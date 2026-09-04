@@ -29,12 +29,12 @@ use axum::{
 use futures_util::StreamExt;
 use replicant_client::{
     ClientDegradation, ClientStatus, Error as ClientError,
-    domain::{AccessScope, Device, Inventory, InventoryOwner, Realm},
+    domain::{AccessScope, Device, Inventory, InventoryOwner, Realm, TravelState},
     managed::{
         Client, OperationStatus as ManagedOperationStatus, RefreshMode as ManagedRefreshMode,
         RefreshPhase as ManagedRefreshPhase, RefreshPhaseState as ManagedRefreshPhaseState,
         RefreshReadiness as ManagedRefreshReadiness, RefreshRequest as ManagedRefreshRequest,
-        RefreshRunId, RefreshRunState, SyncDomain,
+        RefreshRunId, RefreshRunState, StateProjectionGroup, StateRevisionChange, SyncDomain,
     },
     raw::{
         accounts::{AccountAchievementListResponse, AccountMeResponse},
@@ -55,15 +55,15 @@ use replicant_protocol::{
     BillFinderResponse, BlueprintSummary, BlueprintsSnapshot, BobnetChannelSummary,
     BobnetMessageSummary, BobnetReplicantSummary, BobnetSnapshot, BootstrapMissionSummary,
     BootstrapSnapshot, CargoCarrierSummary, CargoResourceSummary, CargoSnapshot,
-    CreateTriggerRequest, DaemonHealth, DescriptorCatalog, DeviceClaim, DeviceLogSummary,
-    DeviceLogsSnapshot, DeviceSummary, DevicesSnapshot, DirectorGoalControlRequest,
-    DirectorMiningPolicyRequest, DirectorModeRequest, DirectorReplicantRegionRequest,
-    DirectorSnapshot, DirectoryReplicantDetail, DirectoryReplicantDetailSnapshot,
-    DirectoryReplicantSummary, DirectorySnapshot, DomainSlice, EntityId, EntityIndexSnapshot,
-    EntityInspectorDetail, EntityInspectorSnapshot, EntityKind, EntityRef, EntitySummary,
-    ErrorResponse, EventCriterionSummary, EventRequirementKind, EventRequirementSummary,
-    EventRewardItem, EventRewardsSummary, EventSummary, EventsSnapshot, FactoryJobSummary,
-    FiniteExecution as ProtocolFiniteExecution, FiniteExecutionHistoryResponse,
+    CreateTriggerRequest, DaemonHealth, DescriptorCatalog, DeviceClaim, DeviceInspectorSummary,
+    DeviceLogSummary, DeviceLogsSnapshot, DeviceRuntimeInspectorSummary, DeviceSummary,
+    DevicesSnapshot, DirectorGoalControlRequest, DirectorMiningPolicyRequest, DirectorModeRequest,
+    DirectorReplicantRegionRequest, DirectorSnapshot, DirectoryReplicantDetail,
+    DirectoryReplicantDetailSnapshot, DirectoryReplicantSummary, DirectorySnapshot, DomainSlice,
+    EntityId, EntityIndexSnapshot, EntityInspectorDetail, EntityInspectorSnapshot, EntityKind,
+    EntityRef, EntitySummary, ErrorResponse, EventCriterionSummary, EventRequirementKind,
+    EventRequirementSummary, EventRewardItem, EventRewardsSummary, EventSummary, EventsSnapshot,
+    FactoryJobSummary, FiniteExecution as ProtocolFiniteExecution, FiniteExecutionHistoryResponse,
     FiniteExecutionStatus as ProtocolFiniteExecutionStatus, FrontendTelemetryBatch,
     FrontendTelemetryLevel, GalaxySceneSnapshot, HealthStatus, InboxMessageSummary,
     InventoryDistribution, InventoryLocationSummary, InventoryOwnerKind, InventoryQuantity,
@@ -73,18 +73,20 @@ use replicant_protocol::{
     NetworkSnapshot, Notification, NotificationLevel, OperationClass, OperationKind,
     OperationStatus, OperationUpdate, OverviewReplicant, OverviewSnapshot, OverviewTravel,
     RefreshDelta, RefreshPhase, RefreshPhaseSummary, RefreshRunDetail, RefreshRunSummary,
-    RelayExpansionSummary, RelaySnapshot, ReportsSnapshot, ReputationSummary, RequirementSummary,
-    ResultSummary, RunOperationRequest, RunOperationResponse, RuntimeSnapshot, RuntimeSyncStatus,
-    SettingsSnapshot, SimulationInterfaceSummary, SimulationRunSummary, SimulationScenarioSummary,
+    RelayExpansionSummary, RelaySnapshot, ReplicantInspectorSummary, ReportsSnapshot,
+    ReputationSummary, RequirementSummary, ResultSummary, RunOperationRequest,
+    RunOperationResponse, RuntimeSnapshot, RuntimeSyncStatus, SettingsSnapshot,
+    SimulationInterfaceSummary, SimulationRunSummary, SimulationScenarioSummary,
     SimulationsSnapshot, SnapshotMetadata, StandingSnapshot, StartRefreshRequest,
     StartWorkflowRequest, StartWorkflowResponse, SurveyMissionSummary, SurveySnapshot, SyncPhase,
     SystemSceneSnapshot, TradeControllerSummary, TradeItemSummary, TradeSnapshot, TradeSummary,
-    TriggerCondition as ProtocolTriggerCondition, TriggerId as ProtocolTriggerId,
-    TriggerListResponse, TriggerTarget as ProtocolTriggerTarget, TutorialStepSummary,
-    TutorialSummary, TutorialsSnapshot, UpdateTriggerRequest, Versioned, WorkflowActivity,
-    WorkflowActivityResponse, WorkflowControlResponse, WorkflowDetail,
-    WorkflowId as ProtocolWorkflowId, WorkflowListResponse, WorkflowStatus as ProtocolStatus,
-    WorkflowStatusCount, WorkflowSummary,
+    TravelInspectorSummary, TriggerCondition as ProtocolTriggerCondition,
+    TriggerId as ProtocolTriggerId, TriggerListResponse, TriggerTarget as ProtocolTriggerTarget,
+    TutorialStepSummary, TutorialSummary, TutorialsSnapshot, UpdateTriggerRequest, Versioned,
+    WorkflowActivity, WorkflowActivityResponse, WorkflowControlResponse, WorkflowDetail,
+    WorkflowId as ProtocolWorkflowId, WorkflowIntelligenceSnapshot, WorkflowListResponse,
+    WorkflowReservationSummary, WorkflowStatus as ProtocolStatus, WorkflowStatusCount,
+    WorkflowSummary, WorkflowTargetSummary,
 };
 use replicant_runtime::{
     ApplicationContext,
@@ -118,10 +120,11 @@ use replicant_runtime::{
 use replicant_workflow::{
     AutomationPolicy, AutomationTrigger, FiniteExecution as StoredFiniteExecution,
     FiniteExecutionClass, FiniteExecutionStatus as StoredFiniteExecutionStatus, NewTrigger,
-    RepositoryError, ResourceKey, SupervisorError, TriggerCondition, TriggerId, TriggerState,
-    TriggerTarget, TriggerTargetClass, WorkItemStatus, WorkflowId, WorkflowInstance, WorkflowKind,
-    WorkflowRepository, WorkflowStatus, WorkflowSummary as StoredWorkflowSummary,
-    WorkflowSupervisor, WorkflowTelemetrySink,
+    RepositoryError, ResourceKey, ResourceReservation, SupervisorError, TriggerCondition,
+    TriggerId, TriggerState, TriggerTarget, TriggerTargetClass, WorkItemStatus, WorkflowId,
+    WorkflowInstance, WorkflowKind, WorkflowRepository, WorkflowStatus,
+    WorkflowSummary as StoredWorkflowSummary, WorkflowSupervisor, WorkflowTarget,
+    WorkflowTargetRecord, WorkflowTelemetrySink,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -370,6 +373,9 @@ pub struct AppState {
     /// Slices invalidated since the last flush, coalesced so one tick of
     /// managed churn costs one live message instead of one per slice.
     pending_slices: StdMutex<BTreeSet<DomainSlice>>,
+    /// Cause classes and their affected slices, retained until the same
+    /// coalesced flush as `pending_slices` for bounded structured telemetry.
+    pending_causes: StdMutex<BTreeMap<&'static str, BTreeSet<DomainSlice>>>,
     /// Revision each slice last reached, served with snapshots so a client can
     /// tell whether its cached projection is current.
     slice_revisions: StdMutex<BTreeMap<DomainSlice, u64>>,
@@ -428,6 +434,7 @@ impl AppState {
             revision: AtomicU64::new(revision),
             publish_lock: StdMutex::new(()),
             pending_slices: StdMutex::new(BTreeSet::new()),
+            pending_causes: StdMutex::new(BTreeMap::new()),
             slice_revisions: StdMutex::new(BTreeMap::new()),
             device_rows: tokio::sync::Mutex::new(None),
             message_sync: Mutex::new(()),
@@ -480,15 +487,36 @@ impl AppState {
     /// Dirty slices are flushed once per supervisor tick by
     /// [`AppState::flush_invalidations`].
     fn invalidate(&self, slice: DomainSlice) {
+        self.invalidate_with_cause("explicit", slice);
+    }
+
+    fn invalidate_with_cause(&self, cause: &'static str, slice: DomainSlice) {
         lock(&self.pending_slices).insert(slice);
+        lock(&self.pending_causes)
+            .entry(cause)
+            .or_default()
+            .insert(slice);
+    }
+
+    fn invalidate_recovery(&self, cause: &'static str) {
+        for slice in all_domain_slices().iter().copied() {
+            self.invalidate_with_cause(cause, slice);
+        }
     }
 
     /// Publishes one coalesced invalidation for everything marked dirty.
     fn flush_invalidations(&self) {
         let slices = std::mem::take(&mut *lock(&self.pending_slices));
+        let causes = std::mem::take(&mut *lock(&self.pending_causes));
         if slices.is_empty() {
             return;
         }
+        tracing::debug!(
+            target: "replicant_server::invalidation",
+            causes = ?causes,
+            slice_count = slices.len(),
+            "coalesced domain invalidation"
+        );
         let guard = lock(&self.publish_lock);
         let revision = self.revision.fetch_add(1, Ordering::Relaxed) + 1;
         let mut current = lock(&self.slice_revisions);
@@ -842,6 +870,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/directory/{code}", get(directory_replicant))
         .route("/api/tutorials", get(tutorials))
         .route("/api/trade", get(trade))
+        .route("/api/trade/refresh", post(refresh_trade))
         .route("/api/trade/bill/find", post(find_bill))
         .route("/api/reports", get(reports))
         .route("/api/messages", get(messages))
@@ -888,6 +917,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             put(update_director_replicant_region),
         )
         .route("/api/workflows", get(list_workflows).post(start_workflow))
+        .route("/api/workflow-intelligence", get(workflow_intelligence))
         .route("/api/workflows/{id}", get(workflow_detail))
         .route("/api/workflows/{id}/activity", get(workflow_activity))
         .route("/api/workflows/{id}/pause", post(pause_workflow))
@@ -926,6 +956,126 @@ pub fn router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
+const ALL_DOMAIN_SLICES: &[DomainSlice] = &[
+    DomainSlice::Entities,
+    DomainSlice::Universe,
+    DomainSlice::Overview,
+    DomainSlice::Devices,
+    DomainSlice::Inventory,
+    DomainSlice::Autofactories,
+    DomainSlice::Cargo,
+    DomainSlice::Missions,
+    DomainSlice::History,
+    DomainSlice::Events,
+    DomainSlice::Activity,
+    DomainSlice::Trade,
+    DomainSlice::Simulations,
+    DomainSlice::Blueprints,
+    DomainSlice::Directory,
+    DomainSlice::Tutorials,
+    DomainSlice::Messages,
+    DomainSlice::Bobnet,
+    DomainSlice::Network,
+    DomainSlice::Standing,
+    DomainSlice::Leaderboards,
+    DomainSlice::Workflows,
+    DomainSlice::Operations,
+    DomainSlice::Refresh,
+    DomainSlice::Director,
+];
+
+fn all_domain_slices() -> &'static [DomainSlice] {
+    ALL_DOMAIN_SLICES
+}
+
+fn state_change_slices(change: &StateRevisionChange) -> BTreeSet<DomainSlice> {
+    let mut slices = BTreeSet::new();
+    for group in &change.changed {
+        let affected = match group {
+            StateProjectionGroup::Account => &[
+                DomainSlice::Overview,
+                DomainSlice::Network,
+                DomainSlice::Standing,
+                DomainSlice::Leaderboards,
+            ][..],
+            StateProjectionGroup::Devices => &[
+                DomainSlice::Entities,
+                DomainSlice::Overview,
+                DomainSlice::Devices,
+                DomainSlice::Inventory,
+                DomainSlice::Autofactories,
+                DomainSlice::Cargo,
+                DomainSlice::Missions,
+                DomainSlice::Trade,
+                DomainSlice::Network,
+                DomainSlice::Director,
+            ][..],
+            StateProjectionGroup::Replicants => &[
+                DomainSlice::Entities,
+                DomainSlice::Overview,
+                DomainSlice::Devices,
+                DomainSlice::Missions,
+                DomainSlice::Directory,
+                DomainSlice::Network,
+                DomainSlice::Director,
+            ][..],
+            StateProjectionGroup::Locations => &[
+                DomainSlice::Entities,
+                DomainSlice::Universe,
+                DomainSlice::Overview,
+                DomainSlice::Devices,
+                DomainSlice::Inventory,
+                DomainSlice::Cargo,
+                DomainSlice::Missions,
+                DomainSlice::Events,
+                DomainSlice::Trade,
+                DomainSlice::Network,
+                DomainSlice::Director,
+            ][..],
+            StateProjectionGroup::Inventories => &[
+                DomainSlice::Overview,
+                DomainSlice::Inventory,
+                DomainSlice::Cargo,
+            ][..],
+            StateProjectionGroup::Simulations => &[DomainSlice::Simulations][..],
+            StateProjectionGroup::Galaxy => &[
+                DomainSlice::Entities,
+                DomainSlice::Universe,
+                DomainSlice::Overview,
+                DomainSlice::Devices,
+                DomainSlice::Inventory,
+                DomainSlice::Missions,
+                DomainSlice::Trade,
+                DomainSlice::Network,
+                DomainSlice::Director,
+            ][..],
+            // StateProjectionGroup is non-exhaustive. A projection group added by a newer
+            // managed client may affect any frontend domain until this mapping is taught
+            // about it, so recover conservatively rather than serving stale slices.
+            _ => all_domain_slices(),
+        };
+        slices.extend(affected.iter().copied());
+    }
+    slices
+}
+
+fn event_invalidation_slices(event: &replicant_client::domain::Event) -> BTreeSet<DomainSlice> {
+    let mut slices = BTreeSet::from([DomainSlice::Events, DomainSlice::Activity]);
+    match event.name.as_str() {
+        "message.new" => {
+            slices.insert(DomainSlice::Messages);
+        }
+        "blueprint.unlocked" => {
+            slices.insert(DomainSlice::Blueprints);
+        }
+        "trade.completed" | "trade.created" | "trade.deleted" => {
+            slices.insert(DomainSlice::Trade);
+        }
+        _ => {}
+    }
+    slices
+}
+
 /// Runs periodic persisted-workflow reconciliation until shutdown.
 pub async fn run_supervisor(state: Arc<AppState>, mut shutdown: watch::Receiver<bool>) {
     let mut interval = tokio::time::interval(Duration::from_millis(250));
@@ -940,6 +1090,7 @@ pub async fn run_supervisor(state: Arc<AppState>, mut shutdown: watch::Receiver<
     let mut tick_duration_max_ms = 0_u64;
     let mut revisions = state.client().state().watch().ok();
     let mut operations = state.client().operations().watch().ok();
+    let mut managed_events = state.client().events().watch().await.ok();
     let mut bobnet = state.client().bobnet().watch().await.ok();
     let mut workflows = state
         .repository
@@ -949,6 +1100,10 @@ pub async fn run_supervisor(state: Arc<AppState>, mut shutdown: watch::Receiver<
         .map(|workflow| (workflow.id.to_string(), workflow.revision))
         .collect::<BTreeMap<_, _>>();
     let mut activity_cursor = state.repository.latest_activity_id().unwrap_or_default();
+    let mut workflow_intelligence_revision = state
+        .repository
+        .workflow_intelligence_revision()
+        .unwrap_or_default();
     let mut managed_phase = sync_phase(&state.client().status());
     let mut refresh_fingerprint = state
         .client()
@@ -976,22 +1131,53 @@ pub async fn run_supervisor(state: Arc<AppState>, mut shutdown: watch::Receiver<
                     tick_errors = tick_errors.saturating_add(1);
                     tracing::error!(error = %error, "workflow supervisor tick failed");
                 }
-                publish_workflow_updates(&state, &mut workflows, &mut activity_cursor);
-                let mut stop_bobnet_watch = false;
+                let mut reconnect_bobnet = false;
                 if let Some(watch) = bobnet.as_mut() {
                     match watch.try_next() {
-                        Ok(events) if !events.is_empty() => state.invalidate(DomainSlice::Bobnet),
+                        Ok(events) if !events.is_empty() => {
+                            state.invalidate_with_cause("bobnet_events", DomainSlice::Bobnet);
+                        }
                         Ok(_) => {}
                         Err(error) => {
                             tracing::warn!(error = %error, "BobNet event watch stopped");
                             state.record_runtime_telemetry("watcher_lag", "bobnet", 1, None);
-                            stop_bobnet_watch = true;
+                            state.invalidate_recovery("bobnet_watch_recovery");
+                            reconnect_bobnet = true;
                         }
                     }
                 }
-                if stop_bobnet_watch {
-                    bobnet = None;
+                if reconnect_bobnet {
+                    bobnet = state.client().bobnet().watch().await.ok();
                 }
+                let mut reconnect_managed_events = false;
+                if let Some(watch) = managed_events.as_mut() {
+                    match watch.try_next() {
+                        Ok(events) => {
+                            let mut slices = BTreeSet::new();
+                            for event in events {
+                                slices.extend(event_invalidation_slices(&event));
+                            }
+                            for slice in slices {
+                                state.invalidate_with_cause("managed_events", slice);
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(error = %error, "managed event watch stopped");
+                            state.record_runtime_telemetry("watcher_lag", "managed_events", 1, None);
+                            state.invalidate_recovery("managed_events_recovery");
+                            reconnect_managed_events = true;
+                        }
+                    }
+                }
+                if reconnect_managed_events {
+                    managed_events = state.client().events().watch().await.ok();
+                }
+                publish_workflow_updates(
+                    &state,
+                    &mut workflows,
+                    &mut activity_cursor,
+                    &mut workflow_intelligence_revision,
+                );
                 if tick_count % 4 == 0
                     && let Ok(runs) = state.client().refresh().list(100).await
                 {
@@ -1059,42 +1245,18 @@ pub async fn run_supervisor(state: Arc<AppState>, mut shutdown: watch::Receiver<
                     Err(error) => tracing::warn!(error = %error, "workflow retention sweep failed"),
                 }
             }
-            revision = async { revisions.as_mut().expect("guarded").next().await }, if revisions.is_some() => {
+            revision = async { revisions.as_mut().expect("guarded").next_change().await }, if revisions.is_some() => {
                 match revision {
-                    Ok(_) => {
-                        // Marked here, flushed as one coalesced message on the
-                        // next tick: a busy account bumps the managed revision
-                        // continuously, and one message per slice per bump was
-                        // the dominant source of live-channel churn.
-                        for slice in [
-                            DomainSlice::Entities,
-                            DomainSlice::Universe,
-                            DomainSlice::Overview,
-                            DomainSlice::Devices,
-                            DomainSlice::Inventory,
-                            DomainSlice::Autofactories,
-                            DomainSlice::Cargo,
-                            DomainSlice::Missions,
-                            DomainSlice::Events,
-                            DomainSlice::Activity,
-                            DomainSlice::Trade,
-                            DomainSlice::Simulations,
-                            DomainSlice::Blueprints,
-                            DomainSlice::Directory,
-                            DomainSlice::Tutorials,
-                            DomainSlice::Messages,
-                            DomainSlice::Network,
-                            DomainSlice::Standing,
-                            DomainSlice::Leaderboards,
-                            DomainSlice::Director,
-                        ] {
-                            state.invalidate(slice);
+                    Ok(change) => {
+                        for slice in state_change_slices(&change) {
+                            state.invalidate_with_cause("managed_state", slice);
                         }
                     }
                     Err(error) => {
                         tracing::warn!(error = %error, "managed state watcher stopped");
                         state.record_runtime_telemetry("watcher_lag", "managed_state", 1, None);
-                        revisions = None;
+                        state.invalidate_recovery("managed_state_recovery");
+                        revisions = state.client().state().watch().ok();
                     }
                 }
             }
@@ -1428,6 +1590,7 @@ fn publish_workflow_updates(
     state: &AppState,
     revisions: &mut BTreeMap<String, u64>,
     activity_cursor: &mut i64,
+    intelligence_revision: &mut i64,
 ) {
     if let Ok(current) = state.repository.list_summaries() {
         let mut present = BTreeSet::new();
@@ -1460,6 +1623,12 @@ fn publish_workflow_updates(
             }
         }
         revisions.retain(|id, _| present.contains(id));
+    }
+    if let Ok(current) = state.repository.workflow_intelligence_revision()
+        && current != *intelligence_revision
+    {
+        *intelligence_revision = current;
+        state.invalidate(DomainSlice::Workflows);
     }
     if let Ok(activity) = state.repository.activity_since(*activity_cursor) {
         for record in activity {
@@ -2075,6 +2244,350 @@ async fn device_rows(state: &Arc<AppState>) -> Result<Arc<Vec<DeviceSummary>>, A
     let rows = Arc::new(build_device_rows(state).await?);
     *cached = Some((revision, rows.clone()));
     Ok(rows)
+}
+
+/// Builds one device row from its cached observation and only the related
+/// location/owner lookups. List routes continue to use [`device_rows`] so
+/// their account-wide cache remains shared.
+async fn targeted_device_row(
+    state: &Arc<AppState>,
+    code: &str,
+) -> Result<
+    (
+        DeviceInspectorSummary,
+        replicant_client::domain::Observation<Device>,
+    ),
+    ApiError,
+> {
+    let handle = state
+        .client()
+        .devices()
+        .cached(code)
+        .ok_or_else(ApiError::entity_not_found)?;
+    // Inspector reads are a good place to request authoritative device detail.
+    // Degraded/offline use still falls back to the cached managed observation.
+    let _ = handle.refresh().await;
+    let observation = state
+        .client()
+        .devices()
+        .cached(code)
+        .ok_or_else(ApiError::entity_not_found)?
+        .observation()
+        .await
+        .map_err(|_| ApiError::unavailable())?;
+    let device = observation.value.clone();
+    let deployed_at = device.deployed_at.clone();
+    let in_control_range = device.in_control_range;
+    let settings = device.settings.clone();
+    let hosting_replicant = device
+        .relationships
+        .hosting_replicant
+        .as_ref()
+        .map(|value| summary_ref(EntityKind::Replicant, value.id.as_str()));
+    let travel = device.travel.as_ref().map(travel_inspector_summary);
+    let runtime = device_runtime_inspector_summary(&device.runtime);
+
+    let mut location_systems = BTreeMap::new();
+    let mut locations = BTreeSet::new();
+    if let Some(location) = device.location.as_ref() {
+        locations.insert(location.id.to_string());
+    }
+    if let Some(travel) = device.travel.as_ref() {
+        if let Some(origin) = travel.origin.as_ref() {
+            locations.insert(origin.id.to_string());
+        }
+        if let Some(destination) = travel.destination.as_ref() {
+            locations.insert(destination.id.to_string());
+        }
+        if let Some(destination) = travel.final_destination.as_ref() {
+            locations.insert(destination.id.to_string());
+        }
+    }
+    for location in locations {
+        if let Some(system) = targeted_location_system(state, &location).await? {
+            location_systems.insert(location, Some(system));
+        }
+    }
+    let mut replicant_names = BTreeMap::new();
+    if let Some(owner) = device.relationships.assigned_replicant.as_ref()
+        && let Some(handle) = state.client().replicants().cached(owner.id.as_str())
+    {
+        let owner = handle
+            .snapshot()
+            .await
+            .map_err(|_| ApiError::unavailable())?;
+        if let Some(name) = owner.name {
+            replicant_names.insert(owner.key.id.to_string(), name);
+        }
+    }
+    let claim = device_claim_for(state, code)?;
+    let system_regions = expanded_system_region_map(&state.client().galaxy().catalogue());
+    let mut row = device_summary(
+        device,
+        &location_systems,
+        &system_regions,
+        &replicant_names,
+        claim,
+    )?;
+    if row.location.is_none()
+        && let Some(parent) = row.stowed_in.clone()
+        && let Some((location, system, region)) =
+            targeted_stowed_context(state, &parent, &system_regions).await?
+    {
+        row.location = Some(location);
+        row.system = system;
+        row.region = region;
+    }
+    Ok((
+        DeviceInspectorSummary {
+            device: row,
+            deployed_at,
+            in_control_range,
+            settings,
+            hosting_replicant,
+            travel,
+            runtime,
+        },
+        observation,
+    ))
+}
+
+fn travel_inspector_summary(travel: &TravelState) -> TravelInspectorSummary {
+    TravelInspectorSummary {
+        arrives_at: travel.arrives_at.clone(),
+        departed_at: travel.departed_at.clone(),
+        destination: travel
+            .destination
+            .as_ref()
+            .map(|value| value.id.to_string()),
+        eta_seconds: travel.eta_seconds,
+        final_arrives_at: travel.final_arrives_at.clone(),
+        final_destination: travel
+            .final_destination
+            .as_ref()
+            .map(|value| value.id.to_string()),
+        origin: travel.origin.as_ref().map(|value| value.id.to_string()),
+        route_eta_seconds: travel.route_eta_seconds,
+        stage: travel.stage.clone(),
+        travel_type: travel.travel_type.clone(),
+        details: travel.details.clone(),
+    }
+}
+
+fn device_runtime_inspector_summary(
+    runtime: &replicant_client::domain::DeviceRuntimeState,
+) -> DeviceRuntimeInspectorSummary {
+    DeviceRuntimeInspectorSummary {
+        created_at: runtime.created_at.clone(),
+        short_description: runtime.short_description.clone(),
+        description: runtime.description.clone(),
+        printing: runtime.printing.clone(),
+        mining: runtime.mining.clone(),
+        prospect: runtime.prospect.clone(),
+        repair: runtime.repair.clone(),
+        scan: runtime.scan.clone(),
+        waiting_for: runtime.waiting_for.clone(),
+        print_queue: runtime.print_queue.clone(),
+        queue_size: runtime.queue_size,
+        taxi_mode: runtime.taxi_mode.clone(),
+        tracking_site_id: runtime.tracking_site_id,
+        beacon_only: runtime.beacon_only,
+        welcome_message: runtime.welcome_message.clone(),
+        repair_paid_pct: runtime.repair_paid_pct.clone(),
+    }
+}
+
+async fn targeted_location_system(
+    state: &Arc<AppState>,
+    location: &str,
+) -> Result<Option<String>, ApiError> {
+    let observations = state
+        .client()
+        .locations()
+        .find()
+        .at(location)
+        .collect_observations()
+        .await
+        .map_err(|_| ApiError::unavailable())?;
+    Ok(observations
+        .last()
+        .and_then(|observation| observation.value.system.clone())
+        .or_else(|| {
+            location
+                .split_once('-')
+                .map(|(system, _)| system.to_owned())
+        }))
+}
+
+async fn targeted_stowed_context(
+    state: &Arc<AppState>,
+    parent: &str,
+    system_regions: &BTreeMap<String, String>,
+) -> Result<Option<(String, Option<String>, Option<String>)>, ApiError> {
+    let mut current = Some(parent.to_owned());
+    let mut seen = BTreeSet::new();
+    while let Some(code) = current {
+        if !seen.insert(code.clone()) {
+            break;
+        }
+        let Some(handle) = state.client().devices().cached(&code) else {
+            break;
+        };
+        let host = handle
+            .snapshot()
+            .await
+            .map_err(|_| ApiError::unavailable())?;
+        if let Some(location) = host
+            .location
+            .as_ref()
+            .or_else(|| {
+                host.travel
+                    .as_ref()
+                    .and_then(|travel| travel.origin.as_ref())
+            })
+            .map(|value| value.id.to_string())
+        {
+            let system = targeted_location_system(state, &location).await?;
+            let region = system
+                .as_ref()
+                .and_then(|value| system_regions.get(value).cloned());
+            return Ok(Some((location, system, region)));
+        }
+        current = host
+            .relationships
+            .stowed_in
+            .as_ref()
+            .map(|value| value.id.to_string());
+    }
+    Ok(None)
+}
+
+async fn targeted_replicant_detail(
+    state: &Arc<AppState>,
+    code: &str,
+) -> Result<ReplicantInspectorSummary, ApiError> {
+    let replicant = if let Some(handle) = state.client().replicants().cached(code) {
+        handle
+            .snapshot()
+            .await
+            .map_err(|_| ApiError::unavailable())?
+    } else {
+        state
+            .client()
+            .directory()
+            .replicant(code)
+            .await
+            .map_err(|_| ApiError::entity_not_found())?
+    };
+
+    let hosted_device = replicant
+        .hosted_device
+        .as_ref()
+        .map(|value| summary_ref(EntityKind::Device, value.id.as_str()));
+    let mut physical_location = replicant
+        .location
+        .as_ref()
+        .or_else(|| {
+            replicant
+                .travel
+                .as_ref()
+                .and_then(|travel| travel.origin.as_ref())
+        })
+        .map(|value| value.id.to_string());
+    let mut travel = replicant.travel.clone();
+
+    if let Some(hosted) = replicant.hosted_device.as_ref()
+        && let Some(device_handle) = state.client().devices().cached(hosted.id.as_str())
+    {
+        let device = device_handle
+            .snapshot()
+            .await
+            .map_err(|_| ApiError::unavailable())?;
+        physical_location = device
+            .location
+            .as_ref()
+            .or_else(|| {
+                device
+                    .travel
+                    .as_ref()
+                    .and_then(|travel| travel.origin.as_ref())
+            })
+            .map(|value| value.id.to_string())
+            .or(physical_location);
+        if travel.is_none() {
+            travel = device.travel;
+        }
+    }
+
+    let system = match physical_location.as_deref() {
+        Some(location) => targeted_location_system(state, location).await?,
+        None => None,
+    };
+    let region = system.as_ref().and_then(|system| {
+        expanded_system_region_map(&state.client().galaxy().catalogue())
+            .get(system)
+            .cloned()
+    });
+    let private = replicant.private.as_ref();
+    let director =
+        cached_director_snapshot(&state.repository, state.revision.load(Ordering::Relaxed))
+            .ok()
+            .and_then(|snapshot| {
+                snapshot
+                    .replicants
+                    .into_iter()
+                    .find(|assignment| assignment.code == code)
+            });
+
+    Ok(ReplicantInspectorSummary {
+        entity: summary_ref(EntityKind::Replicant, replicant.key.id.as_str()),
+        name: replicant.name.clone(),
+        status: wire_value(replicant.status.as_ref()),
+        is_npc: replicant.is_npc,
+        ownership: wire_value(Some(&replicant.access)).unwrap_or_else(|| "unknown".to_owned()),
+        system,
+        region,
+        assigned_region: director.as_ref().and_then(|value| value.region.clone()),
+        director_state: director
+            .as_ref()
+            .and_then(|value| wire_value(Some(&value.state))),
+        role_affinity: director
+            .as_ref()
+            .and_then(|value| value.role_affinity.clone()),
+        workflow_id: director
+            .as_ref()
+            .and_then(|value| value.workflow_id.as_ref().map(|id| id.0.clone())),
+        location: physical_location,
+        hosted_device,
+        travel: travel.as_ref().map(travel_inspector_summary),
+        description: private.and_then(|value| value.description.clone()),
+        pronouns: private.and_then(|value| value.pronouns.clone()),
+        experience_points: private.and_then(|value| value.experience_points),
+        plan: private.and_then(|value| value.plan.clone()),
+        cohort_permission: private.and_then(|value| value.cohort_permission.clone()),
+    })
+}
+
+fn device_claim_for(state: &AppState, code: &str) -> Result<Option<DeviceClaim>, ApiError> {
+    for workflow in state.repository.list().map_err(ApiError::repository)? {
+        for claim in state
+            .repository
+            .claims(workflow.id)
+            .map_err(ApiError::repository)?
+        {
+            if let ResourceKey::Device(claimed) = claim.resource
+                && claimed == code
+            {
+                let workflow = summary(&workflow);
+                return Ok(Some(DeviceClaim {
+                    workflow_id: workflow.id,
+                    workflow_kind: workflow.kind,
+                    workflow_status: workflow.status,
+                }));
+            }
+        }
+    }
+    Ok(None)
 }
 
 async fn build_device_rows(state: &Arc<AppState>) -> Result<Vec<DeviceSummary>, ApiError> {
@@ -2918,6 +3431,9 @@ fn event_summary(raw: &LocationEvent) -> Result<EventSummary, ApiError> {
 #[derive(Default, Deserialize)]
 struct ActivityQuery {
     device: Option<String>,
+    replicant: Option<String>,
+    system: Option<String>,
+    location: Option<String>,
     name: Option<String>,
     ami_only: Option<bool>,
     limit: Option<usize>,
@@ -2943,9 +3459,30 @@ async fn account_activity(
     {
         history = history.named(name.trim());
     }
+    if let Some(replicant) = query
+        .replicant
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        history = history.for_replicant(replicant.trim());
+    }
+    if let Some(system) = query
+        .system
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        history = history.in_system(system.trim());
+    }
+    if let Some(location) = query
+        .location
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        history = history.at_location(location.trim());
+    }
     let limit = query.limit.unwrap_or(200).clamp(1, 1_000);
     // AMI digest is a prefix/suffix predicate rather than one exact event
-    // name, so modestly over-read recent local history before filtering.
+    // name, so modestly over-read the already entity-filtered local history.
     let history_limit = if query.ami_only.unwrap_or(false) {
         limit.saturating_mul(20).min(5_000)
     } else {
@@ -3459,7 +3996,20 @@ async fn tutorials(
 async fn trade(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Versioned<TradeSnapshot>>, ApiError> {
-    let metadata = state.snapshot_metadata()?;
+    Ok(Json(Versioned::current(trade_snapshot(&state).await?)))
+}
+
+async fn refresh_trade(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Versioned<TradeSnapshot>>, ApiError> {
+    let mut snapshot = trade_snapshot(&state).await?;
+    state.invalidate(DomainSlice::Trade);
+    state.flush_invalidations();
+    snapshot.metadata = state.snapshot_metadata()?;
+    Ok(Json(Versioned::current(snapshot)))
+}
+
+async fn trade_snapshot(state: &Arc<AppState>) -> Result<TradeSnapshot, ApiError> {
     // The daemon already maintains the owned replicant projection. Do not
     // force a redundant upstream replicant sync just to choose a directory
     // viewer every time the Trade page opens.
@@ -3486,17 +4036,17 @@ async fn trade(
             .then_with(|| left.key.id.as_str().cmp(right.key.id.as_str()))
     });
     let Some(viewer) = viewers.into_iter().next() else {
-        return Ok(Json(Versioned::current(TradeSnapshot {
-            metadata,
+        return Ok(TradeSnapshot {
+            metadata: state.snapshot_metadata()?,
             viewer: None,
             controllers: Vec::new(),
-        })));
+        });
     };
     let viewer_code = viewer.key.id.as_str().to_owned();
     let traders = trader_directory(state.client(), &viewer_code)
         .await
         .map_err(|_| ApiError::unavailable())?;
-    let devices = device_rows(&state).await?;
+    let devices = device_rows(state).await?;
     let devices = devices.as_ref();
     let workflows = state
         .repository
@@ -3550,11 +4100,11 @@ async fn trade(
             workflow,
         ));
     }
-    Ok(Json(Versioned::current(TradeSnapshot {
-        metadata,
+    Ok(TradeSnapshot {
+        metadata: state.snapshot_metadata()?,
         viewer: Some(summary_ref(EntityKind::Replicant, viewer_code)),
         controllers,
-    })))
+    })
 }
 
 fn trade_details_status(error: &replicant_runtime::ApplicationError) -> &'static str {
@@ -5345,20 +5895,8 @@ async fn entity_inspector(
     let metadata = state.snapshot_metadata()?;
     let snapshot = match kind.as_str() {
         "device" => {
-            let rows = device_rows(&state).await?;
-            let device = rows
-                .iter()
-                .find(|device| device.entity.id.0 == id)
-                .cloned()
-                .ok_or_else(ApiError::entity_not_found)?;
-            let observation = state
-                .client()
-                .devices()
-                .cached(&id)
-                .ok_or_else(ApiError::entity_not_found)?
-                .observation()
-                .await
-                .map_err(|_| ApiError::unavailable())?;
+            let (detail, observation) = targeted_device_row(&state, &id).await?;
+            let device = &detail.device;
             EntityInspectorSnapshot {
                 metadata,
                 summary: EntitySummary {
@@ -5371,7 +5909,28 @@ async fn entity_inspector(
                     status: device.status.clone(),
                 },
                 provenance: Some(inspector::provenance(&observation.metadata)),
-                detail: EntityInspectorDetail::Device(Box::new(device)),
+                detail: EntityInspectorDetail::Device(Box::new(detail)),
+            }
+        }
+        "replicant" => {
+            let detail = targeted_replicant_detail(&state, &id).await?;
+            EntityInspectorSnapshot {
+                metadata,
+                summary: EntitySummary {
+                    entity: detail.entity.clone(),
+                    label: detail.name.clone().unwrap_or_else(|| id.clone()),
+                    secondary_label: detail
+                        .name
+                        .as_ref()
+                        .filter(|name| name.as_str() != id)
+                        .map(|_| id.clone()),
+                    system: detail.system.clone(),
+                    location: detail.location.clone(),
+                    entity_type: Some("replicant".to_owned()),
+                    status: detail.status.clone(),
+                },
+                provenance: None,
+                detail: EntityInspectorDetail::Replicant(Box::new(detail)),
             }
         }
         "system" => {
@@ -6609,6 +7168,34 @@ async fn list_workflows(
     Ok(Json(Versioned::current(WorkflowListResponse { workflows })))
 }
 
+async fn workflow_intelligence(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Versioned<WorkflowIntelligenceSnapshot>>, ApiError> {
+    let metadata = state.snapshot_metadata()?;
+    let repository = state.repository.clone();
+    let snapshot = spawn_blocking_repository(repository, move |repository| {
+        let reservations = repository
+            .active_resource_reservations()
+            .map_err(ApiError::repository)?
+            .into_iter()
+            .map(protocol_reservation)
+            .collect();
+        let targets = repository
+            .active_workflow_targets()
+            .map_err(ApiError::repository)?
+            .into_iter()
+            .map(protocol_workflow_target)
+            .collect();
+        Ok(WorkflowIntelligenceSnapshot {
+            metadata,
+            reservations,
+            targets,
+        })
+    })
+    .await?;
+    Ok(Json(Versioned::current(snapshot)))
+}
+
 async fn workflow_detail(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -7159,6 +7746,78 @@ fn requirement_target(target: &RequirementTarget) -> String {
     }
 }
 
+fn protocol_reservation(reservation: ResourceReservation) -> WorkflowReservationSummary {
+    let pool_identity = match &reservation.resource {
+        ResourceKey::Replicant(id) => format!("replicant:{id}"),
+        ResourceKey::Device(id) => format!("device:{id}"),
+        ResourceKey::Autofactory(id) => format!("autofactory:{id}"),
+        ResourceKey::Namespaced { namespace, key } => format!("{namespace}:{key}"),
+    };
+    let entity = match &reservation.resource {
+        ResourceKey::Replicant(id) => Some(EntityRef {
+            kind: EntityKind::Replicant,
+            id: EntityId(id.clone()),
+        }),
+        ResourceKey::Device(id) => Some(EntityRef {
+            kind: EntityKind::Device,
+            id: EntityId(id.clone()),
+        }),
+        ResourceKey::Autofactory(id) => Some(EntityRef {
+            kind: EntityKind::Autofactory,
+            id: EntityId(id.clone()),
+        }),
+        ResourceKey::Namespaced { .. } => None,
+    };
+    let resource = (reservation.kind == "material")
+        .then(|| reservation.capabilities.first().cloned())
+        .flatten();
+    let (region, system, location) = reservation
+        .location
+        .map(|location| (location.region, location.system, location.designation))
+        .unwrap_or((None, None, None));
+    WorkflowReservationSummary {
+        allocation_id: reservation.allocation_id.to_string(),
+        workflow_id: ProtocolWorkflowId(reservation.workflow_id.to_string()),
+        work_item_id: reservation.item_id.to_string(),
+        requirement_key: reservation.requirement_key,
+        kind: reservation.kind,
+        resource,
+        pool_identity,
+        entity,
+        capabilities: reservation.capabilities,
+        quantity: reservation.quantity,
+        region,
+        system,
+        location,
+        created_at_ms: reservation.created_at_ms,
+        updated_at_ms: reservation.updated_at_ms,
+    }
+}
+
+fn protocol_workflow_target(record: WorkflowTargetRecord) -> WorkflowTargetSummary {
+    let (system, location) = match &record.target {
+        WorkflowTarget::Event {
+            system, location, ..
+        } => (Some(system.clone()), Some(location.clone())),
+        WorkflowTarget::System { system } => (Some(system.clone()), None),
+        WorkflowTarget::Location { location } => (None, Some(location.clone())),
+        WorkflowTarget::Device { .. }
+        | WorkflowTarget::Resource { .. }
+        | WorkflowTarget::Blueprint { .. }
+        | WorkflowTarget::Custom { .. } => (None, None),
+    };
+    WorkflowTargetSummary {
+        workflow_id: ProtocolWorkflowId(record.workflow_id.to_string()),
+        kind: record.target.kind().to_owned(),
+        key: record.target.key().to_owned(),
+        system,
+        location,
+        active: record.active,
+        created_at_ms: record.created_at_ms,
+        updated_at_ms: record.updated_at_ms,
+    }
+}
+
 fn detail(
     repository: &WorkflowRepository,
     instance: &WorkflowInstance,
@@ -7174,6 +7833,18 @@ fn detail(
         .into_iter()
         .map(|claim| entity_ref(claim.resource))
         .collect();
+    let reservations = repository
+        .workflow_resource_reservations(instance.id)
+        .map_err(ApiError::repository)?
+        .into_iter()
+        .map(protocol_reservation)
+        .collect();
+    let targets = repository
+        .workflow_targets(instance.id)
+        .map_err(ApiError::repository)?
+        .into_iter()
+        .map(protocol_workflow_target)
+        .collect();
     Ok(WorkflowDetail {
         summary: summary(instance),
         schema_version: instance.schema_version,
@@ -7183,6 +7854,8 @@ fn detail(
             .parent_id
             .map(|id| ProtocolWorkflowId(id.to_string())),
         claims,
+        reservations,
+        targets,
         created_at_ms: instance.created_at,
         finished_at_ms: instance.status.is_terminal().then_some(instance.updated_at),
         error: if instance.status == WorkflowStatus::Failed {
@@ -7909,6 +8582,60 @@ mod tests {
         )
         .expect("app state");
         (router(state.clone()), client, state)
+    }
+
+    #[test]
+    fn non_location_message_event_invalidates_events_activity_and_messages() {
+        let event = replicant_client::domain::Event {
+            id: replicant_client::domain::EventId::new("event-1"),
+            realm: None,
+            name: replicant_client::domain::EventName::from("message.new".to_owned()),
+            category: replicant_client::domain::EventCategory::from("message"),
+            device: None,
+            replicant: None,
+            location: None,
+            star: None,
+            occurred_at: "2026-01-01T00:00:00Z".to_owned(),
+            payload: BTreeMap::new(),
+        };
+        assert_eq!(
+            event_invalidation_slices(&event),
+            BTreeSet::from([
+                DomainSlice::Events,
+                DomainSlice::Activity,
+                DomainSlice::Messages,
+            ])
+        );
+        assert!(
+            !event_invalidation_slices(&event).contains(&DomainSlice::Devices),
+            "message events must not invalidate devices"
+        );
+    }
+
+    #[test]
+    fn state_device_changes_do_not_invalidate_messages() {
+        let change = StateRevisionChange {
+            revision: 7,
+            changed: BTreeSet::from([StateProjectionGroup::Devices]),
+        };
+        assert!(
+            !state_change_slices(&change).contains(&DomainSlice::Messages),
+            "device changes must not invalidate the account inbox"
+        );
+        assert!(
+            state_change_slices(&change).contains(&DomainSlice::Devices),
+            "device changes must invalidate devices"
+        );
+    }
+
+    #[tokio::test]
+    async fn watcher_recovery_marks_every_domain_slice() {
+        let (_, _, state) = test_app().await;
+        state.invalidate_recovery("test_recovery");
+        assert_eq!(
+            *lock(&state.pending_slices),
+            all_domain_slices().iter().copied().collect()
+        );
     }
     #[test]
     fn director_wakes_for_asteroid_event() {
@@ -9020,6 +9747,79 @@ mod tests {
         client.close().await.expect("close client");
     }
 
+    #[tokio::test]
+    async fn trade_refresh_fetches_current_directory_and_trades_from_upstream() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/replicants/R-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "replicant_code": "R-1",
+                "replicant_name": "Ada",
+                "location": "SOL-1"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/replicants/R-1/traders"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "traders": [{
+                    "controller_code": "TC-1",
+                    "shop_name": "Exchange",
+                    "is_local": true,
+                    "star": "SOL",
+                    "trade_count": 1
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/devices/TC-1/trades"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "trades": [{
+                    "trade_code": "TRD-1",
+                    "current_stock": 3,
+                    "criteria": {"resources": {"iron": 4}},
+                    "rewards": {"devices": {"probe": 1}}
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (app, client) = test_app_at(&server.uri()).await;
+        client
+            .replicants()
+            .get_owned("R-1")
+            .await
+            .expect("seed trade viewer");
+
+        let response = app
+            .oneshot(
+                Request::post("/api/trade/refresh")
+                    .body(Body::empty())
+                    .expect("trade refresh request"),
+            )
+            .await
+            .expect("trade refresh response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = serde_json::from_value::<Versioned<TradeSnapshot>>(json(response).await)
+            .expect("typed trade refresh response");
+        assert_eq!(response.payload.viewer.expect("viewer").id.0, "R-1");
+        assert_eq!(response.payload.controllers[0].entity.id.0, "TC-1");
+        assert_eq!(
+            response.payload.controllers[0].trades[0].trade_code,
+            "TRD-1"
+        );
+        assert_eq!(
+            response.payload.controllers[0].trades[0].current_stock,
+            Some(3)
+        );
+        server.verify().await;
+        client.close().await.expect("close client");
+    }
+
     #[test]
     fn intelligence_projections_normalize_actual_sdk_fields() {
         let metadata = SnapshotMetadata {
@@ -9641,6 +10441,7 @@ mod tests {
             system_status: None,
             active_directive: None,
             travel: None,
+            runtime: Default::default(),
             access: AccessScope::Owned,
         };
         let row = device_summary(
@@ -9704,6 +10505,7 @@ mod tests {
                 origin: Some(LocationKey::live("EARTH".into())),
                 ..TravelState::default()
             }),
+            runtime: Default::default(),
             access: AccessScope::Owned,
         };
         let row = device_summary(
@@ -10430,6 +11232,19 @@ mod tests {
             1,
             "the daemon retains workflow ownership after the start request ends"
         );
+        let workflow_id: WorkflowId = id.parse().expect("workflow id");
+        state
+            .repository
+            .record_workflow_targets(
+                workflow_id,
+                &[WorkflowTarget::Event {
+                    event_id: "EVT-ROUTE".into(),
+                    system: "SOL".into(),
+                    location: "SOL-5-L4".into(),
+                }],
+                100,
+            )
+            .expect("record workflow target");
 
         let response = app
             .clone()
@@ -10457,6 +11272,20 @@ mod tests {
                 .expect("response");
             assert_eq!(response.status(), StatusCode::OK);
         }
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get("/api/workflow-intelligence")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let intelligence = json(response).await;
+        assert_eq!(intelligence["payload"]["targets"][0]["key"], "EVT-ROUTE");
+        assert_eq!(intelligence["payload"]["targets"][0]["active"], true);
 
         for (command, status) in [("resume", "reconciling"), ("cancel", "cancelled")] {
             let response = app
