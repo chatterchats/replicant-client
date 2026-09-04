@@ -14369,12 +14369,14 @@ mod tests {
     }
 
     async fn seed_event_pool_worker(server: &MockServer, client: &Client, worker: &str) {
+        let vessel = format!("{worker}-VESSEL");
         Mock::given(method("GET"))
             .and(path(format!("/v1/replicants/{worker}")))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "replicant_code": worker,
+                "hosted_device_code": vessel,
                 "location": "ROOT-1-L4",
-                "status": "active"
+                "status": "stationary"
             })))
             .expect(1)
             .mount(server)
@@ -14384,6 +14386,24 @@ mod tests {
             .get_owned(worker)
             .await
             .expect("seed event worker");
+        Mock::given(method("GET"))
+            .and(path(format!("/v1/devices/{vessel}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "device_code": vessel,
+                "device_type": "racing_vessel",
+                "replicant_code": worker,
+                "hosting_replicant": worker,
+                "location": "ROOT-1-L4",
+                "status": "idle"
+            })))
+            .expect(1)
+            .mount(server)
+            .await;
+        client
+            .devices()
+            .get(&vessel)
+            .await
+            .expect("seed event vessel");
     }
 
     async fn seed_event_pool_device(
@@ -17031,7 +17051,11 @@ mod tests {
             .map(|index| replicant_workflow::AllocationCandidate {
                 resource: ResourceKey::Replicant(format!("R-{index}")),
                 kind: "replicant".into(),
-                capabilities: vec!["census".into(), "system_scan".into()],
+                capabilities: vec![
+                    "census".into(),
+                    "system_scan".into(),
+                    OPERATIONAL_REGIONAL_WORKER_CAPABILITY.into(),
+                ],
                 location: Some(replicant_workflow::AllocationLocation {
                     region: Some("Alpha".into()),
                     ..replicant_workflow::AllocationLocation::default()
@@ -17195,7 +17219,11 @@ mod tests {
         let candidate = |worker: &str| replicant_workflow::AllocationCandidate {
             resource: ResourceKey::Replicant(worker.into()),
             kind: "replicant".into(),
-            capabilities: vec!["census".into(), "system_scan".into()],
+            capabilities: vec![
+                "census".into(),
+                "system_scan".into(),
+                OPERATIONAL_REGIONAL_WORKER_CAPABILITY.into(),
+            ],
             location: Some(replicant_workflow::AllocationLocation {
                 region: Some("Alpha".into()),
                 ..replicant_workflow::AllocationLocation::default()

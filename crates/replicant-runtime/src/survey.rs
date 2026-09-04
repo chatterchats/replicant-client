@@ -6720,6 +6720,25 @@ mod tests {
     async fn survey_pool_registered_workflow_overlaps_bundles_and_resumes_maintenance() {
         let server = MockServer::start().await;
         let client = test_client_at(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/v1/stars"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "generated_at": "2026-09-04T00:00:00Z",
+                "total": 1,
+                "stars": [{
+                    "designation": "ROOT",
+                    "region": "Alpha",
+                    "position": {"x": 0.0, "y": 0.0, "z": 0.0}
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        client
+            .galaxy()
+            .refresh_catalogue()
+            .await
+            .expect("seed survey catalogue");
         seed_survey_bundle(&server, &client, "REP-A", "VESSEL-A", "CTRL-A", 3, 4).await;
         seed_survey_bundle(&server, &client, "REP-B", "VESSEL-B", "CTRL-B", 4, 5).await;
 

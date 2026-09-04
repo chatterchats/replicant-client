@@ -4563,16 +4563,16 @@ mod tests {
         server: &MockServer,
         client: &replicant_client::Client,
         worker: &str,
-        hosted: &str,
         devices: &[(&str, &str, Option<i64>)],
     ) {
+        let vessel = format!("{worker}-VESSEL");
         Mock::given(method("GET"))
             .and(path(format!("/v1/replicants/{worker}")))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "replicant_code": worker,
-                "hosted_device_code": hosted,
+                "hosted_device_code": vessel,
                 "location": "ROOT-1-L4",
-                "status": "active"
+                "status": "stationary"
             })))
             .expect(1)
             .mount(server)
@@ -4582,6 +4582,24 @@ mod tests {
             .get_owned(worker)
             .await
             .expect("seed worker");
+        Mock::given(method("GET"))
+            .and(path(format!("/v1/devices/{vessel}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "device_code": vessel,
+                "device_type": "racing_vessel",
+                "replicant_code": worker,
+                "hosting_replicant": worker,
+                "location": "ROOT-1-L4",
+                "status": "idle"
+            })))
+            .expect(1)
+            .mount(server)
+            .await;
+        client
+            .devices()
+            .get(&vessel)
+            .await
+            .expect("seed worker vessel");
         for (code, device_type, transport_capacity) in devices {
             let mut body = serde_json::json!({
                 "device_code": code,
@@ -5087,11 +5105,29 @@ mod tests {
     async fn mining_pool_registered_schema_one_workflow_uses_allocated_concurrent_items() {
         let server = MockServer::start().await;
         let client = mining_pool_client(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/v1/stars"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "generated_at": "2026-09-04T00:00:00Z",
+                "total": 1,
+                "stars": [{
+                    "designation": "ROOT",
+                    "region": "Alpha",
+                    "position": {"x": 0.0, "y": 0.0, "z": 0.0}
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        client
+            .galaxy()
+            .refresh_catalogue()
+            .await
+            .expect("seed mining catalogue");
         seed_mining_pool_worker(
             &server,
             &client,
             "REP-A",
-            "A-CARRIER",
             &[
                 ("A-CARRIER", "surge_carrier", Some(12)),
                 ("A-MC", "ami_mining_controller", None),
@@ -5110,7 +5146,6 @@ mod tests {
             &server,
             &client,
             "REP-B",
-            "B-FREIGHTER",
             &[
                 ("B-FREIGHTER", "cargo_freighter", None),
                 ("B-TC", "ami_transport_controller", None),
@@ -5121,7 +5156,6 @@ mod tests {
             &server,
             &client,
             "REP-C",
-            "C-FREIGHTER",
             &[
                 ("C-FREIGHTER", "cargo_freighter", None),
                 ("C-TC", "ami_transport_controller", None),
