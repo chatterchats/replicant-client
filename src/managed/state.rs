@@ -18,8 +18,8 @@ use crate::domain::{
 };
 
 use super::store::{
-    EventProjectionBatch, MessageMetadata, OperationJournalEntry, ProjectionReplayState,
-    ReconciliationWork, StoreError, StoreHandle,
+    EventHistoryFilter, EventProjectionBatch, MessageMetadata, OperationJournalEntry,
+    ProjectionReplayState, ReconciliationWork, StoreError, StoreHandle,
 };
 
 /// One internally consistent view of committed managed projections.
@@ -129,9 +129,9 @@ impl StateGateway {
     /// Watches coalesced local revisions. This never performs network I/O.
     pub fn watch(&self) -> crate::Result<StateRevisionWatch> {
         self.client.ensure_open()?;
-        Ok(StateRevisionWatch {
-            receiver: self.client.managed_state().subscribe(),
-        })
+        let receiver = self.client.managed_state().subscribe();
+        let previous = Arc::clone(&*receiver.borrow());
+        Ok(StateRevisionWatch { receiver, previous })
     }
 
     /// Watches only revisions that can change the rendered galaxy scene.
@@ -169,19 +169,86 @@ impl GalaxyRevisionWatch {
     }
 }
 
+/// A projection group backed by the managed client's in-memory state.
+///
+/// This is intentionally narrower than the server's domain slices: callers
+/// can map only the application projections that depend on the groups that
+/// changed, without treating every managed revision as a global invalidation.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[non_exhaustive]
+pub enum StateProjectionGroup {
+    /// Account identity and account-level facts.
+    Account,
+    /// Owned and visible device projections.
+    Devices,
+    /// Replicant projections.
+    Replicants,
+    /// Location projections.
+    Locations,
+    /// Inventory projections.
+    Inventories,
+    /// Simulation projections.
+    Simulations,
+    /// Galaxy catalogue and star knowledge projections.
+    Galaxy,
+}
+
+/// Description of one coalesced managed-state revision.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StateRevisionChange {
+    /// The newest committed managed-state revision.
+    pub revision: u64,
+    /// In-memory projection groups whose values or observation metadata changed.
+    pub changed: BTreeSet<StateProjectionGroup>,
+}
+
 /// Coalescing local managed-state revision subscription.
 pub struct StateRevisionWatch {
     receiver: watch::Receiver<Arc<StateSnapshot>>,
+    previous: Arc<StateSnapshot>,
 }
 
 impl StateRevisionWatch {
     /// Waits for the next committed semantic state revision.
     pub async fn next(&mut self) -> crate::Result<u64> {
+        Ok(self.next_change().await?.revision)
+    }
+
+    /// Waits for the next committed semantic state revision and describes the
+    /// projection groups changed since the previous observed revision.
+    pub async fn next_change(&mut self) -> crate::Result<StateRevisionChange> {
         self.receiver
             .changed()
             .await
             .map_err(|_| crate::Error::Closed)?;
-        Ok(self.receiver.borrow_and_update().revision())
+        let current = Arc::clone(&*self.receiver.borrow_and_update());
+        let mut changed = BTreeSet::new();
+        if self.previous.account != current.account {
+            changed.insert(StateProjectionGroup::Account);
+        }
+        if self.previous.devices != current.devices {
+            changed.insert(StateProjectionGroup::Devices);
+        }
+        if self.previous.replicants != current.replicants {
+            changed.insert(StateProjectionGroup::Replicants);
+        }
+        if self.previous.locations != current.locations {
+            changed.insert(StateProjectionGroup::Locations);
+        }
+        if self.previous.inventories != current.inventories {
+            changed.insert(StateProjectionGroup::Inventories);
+        }
+        if self.previous.simulations != current.simulations {
+            changed.insert(StateProjectionGroup::Simulations);
+        }
+        if self.previous.galaxy_projection_revision != current.galaxy_projection_revision {
+            changed.insert(StateProjectionGroup::Galaxy);
+        }
+        self.previous = current.clone();
+        Ok(StateRevisionChange {
+            revision: current.revision,
+            changed,
+        })
     }
 }
 
@@ -201,6 +268,7 @@ fn same_projected_observation<T: PartialEq>(
 pub(crate) struct StateSnapshot {
     revision: u64,
     galaxy_revision: u64,
+    galaxy_projection_revision: u64,
     devices: BTreeMap<DeviceKey, Observation<Device>>,
     account: Option<Observation<Account>>,
     replicants: BTreeMap<ReplicantKey, Observation<Replicant>>,
@@ -280,6 +348,7 @@ impl StateEngine {
         let snapshot = Arc::new(StateSnapshot {
             revision: 0,
             galaxy_revision: 0,
+            galaxy_projection_revision: 0,
             devices,
             account,
             replicants,
@@ -423,6 +492,7 @@ impl StateEngine {
         let mut snapshot = (*self.snapshot()).clone();
         snapshot.revision += 1;
         snapshot.galaxy_revision += u64::from(galaxy_changed);
+        snapshot.galaxy_projection_revision += u64::from(galaxy_changed);
         self.publish(snapshot);
         Ok(())
     }
@@ -506,6 +576,7 @@ impl StateEngine {
         let mut snapshot = (*self.snapshot()).clone();
         snapshot.revision += 1;
         snapshot.galaxy_revision += 1;
+        snapshot.galaxy_projection_revision += 1;
         self.publish(snapshot);
         Ok(())
     }
@@ -622,6 +693,7 @@ impl StateEngine {
         self.publish(StateSnapshot {
             revision: previous.revision + 1,
             galaxy_revision: previous.galaxy_revision,
+            galaxy_projection_revision: previous.galaxy_projection_revision,
             devices: previous.devices.clone(),
             account: Some(account),
             replicants: previous.replicants.clone(),
@@ -652,6 +724,7 @@ impl StateEngine {
         self.publish(StateSnapshot {
             revision: previous.revision + 1,
             galaxy_revision: previous.galaxy_revision + u64::from(galaxy_changed),
+            galaxy_projection_revision: previous.galaxy_projection_revision,
             devices: previous.devices.clone(),
             account: previous.account.clone(),
             replicants,
@@ -687,6 +760,7 @@ impl StateEngine {
         self.publish(StateSnapshot {
             revision: previous.revision + 1,
             galaxy_revision: previous.galaxy_revision,
+            galaxy_projection_revision: previous.galaxy_projection_revision,
             devices: previous.devices.clone(),
             account: previous.account.clone(),
             replicants: previous.replicants.clone(),
@@ -719,6 +793,7 @@ impl StateEngine {
         self.publish(StateSnapshot {
             revision: previous.revision + 1,
             galaxy_revision: previous.galaxy_revision + u64::from(!devices.is_empty()),
+            galaxy_projection_revision: previous.galaxy_projection_revision,
             devices: next_devices,
             account: previous.account.clone(),
             replicants: previous.replicants.clone(),
@@ -749,6 +824,7 @@ impl StateEngine {
         self.publish(StateSnapshot {
             revision: previous.revision + 1,
             galaxy_revision: previous.galaxy_revision + 1,
+            galaxy_projection_revision: previous.galaxy_projection_revision,
             devices,
             account: previous.account.clone(),
             replicants: previous.replicants.clone(),
@@ -775,6 +851,7 @@ impl StateEngine {
         self.publish(StateSnapshot {
             revision: previous.revision + 1,
             galaxy_revision: previous.galaxy_revision,
+            galaxy_projection_revision: previous.galaxy_projection_revision,
             devices: previous.devices.clone(),
             account: previous.account.clone(),
             replicants: previous.replicants.clone(),
@@ -806,6 +883,7 @@ impl StateEngine {
         self.publish(StateSnapshot {
             revision: previous.revision + 1,
             galaxy_revision: previous.galaxy_revision,
+            galaxy_projection_revision: previous.galaxy_projection_revision,
             devices: previous.devices.clone(),
             account: previous.account.clone(),
             replicants: previous.replicants.clone(),
@@ -835,18 +913,12 @@ impl StateEngine {
     }
 
     /// Returns matching durable, deduplicated account event history.
-    pub(crate) fn events(
-        &self,
-        after: Option<String>,
-        device_code: Option<String>,
-        event_name: Option<String>,
-        latest: Option<usize>,
-    ) -> Result<Vec<Event>, StoreError> {
+    pub(crate) fn events(&self, filter: EventHistoryFilter) -> Result<Vec<Event>, StoreError> {
         self.store
             .lock()
             .as_ref()
             .ok_or(StoreError::Closed)?
-            .read_events(after, device_code, event_name, latest)
+            .read_events(filter)
     }
 
     pub(crate) fn prepare_projection_replay(
@@ -1017,6 +1089,8 @@ impl StateEngine {
         self.publish(StateSnapshot {
             revision: previous.revision + 1,
             galaxy_revision: previous.galaxy_revision + u64::from(galaxy_changed),
+            galaxy_projection_revision: previous.galaxy_projection_revision
+                + u64::from(!batch.stars.is_empty()),
             devices,
             account: previous.account.clone(),
             replicants,
@@ -1325,6 +1399,7 @@ impl StateEngine {
             let next = Arc::new(StateSnapshot {
                 revision: previous.revision,
                 galaxy_revision: previous.galaxy_revision,
+                galaxy_projection_revision: previous.galaxy_projection_revision,
                 devices: next_devices,
                 account: previous.account.clone(),
                 replicants: previous.replicants.clone(),
@@ -1342,6 +1417,7 @@ impl StateEngine {
         Ok(self.publish(StateSnapshot {
             revision: previous.revision + 1,
             galaxy_revision: previous.galaxy_revision + 1,
+            galaxy_projection_revision: previous.galaxy_projection_revision,
             devices: next_devices,
             account: previous.account.clone(),
             replicants: previous.replicants.clone(),
@@ -1377,6 +1453,7 @@ impl StateEngine {
         Ok(self.publish(StateSnapshot {
             revision: previous.revision + 1,
             galaxy_revision: previous.galaxy_revision + 1,
+            galaxy_projection_revision: previous.galaxy_projection_revision,
             devices,
             account: previous.account.clone(),
             replicants: previous.replicants.clone(),
@@ -1395,6 +1472,7 @@ impl StateEngine {
             self.publish(StateSnapshot {
                 revision: previous.revision + 1,
                 galaxy_revision: previous.galaxy_revision + 1,
+                galaxy_projection_revision: previous.galaxy_projection_revision,
                 devices,
                 account: previous.account.clone(),
                 replicants: previous.replicants.clone(),
@@ -1424,6 +1502,7 @@ impl StateEngine {
             self.publish(StateSnapshot {
                 revision: previous.revision + 1,
                 galaxy_revision: previous.galaxy_revision + 1,
+                galaxy_projection_revision: previous.galaxy_projection_revision + 1,
                 devices: previous.devices.clone(),
                 account: previous.account.clone(),
                 replicants: previous.replicants.clone(),
@@ -1528,6 +1607,7 @@ mod tests {
                 system_status: None,
                 active_directive: None,
                 travel: None,
+                runtime: Default::default(),
                 access: AccessScope::Owned,
             },
             metadata: ObservationMetadata {
@@ -1598,6 +1678,68 @@ mod tests {
         assert!(engine.persist_devices(&[device("d1")]).is_err());
         assert_eq!(engine.snapshot().revision(), 0);
         assert!(!receiver.has_changed().expect("watch is open"));
+    }
+
+    #[tokio::test]
+    async fn state_watch_reports_only_changed_groups_after_coalescing() {
+        let engine = StateEngine::open_memory().expect("open engine");
+        let receiver = engine.subscribe();
+        let previous = Arc::clone(&*receiver.borrow());
+        let mut watch = StateRevisionWatch { receiver, previous };
+
+        engine
+            .persist_devices(&[device("D1")])
+            .expect("persist first device");
+        engine
+            .persist_devices(&[device("D2")])
+            .expect("persist second device");
+
+        let change = watch.next_change().await.expect("state revision");
+        assert_eq!(
+            change.changed,
+            BTreeSet::from([StateProjectionGroup::Devices])
+        );
+        assert_eq!(change.revision, 2);
+    }
+
+    #[tokio::test]
+    async fn state_watch_reports_galaxy_without_conflating_scene_wakeups() {
+        let engine = StateEngine::open_memory().expect("open engine");
+        let receiver = engine.subscribe();
+        let previous = Arc::clone(&*receiver.borrow());
+        let mut watch = StateRevisionWatch { receiver, previous };
+
+        engine
+            .replace_catalogue(vec![catalogue_star("SOL", Some(true), Some("alpha"))], None)
+            .expect("persist catalogue");
+
+        let change = watch.next_change().await.expect("state revision");
+        assert_eq!(
+            change.changed,
+            BTreeSet::from([StateProjectionGroup::Galaxy])
+        );
+    }
+
+    #[tokio::test]
+    async fn state_watch_preserves_device_and_galaxy_groups_when_coalesced() {
+        let engine = StateEngine::open_memory().expect("open engine");
+        let receiver = engine.subscribe();
+        let previous = Arc::clone(&*receiver.borrow());
+        let mut watch = StateRevisionWatch { receiver, previous };
+
+        engine
+            .persist_devices(&[device("D1")])
+            .expect("persist device");
+        engine
+            .replace_catalogue(vec![catalogue_star("SOL", Some(true), Some("alpha"))], None)
+            .expect("persist catalogue");
+
+        let change = watch.next_change().await.expect("state revision");
+        assert_eq!(
+            change.changed,
+            BTreeSet::from([StateProjectionGroup::Devices, StateProjectionGroup::Galaxy,])
+        );
+        assert_eq!(change.revision, 2);
     }
 
     #[tokio::test]

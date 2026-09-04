@@ -51,6 +51,66 @@ pub struct TravelState {
     pub route_eta_seconds: Option<i64>,
     pub stage: Option<String>,
     pub travel_type: Option<String>,
+    /// Additional route/progress facts retained from the travel payload.
+    #[serde(default)]
+    pub details: BTreeMap<String, Value>,
+}
+
+/// Rich, restart-safe device activity observed from authoritative status reads.
+///
+/// Activity payloads remain open-shaped because Replicant Space evolves device
+/// status fields independently by device type. Stable top-level controls are
+/// modeled separately while activity-specific detail is retained as JSON.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DeviceRuntimeState {
+    pub created_at: Option<String>,
+    pub short_description: Option<String>,
+    pub description: Option<String>,
+    pub printing: Option<Value>,
+    pub mining: Option<Value>,
+    pub prospect: Option<Value>,
+    pub repair: Option<Value>,
+    pub scan: Option<Value>,
+    pub waiting_for: Option<Value>,
+    pub print_queue: Vec<BTreeMap<String, Value>>,
+    pub queue_size: Option<i64>,
+    pub taxi_mode: Option<String>,
+    pub tracking_site_id: Option<i64>,
+    pub beacon_only: Option<bool>,
+    pub welcome_message: Option<String>,
+    pub repair_paid_pct: Option<Value>,
+}
+
+impl DeviceRuntimeState {
+    /// Preserves richer activity fields that a partial/list observation omitted.
+    pub fn preserve_missing_from(&mut self, existing: &Self) {
+        macro_rules! preserve {
+            ($field:ident) => {
+                if self.$field.is_none() {
+                    self.$field = existing.$field.clone();
+                }
+            };
+        }
+        preserve!(created_at);
+        preserve!(short_description);
+        preserve!(description);
+        preserve!(printing);
+        preserve!(mining);
+        preserve!(prospect);
+        preserve!(repair);
+        preserve!(scan);
+        preserve!(waiting_for);
+        if self.print_queue.is_empty() {
+            self.print_queue = existing.print_queue.clone();
+        }
+        preserve!(queue_size);
+        preserve!(taxi_mode);
+        preserve!(tracking_site_id);
+        preserve!(beacon_only);
+        preserve!(welcome_message);
+        preserve!(repair_paid_pct);
+    }
 }
 
 /// Operational-capacity value reported by the game API.
@@ -166,6 +226,9 @@ pub struct Device {
     pub active_directive: Option<ActiveDeviceDirective>,
     #[serde(default)]
     pub travel: Option<TravelState>,
+    /// Rich current device activity and device-type-specific status.
+    #[serde(default)]
+    pub runtime: DeviceRuntimeState,
     pub access: AccessScope,
 }
 
@@ -297,6 +360,39 @@ pub struct LocationSurveyProgress {
     pub moons_total: Option<i64>,
     pub moons_scanned: Option<i64>,
     pub moons_total_estimated: Option<bool>,
+    /// Durable evidence that a post-reset `survey_system` directive reached
+    /// terminal progress even when the live location response omits the
+    /// aggregate planet/moon counters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub survey_system_complete: Option<bool>,
+}
+
+impl LocationSurveyProgress {
+    /// Returns authoritative system-survey completeness when it can be
+    /// established from exact aggregate counters or terminal directive
+    /// evidence. Exact counters take precedence over the fallback marker so a
+    /// later contradictory observation cannot be hidden by older evidence.
+    #[must_use]
+    pub fn system_survey_complete(&self) -> Option<bool> {
+        let planets_complete = match (self.planets_total, self.planets_scanned) {
+            (Some(total), Some(scanned)) => Some(total == scanned),
+            _ => None,
+        };
+        let moons_complete = match self.moons_total_estimated {
+            Some(false) => match (self.moons_total, self.moons_scanned) {
+                (Some(total), Some(scanned)) => Some(total == scanned),
+                _ => None,
+            },
+            Some(true) => Some(false),
+            None => None,
+        };
+        let aggregate = match (planets_complete, moons_complete) {
+            (Some(true), Some(true)) => Some(true),
+            (Some(false), _) | (_, Some(false)) => Some(false),
+            _ => None,
+        };
+        aggregate.or(self.survey_system_complete)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -426,6 +522,10 @@ impl Location {
             .survey_progress
             .moons_total_estimated
             .or(self.survey_progress.moons_total_estimated);
+        self.survey_progress.survey_system_complete = newer
+            .survey_progress
+            .survey_system_complete
+            .or(self.survey_progress.survey_system_complete);
         merge_knowledge(
             &mut self.environment.atmosphere,
             &newer.environment.atmosphere,
@@ -762,4 +862,42 @@ pub struct StarKnowledge {
     pub region: Option<String>,
     pub distance_from_replicant: Option<f64>,
     pub estimated_travel_time: Option<i64>,
+}
+
+#[cfg(test)]
+mod survey_progress_tests {
+    use super::LocationSurveyProgress;
+
+    #[test]
+    fn exact_aggregate_survey_counters_take_precedence_over_terminal_fallback() {
+        let complete = LocationSurveyProgress {
+            planets_total: Some(4),
+            planets_scanned: Some(4),
+            moons_total: Some(7),
+            moons_scanned: Some(7),
+            moons_total_estimated: Some(false),
+            survey_system_complete: None,
+        };
+        assert_eq!(complete.system_survey_complete(), Some(true));
+
+        let contradictory = LocationSurveyProgress {
+            moons_scanned: Some(6),
+            survey_system_complete: Some(true),
+            ..complete
+        };
+        assert_eq!(contradictory.system_survey_complete(), Some(false));
+    }
+
+    #[test]
+    fn terminal_survey_evidence_fills_missing_aggregate_counters() {
+        let progress = LocationSurveyProgress {
+            survey_system_complete: Some(true),
+            ..LocationSurveyProgress::default()
+        };
+        assert_eq!(progress.system_survey_complete(), Some(true));
+        assert_eq!(
+            LocationSurveyProgress::default().system_survey_complete(),
+            None
+        );
+    }
 }

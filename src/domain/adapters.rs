@@ -235,18 +235,91 @@ fn whole_seconds(value: Option<f64>) -> Option<i64> {
 }
 
 fn travel_state(travel: &Option<raw::status::TravelInfo>, realm: &Realm) -> Option<TravelState> {
-    travel.as_ref().map(|travel| TravelState {
-        arrives_at: travel.arrives_at.clone(),
-        departed_at: travel.departed_at.clone(),
-        destination: location_key(&travel.destination, realm),
-        eta_seconds: whole_seconds(travel.eta_seconds),
-        final_arrives_at: travel.final_arrives_at.clone(),
-        final_destination: location_key(&travel.final_destination, realm),
-        origin: location_key(&travel.origin, realm),
-        route_eta_seconds: whole_seconds(travel.route_eta_seconds),
-        stage: travel.stage.clone(),
-        travel_type: travel.r#type.clone(),
+    travel.as_ref().map(|travel| {
+        let mut details = BTreeMap::new();
+        for (key, value) in [
+            (
+                "destination_name",
+                serde_json::json!(travel.destination_name),
+            ),
+            (
+                "destination_type",
+                serde_json::json!(travel.destination_type),
+            ),
+            ("distance_au", serde_json::json!(travel.distance_au)),
+            ("distance_ly", serde_json::json!(travel.distance_ly)),
+            (
+                "final_destination_name",
+                serde_json::json!(travel.final_destination_name),
+            ),
+            ("origin_name", serde_json::json!(travel.origin_name)),
+            (
+                "progress_percent",
+                serde_json::json!(travel.progress_percent),
+            ),
+            ("route", serde_json::json!(travel.route)),
+            (
+                "route_progress_percent",
+                serde_json::json!(travel.route_progress_percent),
+            ),
+            (
+                "total_distance_ly",
+                serde_json::json!(travel.total_distance_ly),
+            ),
+            (
+                "total_time_seconds",
+                serde_json::json!(travel.total_time_seconds),
+            ),
+        ] {
+            if !value.is_null() && !matches!(&value, Value::Array(values) if values.is_empty()) {
+                details.insert(key.to_owned(), value);
+            }
+        }
+        TravelState {
+            arrives_at: travel.arrives_at.clone(),
+            departed_at: travel.departed_at.clone(),
+            destination: location_key(&travel.destination, realm),
+            eta_seconds: whole_seconds(travel.eta_seconds),
+            final_arrives_at: travel.final_arrives_at.clone(),
+            final_destination: location_key(&travel.final_destination, realm),
+            origin: location_key(&travel.origin, realm),
+            route_eta_seconds: whole_seconds(travel.route_eta_seconds),
+            stage: travel.stage.clone(),
+            travel_type: travel.r#type.clone(),
+            details,
+        }
     })
+}
+
+fn activity_value<T: serde::Serialize>(value: &Option<T>) -> Option<Value> {
+    value
+        .as_ref()
+        .and_then(|value| serde_json::to_value(value).ok())
+}
+
+fn device_runtime(raw: &raw::devices::DeviceStatus) -> DeviceRuntimeState {
+    DeviceRuntimeState {
+        created_at: raw.created_at.clone(),
+        short_description: raw.short_description.clone(),
+        description: raw.description.clone(),
+        printing: activity_value(&raw.printing),
+        mining: activity_value(&raw.mining),
+        prospect: activity_value(&raw.prospect),
+        repair: activity_value(&raw.repair),
+        scan: activity_value(&raw.scan),
+        waiting_for: raw.waiting_for.clone().map(Value::Object),
+        print_queue: raw
+            .print_queue
+            .iter()
+            .map(|item| item.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+            .collect(),
+        queue_size: raw.queue_size,
+        taxi_mode: raw.taxi_mode.clone(),
+        tracking_site_id: raw.tracking_site_id,
+        beacon_only: raw.beacon_only,
+        welcome_message: raw.welcome_message.clone(),
+        repair_paid_pct: raw.repair_paid_pct.map(|value| serde_json::json!(value)),
+    }
 }
 
 fn active_device_directive(raw: &raw::devices::DeviceStatus) -> Option<ActiveDeviceDirective> {
@@ -367,6 +440,7 @@ fn device(
         }),
         active_directive: active_device_directive(raw),
         travel: travel_state(&raw.travel, &realm),
+        runtime: device_runtime(raw),
         access,
     })
 }
@@ -704,6 +778,7 @@ pub fn location_detail(
             moons_total: raw.moons_total,
             moons_scanned: raw.moons_scanned,
             moons_total_estimated: raw.moons_total_estimated,
+            survey_system_complete: None,
         },
         environment: LocationEnvironment {
             atmosphere: knowledge(

@@ -9,8 +9,9 @@ use crate::domain::{
     IncomingObjectStatus, LocationEvent, LocationEventId, LocationEventKey, LocationId,
     LocationKey, Message, Observation, ObservationAuthority, ObservationMetadata,
     ObservationSource, ObservationTime, Reachability, Realm, ReplicantId, ReplicantKey,
-    ResourceSite, ResourceSiteId, ResourceSiteKey, Simulation, SimulationId, SimulationLifecycle,
-    SourceDocument, StarId, StarKey, Trade, TradeId, TradeKey, TradeStatus, TravelState,
+    ReplicantStatus, ResourceSite, ResourceSiteId, ResourceSiteKey, Simulation, SimulationId,
+    SimulationLifecycle, SourceDocument, StarId, StarKey, Trade, TradeId, TradeKey, TradeStatus,
+    TravelState,
 };
 use crate::managed::Client;
 
@@ -78,18 +79,67 @@ fn integer_map(value: Option<&Value>) -> BTreeMap<String, i64> {
         .collect()
 }
 
+fn terminal_survey_system_digest(event: &Event) -> bool {
+    if event.name.as_str() != "ami.survey.digest"
+        || event.payload.get("directive").and_then(Value::as_str) != Some("survey_system")
+    {
+        return false;
+    }
+    let Some(progress) = event
+        .payload
+        .get("report")
+        .and_then(|report| report.get("progress"))
+        .and_then(Value::as_object)
+    else {
+        return false;
+    };
+    matches!(
+        (
+            progress.get("scanned").and_then(Value::as_i64),
+            progress.get("remaining").and_then(Value::as_i64),
+            progress.get("total").and_then(Value::as_i64),
+        ),
+        (Some(scanned), Some(0), Some(total)) if total >= 0 && scanned == total
+    )
+}
+
+fn survey_digest_star(event: &Event) -> Option<&str> {
+    event
+        .star
+        .as_ref()
+        .map(|star| star.id.as_str())
+        .or_else(|| {
+            event.location.as_ref().map(|location| {
+                location
+                    .id
+                    .as_str()
+                    .split('-')
+                    .next()
+                    .unwrap_or(location.id.as_str())
+            })
+        })
+        .or_else(|| {
+            event
+                .payload
+                .get("report")
+                .and_then(|report| report.get("scans"))
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_object)
+                .filter_map(|scan| scan.get("scan_target").and_then(Value::as_str))
+                .map(|target| target.split('-').next().unwrap_or(target))
+                .next()
+        })
+}
+
 fn narrow_reconciliation(event: &Event) -> ReconciliationTarget {
     let realm = event.realm.clone().unwrap_or_default();
     if let Some(device) = &event.device {
         return device_reconciliation(device);
     }
     if let Some(replicant) = &event.replicant {
-        return ReconciliationTarget {
-            work_id: format!("replicant:{}", replicant.id.as_str()),
-            realm,
-            kind: "replicant",
-            payload: serde_json::json!({"id": replicant.id.as_str()}),
-        };
+        return replicant_reconciliation(replicant);
     }
     if let Some(location) = &event.location {
         return location_reconciliation(location);
@@ -107,6 +157,15 @@ fn device_reconciliation(key: &DeviceKey) -> ReconciliationTarget {
         work_id: format!("device:{}", key.id.as_str()),
         realm: key.realm.clone(),
         kind: "device",
+        payload: serde_json::json!({"id": key.id.as_str()}),
+    }
+}
+
+fn replicant_reconciliation(key: &ReplicantKey) -> ReconciliationTarget {
+    ReconciliationTarget {
+        work_id: format!("replicant:{}", key.id.as_str()),
+        realm: key.realm.clone(),
+        kind: "replicant",
         payload: serde_json::json!({"id": key.id.as_str()}),
     }
 }
@@ -503,8 +562,10 @@ pub(super) fn projection_device_movement(
             let Some(carrier_key) = event.device.clone() else {
                 return projection_reconciliation_only(client, event);
             };
+            let hosting_replicant = device(client, &carrier_key)
+                .and_then(|carrier| carrier.value.relationships.hosting_replicant.clone());
             let attached = strings(event.payload.get("attached_devices"));
-            let keys = std::iter::once(carrier_key)
+            let keys = std::iter::once(carrier_key.clone())
                 .chain(
                     attached
                         .into_iter()
@@ -567,6 +628,74 @@ pub(super) fn projection_device_movement(
             }
             if !batch.devices.is_empty() {
                 batch.reconciliation.clear();
+            }
+
+            // A Replicant hosted by the travelling carrier shares the carrier's
+            // physical location even when the Replicant detail endpoint is not
+            // refreshed. Keep that projection coherent so worker eligibility
+            // and UI location reads do not retain the pre-travel system.
+            if let Some(replicant_key) = hosting_replicant {
+                if let Some(mut replicant) = client.managed_state().replicant(&replicant_key) {
+                    match event.name.as_str() {
+                        "travel.departed" => {
+                            replicant.value.location = None;
+                            replicant.value.travel = Some(TravelState {
+                                arrives_at: event
+                                    .payload
+                                    .get("arrives_at")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_owned),
+                                departed_at: Some(event.occurred_at.clone()),
+                                destination: event
+                                    .payload
+                                    .get("destination")
+                                    .and_then(Value::as_str)
+                                    .map(|id| {
+                                        LocationKey::in_realm(realm.clone(), LocationId::new(id))
+                                    }),
+                                origin: event.payload.get("origin").and_then(Value::as_str).map(
+                                    |id| LocationKey::in_realm(realm.clone(), LocationId::new(id)),
+                                ),
+                                stage: Some("traveling".to_owned()),
+                                travel_type: event
+                                    .payload
+                                    .get("travel_type")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_owned),
+                                ..TravelState::default()
+                            });
+                            replicant.value.status = Some(ReplicantStatus::Travelling);
+                        }
+                        "travel.arrived" => {
+                            replicant.value.location = event
+                                .payload
+                                .get("destination")
+                                .and_then(Value::as_str)
+                                .map(|id| {
+                                    LocationKey::in_realm(realm.clone(), LocationId::new(id))
+                                });
+                            replicant.value.travel = None;
+                            replicant.value.status = Some(ReplicantStatus::Stationary);
+                        }
+                        _ => {
+                            replicant.value.location = event
+                                .payload
+                                .get("origin")
+                                .and_then(Value::as_str)
+                                .map(|id| {
+                                    LocationKey::in_realm(realm.clone(), LocationId::new(id))
+                                });
+                            replicant.value.travel = None;
+                            replicant.value.status = Some(ReplicantStatus::Stationary);
+                        }
+                    }
+                    replicant.metadata = metadata(event);
+                    batch.replicants.push(replicant);
+                } else {
+                    batch
+                        .reconciliation
+                        .push(replicant_reconciliation(&replicant_key));
+                }
             }
         }
         "replicant.transferred" | "teleport.completed" => {
@@ -725,6 +854,18 @@ pub(super) fn projection_world_lifecycle(
                     {
                         batch.resource_sites.push(site);
                     }
+                }
+            }
+            if terminal_survey_system_digest(event)
+                && let Some(star_id) = survey_digest_star(event)
+            {
+                let key = LocationKey::in_realm(realm.clone(), LocationId::new(star_id));
+                if let Some(mut location) = client.managed_state().location(&key) {
+                    location.value.survey_progress.survey_system_complete = Some(true);
+                    location.metadata = metadata(event);
+                    batch.locations.push(location);
+                } else {
+                    batch.reconciliation.push(location_reconciliation(&key));
                 }
             }
         }

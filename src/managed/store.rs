@@ -125,6 +125,17 @@ type CloseResponse = oneshot::Receiver<Result<(), StoreError>>;
 type CatalogueRows = (BTreeMap<StarKey, Observation<Star>>, Option<String>);
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct EventHistoryFilter {
+    pub(crate) after: Option<String>,
+    pub(crate) device_code: Option<String>,
+    pub(crate) replicant_code: Option<String>,
+    pub(crate) star_id: Option<String>,
+    pub(crate) location_id: Option<String>,
+    pub(crate) event_name: Option<String>,
+    pub(crate) latest: Option<usize>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct MessageMetadata {
     pub(crate) last_cursor: Option<i64>,
     pub(crate) unread_count: Option<i64>,
@@ -591,21 +602,9 @@ impl StoreProxy {
     pub(crate) fn event_cursor(&self) -> Result<Option<String>, StoreError> {
         self.0.execute_blocking(|s| s.event_cursor())
     }
-    pub(crate) fn read_events(
-        &self,
-        after: Option<String>,
-        device_code: Option<String>,
-        event_name: Option<String>,
-        latest: Option<usize>,
-    ) -> Result<Vec<Event>, StoreError> {
-        self.0.execute_blocking(move |store| {
-            store.read_events(
-                after.as_deref(),
-                device_code.as_deref(),
-                event_name.as_deref(),
-                latest,
-            )
-        })
+    pub(crate) fn read_events(&self, filter: EventHistoryFilter) -> Result<Vec<Event>, StoreError> {
+        self.0
+            .execute_blocking(move |store| store.read_events_filtered(&filter))
     }
     pub(crate) fn prepare_projection_replay(
         &mut self,
@@ -2267,7 +2266,21 @@ impl Store {
         event_name: Option<&str>,
         latest: Option<usize>,
     ) -> Result<Vec<Event>, StoreError> {
+        self.read_events_filtered(&EventHistoryFilter {
+            after: after.map(str::to_owned),
+            device_code: device_code.map(str::to_owned),
+            event_name: event_name.map(str::to_owned),
+            latest,
+            ..EventHistoryFilter::default()
+        })
+    }
+
+    pub(crate) fn read_events_filtered(
+        &self,
+        filter: &EventHistoryFilter,
+    ) -> Result<Vec<Event>, StoreError> {
         let started = Instant::now();
+        let after = filter.after.as_deref();
         let after_parts = after.map(parse_event_id).transpose()?;
         let mut sql = String::from(
             "SELECT event_id, realm, event_name, category, device_code, replicant_code, star_id, location_id, occurred_at, payload_json \
@@ -2280,15 +2293,27 @@ impl Store {
             parameters.push(sequence.into());
             parameters.push(after.unwrap_or_default().to_owned().into());
         }
-        if let Some(device_code) = device_code {
+        if let Some(device_code) = filter.device_code.as_deref() {
             sql.push_str(" AND device_code = ?");
             parameters.push(device_code.to_owned().into());
         }
-        if let Some(event_name) = event_name {
+        if let Some(replicant_code) = filter.replicant_code.as_deref() {
+            sql.push_str(" AND replicant_code = ?");
+            parameters.push(replicant_code.to_owned().into());
+        }
+        if let Some(star_id) = filter.star_id.as_deref() {
+            sql.push_str(" AND star_id = ?");
+            parameters.push(star_id.to_owned().into());
+        }
+        if let Some(location_id) = filter.location_id.as_deref() {
+            sql.push_str(" AND location_id = ?");
+            parameters.push(location_id.to_owned().into());
+        }
+        if let Some(event_name) = filter.event_name.as_deref() {
             sql.push_str(" AND event_name = ?");
             parameters.push(event_name.to_owned().into());
         }
-        if let Some(limit) = latest {
+        if let Some(limit) = filter.latest {
             sql.push_str(
                 " ORDER BY stream_millis DESC, stream_sequence DESC, event_id DESC LIMIT ?",
             );
@@ -2303,7 +2328,7 @@ impl Store {
         let query_started = Instant::now();
         let mut rows = statement.query(params_from_iter(parameters.iter()))?;
         let query_ms = query_started.elapsed().as_millis() as u64;
-        let mut events = Vec::with_capacity(latest.unwrap_or_default());
+        let mut events = Vec::with_capacity(filter.latest.unwrap_or_default());
         let mut row_ms = 0u64;
         let mut decode_ms = 0u64;
         loop {
@@ -2320,7 +2345,7 @@ impl Store {
         }
         drop(rows);
         drop(statement);
-        if latest.is_some() {
+        if filter.latest.is_some() {
             events.reverse();
         }
         let elapsed = started.elapsed();
@@ -2329,9 +2354,12 @@ impl Store {
                 target: "replicant_client::store",
                 event = "store.read_events_slow",
                 requested_after_id = after.unwrap_or(""),
-                requested_device_code = device_code.unwrap_or(""),
-                requested_event_name = event_name.unwrap_or(""),
-                limit = latest.unwrap_or_default(),
+                requested_device_code = filter.device_code.as_deref().unwrap_or(""),
+                requested_replicant_code = filter.replicant_code.as_deref().unwrap_or(""),
+                requested_star_id = filter.star_id.as_deref().unwrap_or(""),
+                requested_location_id = filter.location_id.as_deref().unwrap_or(""),
+                requested_event_name = filter.event_name.as_deref().unwrap_or(""),
+                limit = filter.latest.unwrap_or_default(),
                 rows_returned = events.len(),
                 prepare_ms,
                 query_ms,
@@ -2345,9 +2373,12 @@ impl Store {
                 target: "replicant_client::store",
                 event = "store.read_events_completed",
                 requested_after_id = after.unwrap_or(""),
-                requested_device_code = device_code.unwrap_or(""),
-                requested_event_name = event_name.unwrap_or(""),
-                limit = latest.unwrap_or_default(),
+                requested_device_code = filter.device_code.as_deref().unwrap_or(""),
+                requested_replicant_code = filter.replicant_code.as_deref().unwrap_or(""),
+                requested_star_id = filter.star_id.as_deref().unwrap_or(""),
+                requested_location_id = filter.location_id.as_deref().unwrap_or(""),
+                requested_event_name = filter.event_name.as_deref().unwrap_or(""),
+                limit = filter.latest.unwrap_or_default(),
                 rows_returned = events.len(),
                 prepare_ms,
                 query_ms,
@@ -5090,6 +5121,7 @@ mod tests {
                 system_status: None,
                 active_directive: None,
                 travel: None,
+                runtime: Default::default(),
                 access: AccessScope::Owned,
             },
             metadata: ObservationMetadata {

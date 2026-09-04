@@ -114,7 +114,7 @@ pub struct CargoItem {
 
 /// A device's in-progress prospecting scan.
 #[non_exhaustive]
-#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct ProspectInfo {
     /// When prospecting completes, RFC3339.
     pub completes_at: Option<String>,
@@ -133,7 +133,7 @@ pub struct ProspectInfo {
 
 /// A device's in-progress repair.
 #[non_exhaustive]
-#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct RepairInfo {
     /// Estimated seconds remaining. Replicant Space 2.3.3 emits whole seconds;
     /// `f64` is retained for source compatibility and accepts integer JSON.
@@ -148,7 +148,7 @@ pub struct RepairInfo {
 
 /// A device's in-progress scan.
 #[non_exhaustive]
-#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct ScanInfo {
     /// When the scan completes, RFC3339.
     pub completes_at: Option<String>,

@@ -207,7 +207,15 @@ open_value!(DeviceDirective {
     BeltSearch => "belt_search", Delivery => "delivery", Shuttle => "shuttle",
     Ferry => "ferry", Consolidate => "consolidate"
 });
-open_value!(ReplicantStatus { Active => "active", Offline => "offline", Traveling => "traveling" });
+open_value!(ReplicantStatus {
+    Stationary => "stationary",
+    Travelling => "travelling",
+    Mining => "mining",
+    Offline => "offline",
+    // Retained for compatibility with older/alternate API payloads.
+    Active => "active",
+    Traveling => "traveling"
+});
 open_value!(SpeciesKind { Human => "human" });
 open_value!(LocationType { Planet => "planet", Moon => "moon", Belt => "belt", Station => "station" });
 open_value!(Atmosphere {
@@ -257,6 +265,20 @@ open_value!(EventCategory { Account => "account", Device => "device", Replicant 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn documented_replicant_status_values_are_typed() {
+        assert_eq!(
+            ReplicantStatus::from("stationary"),
+            ReplicantStatus::Stationary
+        );
+        assert_eq!(
+            ReplicantStatus::from("travelling"),
+            ReplicantStatus::Travelling
+        );
+        assert_eq!(ReplicantStatus::from("mining"), ReplicantStatus::Mining);
+        assert_eq!(ReplicantStatus::from("offline"), ReplicantStatus::Offline);
+    }
 
     #[test]
     fn device_type_catalogue_matches_blueprints_and_non_printable_devices() {

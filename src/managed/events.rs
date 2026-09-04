@@ -188,6 +188,9 @@ pub struct EventHistoryQuery {
     client: Client,
     after: Option<String>,
     device_code: Option<String>,
+    replicant_code: Option<String>,
+    star_id: Option<String>,
+    location_id: Option<String>,
     event_name: Option<String>,
     latest: Option<usize>,
 }
@@ -198,6 +201,9 @@ impl EventHistoryQuery {
             client,
             after: None,
             device_code: None,
+            replicant_code: None,
+            star_id: None,
+            location_id: None,
             event_name: None,
             latest: None,
         }
@@ -214,6 +220,27 @@ impl EventHistoryQuery {
     #[must_use]
     pub fn for_device(mut self, device_code: impl Into<String>) -> Self {
         self.device_code = Some(device_code.into());
+        self
+    }
+
+    /// Returns only events associated with this Replicant code.
+    #[must_use]
+    pub fn for_replicant(mut self, replicant_code: impl Into<String>) -> Self {
+        self.replicant_code = Some(replicant_code.into());
+        self
+    }
+
+    /// Returns only events associated with this star system.
+    #[must_use]
+    pub fn in_system(mut self, star_id: impl Into<String>) -> Self {
+        self.star_id = Some(star_id.into());
+        self
+    }
+
+    /// Returns only events associated with this exact location.
+    #[must_use]
+    pub fn at_location(mut self, location_id: impl Into<String>) -> Self {
+        self.location_id = Some(location_id.into());
         self
     }
 
@@ -238,7 +265,15 @@ impl EventHistoryQuery {
         self.client.ensure_open()?;
         self.client
             .managed_state()
-            .events(self.after, self.device_code, self.event_name, self.latest)
+            .events(super::store::EventHistoryFilter {
+                after: self.after,
+                device_code: self.device_code,
+                replicant_code: self.replicant_code,
+                star_id: self.star_id,
+                location_id: self.location_id,
+                event_name: self.event_name,
+                latest: self.latest,
+            })
             .map_err(persistence_error)
     }
 }
@@ -1902,9 +1937,15 @@ mod tests {
             name: crate::domain::EventName::from("travel.departed"),
             category: crate::domain::EventCategory::from("travel"),
             device: Some(DeviceKey::live(DeviceId::from("D1"))),
-            replicant: None,
-            location: None,
-            star: None,
+            replicant: Some(crate::domain::ReplicantKey::live(
+                crate::domain::ReplicantId::from("R1"),
+            )),
+            location: Some(crate::domain::LocationKey::live(
+                crate::domain::LocationId::from("L1"),
+            )),
+            star: Some(crate::domain::StarKey::live(crate::domain::StarId::from(
+                "S1",
+            ))),
             occurred_at: "2026-07-29T00:00:00Z".into(),
             payload: BTreeMap::new(),
         };
@@ -1914,9 +1955,15 @@ mod tests {
             name: crate::domain::EventName::from("directive.completed"),
             category: crate::domain::EventCategory::from("directive"),
             device: Some(DeviceKey::live(DeviceId::from("D1"))),
-            replicant: None,
-            location: None,
-            star: None,
+            replicant: Some(crate::domain::ReplicantKey::live(
+                crate::domain::ReplicantId::from("R1"),
+            )),
+            location: Some(crate::domain::LocationKey::live(
+                crate::domain::LocationId::from("L1"),
+            )),
+            star: Some(crate::domain::StarKey::live(crate::domain::StarId::from(
+                "S1",
+            ))),
             occurred_at: "2026-07-29T00:00:01Z".into(),
             payload: BTreeMap::new(),
         };
@@ -1926,9 +1973,15 @@ mod tests {
             name: crate::domain::EventName::from("directive.completed"),
             category: crate::domain::EventCategory::from("directive"),
             device: Some(DeviceKey::live(DeviceId::from("D2"))),
-            replicant: None,
-            location: None,
-            star: None,
+            replicant: Some(crate::domain::ReplicantKey::live(
+                crate::domain::ReplicantId::from("R2"),
+            )),
+            location: Some(crate::domain::LocationKey::live(
+                crate::domain::LocationId::from("L2"),
+            )),
+            star: Some(crate::domain::StarKey::live(crate::domain::StarId::from(
+                "S2",
+            ))),
             occurred_at: "2026-07-29T00:00:02Z".into(),
             payload: BTreeMap::new(),
         };
@@ -1972,6 +2025,23 @@ mod tests {
                 .map(|event| event.id.as_str())
                 .collect::<Vec<_>>(),
             ["10-0"]
+        );
+        let entity_events = client
+            .events()
+            .history()
+            .for_replicant("R1")
+            .in_system("S1")
+            .at_location("L1")
+            .latest(10)
+            .collect()
+            .await
+            .expect("entity-filtered local history");
+        assert_eq!(
+            entity_events
+                .iter()
+                .map(|event| event.id.as_str())
+                .collect::<Vec<_>>(),
+            ["9-999", "10-0"]
         );
         assert_eq!(
             client.events().cursor().expect("cursor").as_deref(),
@@ -2275,6 +2345,7 @@ mod tests {
                 system_status: None,
                 active_directive: None,
                 travel: None,
+                runtime: Default::default(),
                 access: AccessScope::Owned,
             },
             metadata: ObservationMetadata {
@@ -2319,6 +2390,7 @@ mod tests {
                 system_status: None,
                 active_directive: None,
                 travel: None,
+                runtime: Default::default(),
                 access: AccessScope::Owned,
             },
             metadata: ObservationMetadata {

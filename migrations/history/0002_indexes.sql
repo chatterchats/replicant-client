@@ -11,3 +11,12 @@ WHERE applied_at IS NOT NULL OR archived_only = 1;
 CREATE INDEX IF NOT EXISTS event_history_retained_device_stream_order
 ON event_history(device_code, stream_millis, stream_sequence, event_id)
 WHERE applied_at IS NOT NULL OR archived_only = 1;
+CREATE INDEX IF NOT EXISTS event_history_retained_replicant_stream_order
+ON event_history(replicant_code, stream_millis, stream_sequence, event_id)
+WHERE replicant_code IS NOT NULL AND (applied_at IS NOT NULL OR archived_only = 1);
+CREATE INDEX IF NOT EXISTS event_history_retained_star_stream_order
+ON event_history(star_id, stream_millis, stream_sequence, event_id)
+WHERE star_id IS NOT NULL AND (applied_at IS NOT NULL OR archived_only = 1);
+CREATE INDEX IF NOT EXISTS event_history_retained_location_stream_order
+ON event_history(location_id, stream_millis, stream_sequence, event_id)
+WHERE location_id IS NOT NULL AND (applied_at IS NOT NULL OR archived_only = 1);

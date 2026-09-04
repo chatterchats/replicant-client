@@ -118,7 +118,7 @@ pub struct ReplicantStatus {
     pub pronouns: Option<String>,
     /// Stable replicant code.
     pub replicant_code: Option<String>,
-    /// Replicant status, e.g. `"active"`, `"offline"`.
+    /// Replicant host activity, e.g. `"stationary"`, `"travelling"`, `"mining"`, `"offline"`.
     pub status: Option<String>,
     /// Devices currently stowed by this replicant, open-shaped.
     #[serde(default)]

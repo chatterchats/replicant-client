@@ -1664,7 +1664,7 @@ fn check_device_capability(client: &Client, device_code: &str, command_name: &st
             });
         }
         if device_command_requires_star_system(command_name)
-            && !device_command_has_stationary_star_system(client, device, command_name)
+            && !device_command_has_stationary_star_system(client, device)
         {
             return Err(Error::Operation {
                 message: format!(
@@ -1676,31 +1676,24 @@ fn check_device_capability(client: &Client, device_code: &str, command_name: &st
     Ok(())
 }
 
-fn device_command_has_stationary_star_system(
-    client: &Client,
-    device: &domain::Device,
-    command_name: &str,
-) -> bool {
+fn device_command_has_stationary_star_system(client: &Client, device: &domain::Device) -> bool {
     if device.location.is_some() && device.travel.is_none() {
         return true;
     }
 
-    // A stowed device intentionally has no direct location of its own. Deploy
-    // executes at the stow container's location, so validate the stationary
-    // container instead of rejecting a healthy stowed-device projection.
-    if command_name == "deploy"
-        && let Some(container) = device.relationships.stowed_in.as_ref()
-    {
-        let key = DeviceKey::live(DeviceId::from(container.id.as_str()));
-        return client
-            .managed_state()
-            .device(&key)
-            .is_some_and(|observation| {
-                observation.value.location.is_some() && observation.value.travel.is_none()
-            });
-    }
-
-    false
+    // A stowed device intentionally has no direct location of its own. Commands
+    // such as AMI `launch` execute in the physical context of the stow
+    // container, so a stationary container is authoritative for this preflight.
+    let Some(container) = device.relationships.stowed_in.as_ref() else {
+        return false;
+    };
+    let key = DeviceKey::live(DeviceId::from(container.id.as_str()));
+    client
+        .managed_state()
+        .device(&key)
+        .is_some_and(|observation| {
+            observation.value.location.is_some() && observation.value.travel.is_none()
+        })
 }
 
 fn device_command_requires_star_system(command_name: &str) -> bool {

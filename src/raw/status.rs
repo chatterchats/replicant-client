@@ -1,12 +1,12 @@
 //! Activity status shared by device and replicant responses.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::raw::JsonObject;
 
 /// An in-progress mining operation.
 #[non_exhaustive]
-#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct MiningInfo {
     /// Current resource availability at the mining site.
     pub availability: Option<String>,
@@ -30,7 +30,7 @@ pub struct MiningInfo {
 
 /// An in-progress print job.
 #[non_exhaustive]
-#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct PrintingInfo {
     /// When the current print completes, RFC3339.
     pub completes_at: Option<String>,
@@ -49,7 +49,7 @@ pub struct PrintingInfo {
 
 /// In-progress travel.
 #[non_exhaustive]
-#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct TravelInfo {
     /// When this leg arrives, RFC3339.
     pub arrives_at: Option<String>,

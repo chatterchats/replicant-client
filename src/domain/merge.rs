@@ -88,6 +88,18 @@ pub fn merge_device(
         &mut incoming.value.in_control_range,
         &existing.value.in_control_range,
     );
+    // Collection/list observations may omit rich activity detail. Preserve
+    // previously observed values in that case. A fresh entity snapshot is
+    // authoritative and is allowed to clear an activity that has completed.
+    if !matches!(
+        incoming.metadata.authority,
+        ObservationAuthority::EntitySnapshot
+    ) {
+        incoming
+            .value
+            .runtime
+            .preserve_missing_from(&existing.value.runtime);
+    }
     if matches!(existing.metadata.access, AccessScope::Owned)
         && matches!(incoming.metadata.access, AccessScope::Public)
     {
@@ -111,6 +123,7 @@ pub fn merge_device(
         incoming.value.system_status = existing.value.system_status;
         incoming.value.active_directive = existing.value.active_directive;
         incoming.value.travel = existing.value.travel;
+        incoming.value.runtime = existing.value.runtime;
     }
     MergeOutcome::Replaced(incoming)
 }
@@ -229,6 +242,7 @@ mod tests {
                 system_status: None,
                 active_directive: None,
                 travel: None,
+                runtime: Default::default(),
                 access: AccessScope::Owned,
             },
             metadata: ObservationMetadata {

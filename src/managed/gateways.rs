@@ -2668,6 +2668,7 @@ mod tests {
                 system_status: None,
                 active_directive: None,
                 travel: None,
+                runtime: Default::default(),
                 access: AccessScope::Owned,
             },
             metadata: domain::ObservationMetadata {

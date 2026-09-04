@@ -119,7 +119,10 @@ pub mod managed {
     };
     pub use simulations::{SimulationQuery, SimulationsGateway};
     pub use smart_travel::SmartTravelRouter;
-    pub use state::{GalaxyRevisionWatch, ManagedStateSnapshot, StateGateway, StateRevisionWatch};
+    pub use state::{
+        GalaxyRevisionWatch, ManagedStateSnapshot, StateGateway, StateProjectionGroup,
+        StateRevisionChange, StateRevisionWatch,
+    };
     pub use sync::{
         SyncCancellation, SyncClient, SyncDiagnostic, SyncDomain, SyncFailure, SyncFailureKind,
         SyncPlan, SyncPlanError, SyncProgress, SyncReadiness, SyncReport,
@@ -145,9 +148,9 @@ pub use managed::{
     RefreshReadiness, RefreshRequest, RefreshRunId, RefreshRunState, RefreshRunStatus,
     RelayHistoryQuery, ReplicantHandle, ReplicantQuery, ReplicantStarSyncReport, ReplicantsGateway,
     SimulationQuery, SimulationsGateway, SmartTravelRouter, StartupPolicy, StateGateway,
-    StateRevisionWatch, SurveyController, SurveyDirective, SyncCancellation, SyncClient,
-    SyncDiagnostic, SyncDomain, SyncFailure, SyncFailureKind, SyncPlan, SyncPlanError,
-    SyncProgress, SyncReadiness, SyncReport, TradeControllerHandle, TradingGateway,
+    StateProjectionGroup, StateRevisionChange, StateRevisionWatch, SurveyController,
+    SurveyDirective, SyncDiagnostic, SyncDomain, SyncFailure, SyncFailureKind, SyncPlan,
+    SyncPlanError, SyncProgress, SyncReadiness, SyncReport, TradeControllerHandle, TradingGateway,
     TransportController, TransportDirective, TravelBuilder, TravelPreview, TravelVia,
     TutorialsGateway, default_data_directory, default_database_path, default_history_database_path,
 };
