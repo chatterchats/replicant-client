@@ -1843,7 +1843,8 @@ impl WorkflowRepository {
     pub fn active_resource_reservations(
         &self,
     ) -> Result<Vec<ResourceReservation>, RepositoryError> {
-        resource_reservations_in(&self.connection()?, None)
+        let connection = self.connection()?;
+        resource_reservations_in(&connection, None)
     }
 
     /// Lists current quantity reservations owned by one workflow.
@@ -1851,7 +1852,8 @@ impl WorkflowRepository {
         &self,
         workflow_id: WorkflowId,
     ) -> Result<Vec<ResourceReservation>, RepositoryError> {
-        resource_reservations_in(&self.connection()?, Some(workflow_id))
+        let connection = self.connection()?;
+        resource_reservations_in(&connection, Some(workflow_id))
     }
 
     /// Idempotently records exact structured targets associated with a workflow.
@@ -1964,12 +1966,14 @@ impl WorkflowRepository {
         &self,
         workflow_id: WorkflowId,
     ) -> Result<Vec<WorkflowTargetRecord>, RepositoryError> {
-        workflow_targets_in(&self.connection()?, Some(workflow_id), false)
+        let connection = self.connection()?;
+        workflow_targets_in(&connection, Some(workflow_id), false)
     }
 
     /// Lists targets owned by workflows that are still capable of making progress.
     pub fn active_workflow_targets(&self) -> Result<Vec<WorkflowTargetRecord>, RepositoryError> {
-        workflow_targets_in(&self.connection()?, None, true)
+        let connection = self.connection()?;
+        workflow_targets_in(&connection, None, true)
     }
 
     /// Reverse-looks up workflows that have ever recorded one exact target identity.
