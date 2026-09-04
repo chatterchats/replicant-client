@@ -98,7 +98,6 @@ clean:
 	$(CARGO) clean --manifest-path $(GALAXY_RENDERER_DIR)/Cargo.toml
 
 build: desktop-prepare
-	$(CARGO) build --workspace
 	$(CARGO) build --workspace --all-features
 
 build-workspace: build
@@ -114,11 +113,9 @@ fmt-check: galaxy-fmt-check
 	$(MAKE) desktop-fmt-check
 
 lint: galaxy-lint
-	$(CARGO) clippy --workspace --all-targets -- -D warnings
 	$(CARGO) clippy --workspace --all-targets --all-features -- -D warnings
 
 check-all: check-all-features
-	$(CARGO) check --workspace --all-targets
 
 check-all-features:
 	$(CARGO) check --workspace --all-targets --all-features
@@ -132,7 +129,6 @@ check-events:
 feature-checks: check-raw check-events check-all-features
 
 test:
-	$(CARGO) test --workspace
 	$(CARGO) test --workspace --all-features
 
 doc: galaxy-doc

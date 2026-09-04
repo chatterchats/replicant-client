@@ -47,7 +47,6 @@ mining-expansion*
 !crates/galaxy-renderer/Cargo.lock
 *.log
 *.txt
-!reference/replicant-docs-crawler/requirements.txt
 apps/web/node_modules/
 apps/web/dist/
 apps/web/src/wasm/galaxy_renderer/
@@ -63,4 +62,3 @@ apps/desktop/node_modules/
 apps/desktop/src-tauri/binaries/replicantd-*
 apps/desktop/src-tauri/icons/
 node_modules/
-!blueprints.json
