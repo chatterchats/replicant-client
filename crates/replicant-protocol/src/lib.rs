@@ -310,6 +310,21 @@ pub enum DirectorRegionStatus {
     Established,
 }
 
+/// Current operational availability of a Director-managed Replicant.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DirectorWorkerState {
+    /// Physically stationary, located, and available with its racing vessel.
+    Operational,
+    /// The Replicant or its racing vessel is travelling.
+    InTransit,
+    /// A non-terminal workflow currently owns the Replicant.
+    Busy,
+    /// Physical readiness is unknown or unsuitable for regional work.
+    #[default]
+    Unavailable,
+}
+
 /// One regional Replicant assignment managed by the Director.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DirectorReplicantAssignment {
@@ -325,6 +340,9 @@ pub struct DirectorReplicantAssignment {
     pub workflow_id: Option<WorkflowId>,
     /// Optional soft role preference such as catalogue or events.
     pub role_affinity: Option<String>,
+    /// Current physical/claim availability for regional work.
+    #[serde(default)]
+    pub state: DirectorWorkerState,
 }
 
 /// Director view of one discovered region.
@@ -342,6 +360,15 @@ pub struct DirectorRegionSummary {
     pub replicants: Vec<String>,
     /// Number of known catalogue systems in the region.
     pub known_systems: usize,
+    /// Assigned Replicants that are currently operational in this region.
+    #[serde(default)]
+    pub operational_workers: usize,
+    /// Assigned Replicants currently travelling.
+    #[serde(default)]
+    pub workers_in_transit: usize,
+    /// Assigned Replicants currently owned by another workflow.
+    #[serde(default)]
+    pub busy_workers: usize,
 }
 
 /// One instantiated standing Director goal.
@@ -445,6 +472,38 @@ pub struct DirectorRequirementSummary {
     pub active_workflows: Vec<WorkflowId>,
 }
 
+/// Per-region workforce diagnostics reported by the Automation Director.
+///
+/// This additive view explains the capacity and scaling state for each
+/// managed region without changing the existing aggregate workforce fields.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DirectorRegionalWorkforceSummary {
+    /// Canonical region name.
+    pub region: String,
+    /// Number of workers targeted for regional bootstrap.
+    pub bootstrap_target: usize,
+    /// Number of workers assigned to this region.
+    pub assigned: usize,
+    /// Number of workers currently incoming to this region.
+    pub incoming: usize,
+    /// Number of assigned workers currently operational.
+    pub operational: usize,
+    /// Number of assigned workers currently in transit.
+    pub in_transit: usize,
+    /// Number of assigned workers currently claimed by another workflow.
+    pub busy: usize,
+    /// Desired ordinary (non-bootstrap) capacity for this region.
+    pub desired_ordinary_capacity: usize,
+    /// Whether regional scale-up is currently suppressed.
+    pub scale_up_suppressed: bool,
+    /// Explanation for regional scale-up suppression, when applicable.
+    pub scale_up_suppression_reason: Option<String>,
+    /// Manufacturing home location, when known.
+    pub manufacturing_home: Option<String>,
+    /// Explanation for the manufacturing-home state, when available.
+    pub manufacturing_home_reason: Option<String>,
+}
+
 /// Grow-only workforce pressure summary.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DirectorWorkforceSummary {
@@ -452,6 +511,15 @@ pub struct DirectorWorkforceSummary {
     pub total: usize,
     /// Replicants claimed by active workflows.
     pub busy: usize,
+    /// Replicants currently operational for regional work.
+    #[serde(default)]
+    pub operational: usize,
+    /// Replicants whose own or hosted-vessel travel is in progress.
+    #[serde(default)]
+    pub in_transit: usize,
+    /// Replicants not operational for reasons other than travel or a workflow claim.
+    #[serde(default)]
+    pub unavailable: usize,
     /// Replicants currently unclaimed by automation.
     pub idle: usize,
     /// `idle / total`, or `1.0` for an empty account.
@@ -462,6 +530,9 @@ pub struct DirectorWorkforceSummary {
     pub scale_up_recommended: bool,
     /// Human-readable reason for or against scaling.
     pub scale_reason: Option<String>,
+    /// Per-region workforce capacity and scaling diagnostics.
+    #[serde(default)]
+    pub regions: Vec<DirectorRegionalWorkforceSummary>,
 }
 
 /// Additive derived-urgency facts emitted by the Automation Director.
@@ -684,6 +755,141 @@ pub struct DeviceSummary {
     pub claim: Option<DeviceClaim>,
 }
 
+/// Full in-progress travel state used by Inspector detail projections.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TravelInspectorSummary {
+    /// Current leg arrival timestamp.
+    pub arrives_at: Option<String>,
+    /// Travel departure timestamp.
+    pub departed_at: Option<String>,
+    /// Current leg destination.
+    pub destination: Option<String>,
+    /// Current ETA reported by the server, in seconds.
+    pub eta_seconds: Option<i64>,
+    /// Final route arrival timestamp.
+    pub final_arrives_at: Option<String>,
+    /// Final route destination.
+    pub final_destination: Option<String>,
+    /// Travel origin.
+    pub origin: Option<String>,
+    /// Whole-route ETA reported by the server, in seconds.
+    pub route_eta_seconds: Option<i64>,
+    /// Forward-compatible route stage.
+    pub stage: Option<String>,
+    /// Forward-compatible travel type.
+    pub travel_type: Option<String>,
+    /// Additional route, distance, and progress facts.
+    #[serde(default)]
+    pub details: BTreeMap<String, Value>,
+}
+
+/// Rich Inspector-only current device activity.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct DeviceRuntimeInspectorSummary {
+    /// Device creation timestamp.
+    pub created_at: Option<String>,
+    /// Short description supplied by the device API.
+    pub short_description: Option<String>,
+    /// Full description supplied by the device API.
+    pub description: Option<String>,
+    /// Active print job.
+    pub printing: Option<Value>,
+    /// Active mining operation.
+    pub mining: Option<Value>,
+    /// Active prospecting operation.
+    pub prospect: Option<Value>,
+    /// Active repair operation.
+    pub repair: Option<Value>,
+    /// Active scan operation.
+    pub scan: Option<Value>,
+    /// Server-reported blocking/waiting state.
+    pub waiting_for: Option<Value>,
+    /// Open-shaped print queue entries.
+    #[serde(default)]
+    pub print_queue: Vec<BTreeMap<String, Value>>,
+    /// Maximum print queue size.
+    pub queue_size: Option<i64>,
+    /// Taxi/passenger mode.
+    pub taxi_mode: Option<String>,
+    /// Tracking-site identifier.
+    pub tracking_site_id: Option<i64>,
+    /// Whether this network device is beacon-only.
+    pub beacon_only: Option<bool>,
+    /// Configured welcome message.
+    pub welcome_message: Option<String>,
+    /// Percentage of repair cost already paid.
+    pub repair_paid_pct: Option<Value>,
+}
+
+/// Rich Inspector-only device projection.
+///
+/// Fleet/list endpoints continue to use [`DeviceSummary`] so opening the
+/// Inspector can expose deeper state without making every device snapshot
+/// carry configuration and travel detail.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DeviceInspectorSummary {
+    /// Lightweight device projection shared with fleet views.
+    #[serde(flatten)]
+    pub device: DeviceSummary,
+    /// Authoritative deployment timestamp when reported.
+    pub deployed_at: Option<String>,
+    /// Whether the device is currently in controller range.
+    pub in_control_range: Option<bool>,
+    /// Forward-compatible device configuration.
+    #[serde(default)]
+    pub settings: BTreeMap<String, Value>,
+    /// Replicant matrix physically hosted by this device.
+    pub hosting_replicant: Option<EntityRef>,
+    /// Full current travel state.
+    pub travel: Option<TravelInspectorSummary>,
+    /// Rich current device activity and device-type status.
+    #[serde(default)]
+    pub runtime: DeviceRuntimeInspectorSummary,
+}
+
+/// Rich Inspector projection for one owned Replicant.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ReplicantInspectorSummary {
+    /// Stable Replicant address.
+    pub entity: EntityRef,
+    /// Display name.
+    pub name: Option<String>,
+    /// Forward-compatible Replicant status.
+    pub status: Option<String>,
+    /// Whether this is an NPC Replicant.
+    pub is_npc: Option<bool>,
+    /// Managed ownership/access scope.
+    pub ownership: String,
+    /// Current physical system.
+    pub system: Option<String>,
+    /// Formal or gateway-expanded physical region.
+    pub region: Option<String>,
+    /// Region permanently assigned by the Automation Director.
+    pub assigned_region: Option<String>,
+    /// Current Director worker classification.
+    pub director_state: Option<String>,
+    /// Optional Director role affinity.
+    pub role_affinity: Option<String>,
+    /// Workflow currently claiming this Replicant, when busy.
+    pub workflow_id: Option<String>,
+    /// Current physical location.
+    pub location: Option<String>,
+    /// Racing vessel or other device hosting the Replicant.
+    pub hosted_device: Option<EntityRef>,
+    /// Full current travel state.
+    pub travel: Option<TravelInspectorSummary>,
+    /// Owned-profile description.
+    pub description: Option<String>,
+    /// Owned-profile pronouns.
+    pub pronouns: Option<String>,
+    /// Experience points.
+    pub experience_points: Option<i64>,
+    /// Current plan text.
+    pub plan: Option<String>,
+    /// Cohort permission.
+    pub cohort_permission: Option<String>,
+}
+
 /// Observation metadata for one Inspector projection.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct EntityProvenance {
@@ -751,6 +957,26 @@ pub struct SystemInspectorSummary {
     pub has_ward: Option<bool>,
     /// Life presence, when observed.
     pub has_life: Option<bool>,
+    /// Descriptive system tags observed from location detail.
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// Rich stellar facts retained by location observations.
+    #[serde(default)]
+    pub stellar: BTreeMap<String, Value>,
+    /// Asteroid-belt summary retained by location observations.
+    #[serde(default)]
+    pub asteroid_belt: BTreeMap<String, Value>,
+    /// Kuiper/Oort and other outer-system facts.
+    #[serde(default)]
+    pub outer_system: BTreeMap<String, Value>,
+    /// Mining bonus percentage observed in the system.
+    pub mining_bonus_percent: Option<f64>,
+    /// Number of observed shops.
+    pub shop_count: Option<u32>,
+    /// Number of active location events.
+    pub active_event_count: Option<u32>,
+    /// Number of catalogued system objects.
+    pub object_count: Option<u32>,
     /// Bounded child-location projection.
     pub children: EntityCollectionSummary,
 }
@@ -770,6 +996,30 @@ pub struct LocationEnvironmentSummary {
     /// Surface temperature in Celsius.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub surface_temperature_c: Option<f64>,
+    /// Surface temperature in Kelvin when reported directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub surface_temperature_k: Option<f64>,
+    /// Atmospheric pressure in Earth atmospheres.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub atmospheric_pressure_atm: Option<f64>,
+    /// Atmospheric oxygen percentage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oxygen_percent: Option<f64>,
+    /// Atmospheric toxicity index.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub atmospheric_toxicity: Option<f64>,
+    /// Hydrosphere percentage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hydrosphere_percent: Option<f64>,
+    /// Tectonic activity index.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tectonic_index: Option<f64>,
+    /// Biosphere index.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub biosphere_index: Option<f64>,
+    /// Whether a subsurface ocean was observed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subsurface_ocean: Option<bool>,
     /// Habitable-zone membership.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub habitable_zone: Option<bool>,
@@ -796,6 +1046,8 @@ pub struct LocationEnvironmentSummary {
 /// Survey progress observed for a location.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LocationSurveySummary {
+    /// Durable system-survey completion evidence.
+    pub system_complete: Option<bool>,
     /// Known total planets.
     pub planets_total: Option<i64>,
     /// Known scanned planets.
@@ -813,6 +1065,8 @@ pub struct LocationSurveySummary {
 pub struct LocationInspectorSummary {
     /// Forward-compatible location type.
     pub location_type: Option<String>,
+    /// Player/custom display name when present.
+    pub custom_name: Option<String>,
     /// Containing system.
     pub system: Option<String>,
     /// Parent location.
@@ -827,6 +1081,33 @@ pub struct LocationInspectorSummary {
     pub survey: LocationSurveySummary,
     /// Environmental facts.
     pub environment: LocationEnvironmentSummary,
+    /// Type-specific physical/orbital/catalogue facts.
+    #[serde(default)]
+    pub physical: BTreeMap<String, Value>,
+    /// Asteroid-belt geometry and richness.
+    #[serde(default)]
+    pub belt: BTreeMap<String, Value>,
+    /// Lagrange-point facts.
+    #[serde(default)]
+    pub lagrange: BTreeMap<String, Value>,
+    /// Kuiper/Oort/outer-system facts.
+    #[serde(default)]
+    pub outer_system: BTreeMap<String, Value>,
+    /// Incoming-object diversion state.
+    #[serde(default)]
+    pub incoming_object: BTreeMap<String, Value>,
+    /// Megastructure progress and requirements.
+    #[serde(default)]
+    pub megastructure: BTreeMap<String, Value>,
+    /// Resource extraction sites observed at this location.
+    #[serde(default)]
+    pub resource_sites: Vec<BTreeMap<String, Value>>,
+    /// Resource inventory observed at this location.
+    #[serde(default)]
+    pub inventory: Vec<BTreeMap<String, Value>>,
+    /// Remaining forward-compatible location fields for advanced inspection.
+    #[serde(default)]
+    pub advanced: BTreeMap<String, Value>,
     /// Bounded physical contents.
     pub contents: EntityCollectionSummary,
 }
@@ -836,7 +1117,9 @@ pub struct LocationInspectorSummary {
 #[serde(tag = "kind", content = "detail", rename_all = "snake_case")]
 pub enum EntityInspectorDetail {
     /// Managed device details.
-    Device(Box<DeviceSummary>),
+    Device(Box<DeviceInspectorSummary>),
+    /// Managed Replicant details.
+    Replicant(Box<ReplicantInspectorSummary>),
     /// Managed system details.
     System(SystemInspectorSummary),
     /// Managed location details.
@@ -2560,6 +2843,73 @@ pub struct WorkflowSummary {
     pub updated_at_ms: i64,
 }
 
+/// One active quantity reservation owned by durable workflow work.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WorkflowReservationSummary {
+    /// Stable allocation identifier.
+    pub allocation_id: String,
+    /// Workflow that owns the reservation.
+    pub workflow_id: WorkflowId,
+    /// Durable work-item identifier.
+    pub work_item_id: String,
+    /// Stable requirement key within the work item.
+    pub requirement_key: String,
+    /// Broker resource category, such as `material`, `device`, or `stow`.
+    pub kind: String,
+    /// Fungible resource wire value when this allocation reserves material inventory.
+    pub resource: Option<String>,
+    /// Exact broker pool identity retained for diagnostics.
+    pub pool_identity: String,
+    /// Exact entity reserved by an exclusive allocation, when applicable.
+    pub entity: Option<EntityRef>,
+    /// Capability labels used to satisfy the requirement.
+    pub capabilities: Vec<String>,
+    /// Quantity committed from the selected pool.
+    pub quantity: u64,
+    /// Region associated with the selected pool observation.
+    pub region: Option<String>,
+    /// System associated with the selected pool observation.
+    pub system: Option<String>,
+    /// Exact location associated with the selected pool observation.
+    pub location: Option<String>,
+    /// First reservation time in Unix milliseconds.
+    pub created_at_ms: i64,
+    /// Most recent reservation update time in Unix milliseconds.
+    pub updated_at_ms: i64,
+}
+
+/// One exact structured target associated with a durable workflow.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WorkflowTargetSummary {
+    /// Workflow that owns or acts on the target.
+    pub workflow_id: WorkflowId,
+    /// Stable target namespace, such as `event`, `system`, or `resource`.
+    pub kind: String,
+    /// Stable identity within the target namespace.
+    pub key: String,
+    /// Containing system when the target records physical context.
+    pub system: Option<String>,
+    /// Exact location when the target records physical context.
+    pub location: Option<String>,
+    /// Whether the target remains in the workflow's current target set.
+    pub active: bool,
+    /// First association time in Unix milliseconds.
+    pub created_at_ms: i64,
+    /// Most recent idempotent association time in Unix milliseconds.
+    pub updated_at_ms: i64,
+}
+
+/// Cross-workflow allocation and target intelligence for active automation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WorkflowIntelligenceSnapshot {
+    /// Snapshot identity and creation time.
+    pub metadata: SnapshotMetadata,
+    /// Current active quantity reservations.
+    pub reservations: Vec<WorkflowReservationSummary>,
+    /// Structured targets owned by non-terminal workflows.
+    pub targets: Vec<WorkflowTargetSummary>,
+}
+
 /// Full frontend-safe workflow representation.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WorkflowDetail {
@@ -2575,6 +2925,12 @@ pub struct WorkflowDetail {
     pub parent_id: Option<WorkflowId>,
     /// Resources exclusively claimed by this workflow.
     pub claims: Vec<EntityRef>,
+    /// Current quantity reservations owned by this workflow's durable work items.
+    #[serde(default)]
+    pub reservations: Vec<WorkflowReservationSummary>,
+    /// Structured domain targets recorded by this workflow.
+    #[serde(default)]
+    pub targets: Vec<WorkflowTargetSummary>,
     /// Unix milliseconds when the workflow was created.
     pub created_at_ms: i64,
     /// Unix milliseconds when the workflow finished, if terminal.
@@ -3420,6 +3776,7 @@ mod tests {
         assert!(decoded.mining_policies.is_empty());
         assert!(decoded.requirements.is_empty());
         assert!(decoded.urgency.is_empty());
+        assert!(decoded.workforce.regions.is_empty());
     }
     #[test]
     fn director_goal_kind_serializes_unserviced_resources() {
@@ -3971,7 +4328,59 @@ mod tests {
             metadata: metadata.clone(),
             summary: summary.clone(),
             provenance: provenance.clone(),
-            detail: EntityInspectorDetail::Device(Box::new(device)),
+            detail: EntityInspectorDetail::Device(Box::new(DeviceInspectorSummary {
+                device,
+                deployed_at: Some("2026-09-04T12:00:00Z".to_owned()),
+                in_control_range: Some(true),
+                settings: BTreeMap::new(),
+                hosting_replicant: None,
+                travel: None,
+                runtime: DeviceRuntimeInspectorSummary::default(),
+            })),
+        }));
+
+        round_trip(&Versioned::current(EntityInspectorSnapshot {
+            metadata: metadata.clone(),
+            summary: EntitySummary {
+                entity: EntityRef {
+                    kind: EntityKind::Replicant,
+                    id: EntityId("R-1".to_owned()),
+                },
+                label: "Chats-1".to_owned(),
+                secondary_label: Some("R-1".to_owned()),
+                system: Some("SOL".to_owned()),
+                location: Some("EARTH".to_owned()),
+                entity_type: Some("replicant".to_owned()),
+                status: Some("stationary".to_owned()),
+            },
+            provenance: None,
+            detail: EntityInspectorDetail::Replicant(Box::new(ReplicantInspectorSummary {
+                entity: EntityRef {
+                    kind: EntityKind::Replicant,
+                    id: EntityId("R-1".to_owned()),
+                },
+                name: Some("Chats-1".to_owned()),
+                status: Some("stationary".to_owned()),
+                is_npc: Some(false),
+                ownership: "owned".to_owned(),
+                system: Some("SOL".to_owned()),
+                region: Some("Alpha".to_owned()),
+                assigned_region: Some("Alpha".to_owned()),
+                director_state: Some("operational".to_owned()),
+                role_affinity: None,
+                workflow_id: None,
+                location: Some("EARTH".to_owned()),
+                hosted_device: Some(EntityRef {
+                    kind: EntityKind::Device,
+                    id: EntityId("V-1".to_owned()),
+                }),
+                travel: None,
+                description: None,
+                pronouns: Some("he/him".to_owned()),
+                experience_points: Some(100),
+                plan: None,
+                cohort_permission: None,
+            })),
         }));
 
         let grouped = EntityCollectionSummary {
@@ -4022,6 +4431,14 @@ mod tests {
                 has_hub: Some(false),
                 has_ward: Some(false),
                 has_life: Some(true),
+                tags: vec!["home".to_owned()],
+                stellar: BTreeMap::new(),
+                asteroid_belt: BTreeMap::new(),
+                outer_system: BTreeMap::new(),
+                mining_bonus_percent: None,
+                shop_count: None,
+                active_event_count: None,
+                object_count: None,
                 children: grouped,
             }),
         }));
@@ -4032,12 +4449,14 @@ mod tests {
             provenance,
             detail: EntityInspectorDetail::Location(Box::new(LocationInspectorSummary {
                 location_type: Some("planet".to_owned()),
+                custom_name: Some("Earth".to_owned()),
                 system: Some("SOL".to_owned()),
                 parent: None,
                 scanned: Some(false),
                 system_scanned: Some(true),
                 system_tags: vec!["home".to_owned()],
                 survey: LocationSurveySummary {
+                    system_complete: Some(false),
                     planets_total: Some(8),
                     planets_scanned: Some(7),
                     moons_total: Some(1),
@@ -4049,6 +4468,14 @@ mod tests {
                     magnetic_field: Some(false),
                     gravity_g: Some(0.0),
                     surface_temperature_c: Some(15.0),
+                    surface_temperature_k: Some(288.15),
+                    atmospheric_pressure_atm: Some(1.0),
+                    oxygen_percent: Some(21.0),
+                    atmospheric_toxicity: Some(0.0),
+                    hydrosphere_percent: Some(71.0),
+                    tectonic_index: Some(50.0),
+                    biosphere_index: Some(95.0),
+                    subsurface_ocean: Some(false),
                     habitable_zone: Some(true),
                     life_stage: Some("none".to_owned()),
                     axial_tilt_degrees: Some(23.4),
@@ -4057,6 +4484,15 @@ mod tests {
                     nearby_belt_richness: Some("rich".to_owned()),
                     distance_from_sol_light_years: Some(0.0),
                 },
+                physical: BTreeMap::new(),
+                belt: BTreeMap::new(),
+                lagrange: BTreeMap::new(),
+                outer_system: BTreeMap::new(),
+                incoming_object: BTreeMap::new(),
+                megastructure: BTreeMap::new(),
+                resource_sites: Vec::new(),
+                inventory: Vec::new(),
+                advanced: BTreeMap::new(),
                 contents: EntityCollectionSummary {
                     total: 1,
                     items: vec![EntitySummary {
@@ -4080,6 +4516,34 @@ mod tests {
             command: "travel".to_owned(),
             parameters: BTreeMap::from([("mode".to_owned(), Value::String("standard".to_owned()))]),
         });
+    }
+
+    #[test]
+    fn director_worker_status_fields_default_for_persisted_snapshots() {
+        let assignment: DirectorReplicantAssignment = serde_json::from_value(serde_json::json!({
+            "code": "R-1",
+            "name": null,
+            "region": "alpha",
+            "busy": false,
+            "workflow_id": null,
+            "role_affinity": null
+        }))
+        .expect("legacy assignment");
+        assert_eq!(assignment.state, DirectorWorkerState::Unavailable);
+
+        let workforce: DirectorWorkforceSummary = serde_json::from_value(serde_json::json!({
+            "total": 1,
+            "busy": 0,
+            "idle": 1,
+            "idle_ratio": 1.0,
+            "pending_worker_demand": 0,
+            "scale_up_recommended": false,
+            "scale_reason": null
+        }))
+        .expect("legacy workforce");
+        assert_eq!(workforce.operational, 0);
+        assert_eq!(workforce.in_transit, 0);
+        assert_eq!(workforce.unavailable, 0);
     }
 
     #[test]
