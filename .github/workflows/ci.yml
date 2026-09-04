@@ -1,0 +1,98 @@
+name: Replicant Client CI
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: replicant-ci-main
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    name: Full CI
+    runs-on:
+      - self-hosted
+      - linux
+      - x64
+      - replicant-ci
+
+    timeout-minutes: 120
+
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_TARGET_DIR: /home/chats/.cache/replicant-ci/target
+      PIP_CACHE_DIR: /home/chats/.cache/replicant-ci/pip
+      npm_config_cache: /home/chats/.cache/replicant-ci/npm
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Add user tools to PATH
+        run: |
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Prepare Rust toolchain
+        run: |
+          rustup toolchain install 1.96.0 \
+            --profile minimal \
+            --component clippy,rustfmt
+
+          rustup target add \
+            wasm32-unknown-unknown \
+            --toolchain 1.96.0
+
+          rustc --version
+          cargo --version
+          cargo clippy --version
+          rustfmt --version
+          wasm-pack --version
+
+      - name: Install web dependencies
+        run: |
+          node --version
+          npm --version
+          npm ci --prefix apps/web
+
+      - name: Install desktop dependencies
+        run: |
+          npm ci --prefix apps/desktop
+
+      - name: Prepare documentation crawler
+        run: |
+          python3 --version
+          python3 -m venv reference/replicant-docs-crawler/venv
+
+          reference/replicant-docs-crawler/venv/bin/python \
+            -m pip install \
+            -r reference/replicant-docs-crawler/requirements.txt
+
+      - name: Environment summary
+        run: |
+          echo "Runner: $(hostname)"
+          echo "Rust: $(rustc --version)"
+          echo "Cargo: $(cargo --version)"
+          echo "Node: $(node --version)"
+          echo "npm: $(npm --version)"
+          echo "Python: $(python3 --version)"
+          echo "wasm-pack: $(wasm-pack --version)"
+          echo "Cargo target: $CARGO_TARGET_DIR"
+
+      - name: Run full CI
+        run: make ci
+
+      - name: Cache and disk usage
+        if: always()
+        run: |
+          du -sh "$CARGO_TARGET_DIR" 2>/dev/null || true
+          du -sh "$HOME/.cargo/registry" 2>/dev/null || true
+          df -h .

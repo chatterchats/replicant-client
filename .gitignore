@@ -47,6 +47,7 @@ mining-expansion*
 !crates/galaxy-renderer/Cargo.lock
 *.log
 *.txt
+!reference/replicant-docs-crawler/requirements.txt
 apps/web/node_modules/
 apps/web/dist/
 apps/web/src/wasm/galaxy_renderer/
