@@ -15,7 +15,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Show runner environment
         run: |
@@ -30,7 +30,7 @@ jobs:
 
       - name: Test Rust container
         run: |
-          docker run --rm rust:1.67 bash -c '
+          docker run --rm rust:1.94 bash -c '
             rustc --version
             cargo --version
           '
