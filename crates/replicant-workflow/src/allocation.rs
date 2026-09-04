@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, fmt, str::FromStr};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::ResourceKey;
+use crate::{ResourceKey, WorkItemId, WorkflowId};
 
 /// Stable identifier for one persisted resource allocation.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
@@ -150,6 +150,34 @@ impl AllocationSet {
     pub fn iter(&self) -> impl Iterator<Item = &ResourceAllocation> {
         self.by_requirement.values().flatten()
     }
+}
+
+/// Frontend/runtime-safe read projection of one active quantity reservation.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ResourceReservation {
+    /// Stable allocation identity.
+    pub allocation_id: AllocationId,
+    /// Workflow that owns the reservation.
+    pub workflow_id: WorkflowId,
+    /// Durable work item whose requirement created the reservation.
+    pub item_id: WorkItemId,
+    /// Stable requirement key within the work item.
+    pub requirement_key: String,
+    /// Exact reserved pool identity.
+    pub resource: ResourceKey,
+    /// Broker resource category, such as `material`, `device`, or `stow`.
+    pub kind: String,
+    /// Broker capabilities used to satisfy the requirement.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    /// Geographic facts retained with the authoritative pool observation.
+    pub location: Option<AllocationLocation>,
+    /// Quantity reserved from the pool.
+    pub quantity: u64,
+    /// First reservation time in Unix milliseconds.
+    pub created_at_ms: i64,
+    /// Most recent reservation update time in Unix milliseconds.
+    pub updated_at_ms: i64,
 }
 
 /// Result of replacing a permanently missing allocation.

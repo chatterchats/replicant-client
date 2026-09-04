@@ -122,7 +122,8 @@ pub enum CampaignOutcome {
     AllSucceeded,
     /// Successful work coexists with failed or abandoned work.
     PartialSuccess,
-    /// No item began execution before the campaign became terminal.
+    /// No useful work completed because nothing could start or every item
+    /// was already satisfied.
     NothingCouldStart,
     /// Work began, but no item succeeded.
     NoSuccess,

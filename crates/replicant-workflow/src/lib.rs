@@ -10,12 +10,14 @@ mod model;
 mod registry;
 mod repository;
 mod supervisor;
+mod target;
 mod telemetry;
 mod work;
 
 pub use allocation::{
     AllocationCandidate, AllocationId, AllocationLocation, AllocationSet, AllocationState,
     ReplacementOutcome, RequirementScope, ResourceAllocation, ResourceRequirement,
+    ResourceReservation,
 };
 pub use model::{
     AutomationPolicy, AutomationTrigger, ClaimAcquireOutcome, FiniteExecution,
@@ -37,6 +39,7 @@ pub use supervisor::{
     BoxWorkflowFuture, ControlRequest, SupervisorError, WorkflowContext, WorkflowExecutor,
     WorkflowSupervisor, WorkflowWaitError,
 };
+pub use target::{WorkflowTarget, WorkflowTargetRecord};
 pub use telemetry::{WorkflowTelemetrySample, WorkflowTelemetrySink};
 pub use work::{
     CampaignCounts, CampaignItemResult, CampaignOutcome, CampaignResult, WorkItem, WorkItemAttempt,

@@ -17,8 +17,8 @@ use tokio::{sync::watch, task::JoinHandle};
 use crate::{
     ClaimAcquireOutcome, NewWorkflow, RepositoryError, ResourceClaim, ResourceKey, WaitIntent,
     WaitOutcome, WaitSignal, WorkflowFailureDisposition, WorkflowId, WorkflowInstance,
-    WorkflowRegistry, WorkflowRepository, WorkflowState, WorkflowStatus, WorkflowTelemetrySample,
-    WorkflowTelemetrySink,
+    WorkflowRegistry, WorkflowRepository, WorkflowState, WorkflowStatus, WorkflowTarget,
+    WorkflowTargetRecord, WorkflowTelemetrySample, WorkflowTelemetrySink,
 };
 
 // Workflows that explicitly return `Waiting` without a durable `WaitIntent` are
@@ -182,6 +182,32 @@ impl WorkflowContext {
         self.repository
             .append_activity(self.instance.id, message)
             .map(|_| ())
+    }
+
+    /// Idempotently records structured domain targets owned or acted on by this workflow.
+    pub fn record_targets(
+        &self,
+        targets: &[WorkflowTarget],
+    ) -> Result<Vec<WorkflowTargetRecord>, RepositoryError> {
+        self.repository
+            .record_workflow_targets(self.instance.id, targets, now_millis())
+    }
+
+    /// Idempotently records one structured domain target.
+    pub fn record_target(
+        &self,
+        target: WorkflowTarget,
+    ) -> Result<Vec<WorkflowTargetRecord>, RepositoryError> {
+        self.record_targets(std::slice::from_ref(&target))
+    }
+
+    /// Replaces the workflow's current target set while retaining released target history.
+    pub fn replace_targets(
+        &self,
+        targets: &[WorkflowTarget],
+    ) -> Result<Vec<WorkflowTargetRecord>, RepositoryError> {
+        self.repository
+            .replace_workflow_targets(self.instance.id, targets, now_millis())
     }
 
     /// Atomically acquires an exclusive gameplay resource for this workflow.

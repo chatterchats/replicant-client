@@ -328,6 +328,45 @@ fn work_item_campaign_aggregation_preserves_partial_success() {
     assert_eq!(result.outcome, CampaignOutcome::NothingCouldStart);
     assert_eq!(result.workflow_status(), WorkflowStatus::Succeeded);
 
+    let started_skipped_campaign = create_campaign(&repository);
+    repository
+        .reconcile_work_items(
+            started_skipped_campaign.id,
+            &[spec(started_skipped_campaign.id, "started-skipped")],
+            12,
+        )
+        .expect("reconcile started skipped item");
+    let assigned = repository
+        .claim_next_work_item(started_skipped_campaign.id, 13)
+        .expect("claim started skipped item")
+        .expect("started skipped item");
+    let running = repository
+        .start_work_item(
+            assigned.id,
+            assigned.state.revision,
+            "R-1",
+            "already-satisfied",
+            14,
+        )
+        .expect("start already-satisfied item");
+    repository
+        .transition_work_item(
+            running.id,
+            running.state.revision,
+            WorkItemTransition::Skipped {
+                reason: "already satisfied after authoritative check".into(),
+                result_json: None,
+            },
+            15,
+        )
+        .expect("skip started item");
+    let result = repository
+        .aggregate_campaign_result(started_skipped_campaign.id)
+        .expect("aggregate started skipped campaign")
+        .expect("started skipped campaign is terminal");
+    assert_eq!(result.outcome, CampaignOutcome::NothingCouldStart);
+    assert_eq!(result.workflow_status(), WorkflowStatus::Succeeded);
+
     let partial_campaign = create_campaign(&repository);
     repository
         .reconcile_work_items(

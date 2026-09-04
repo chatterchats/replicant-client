@@ -9,14 +9,15 @@ use std::{
 };
 
 use crate::{
-    AllocationCandidate, AllocationId, AllocationSet, AllocationState, AutomationPolicy,
-    AutomationTrigger, CampaignCounts, CampaignItemResult, CampaignOutcome, CampaignResult,
-    ClaimAcquireOutcome, FiniteExecution, FiniteExecutionClass, FiniteExecutionStatus, NewTrigger,
-    NewWorkflow, ReplacementOutcome, RequirementScope, ResourceAllocation, ResourceClaim,
-    ResourceKey, ResourceRequirement, TriggerId, TriggerState, WorkItem, WorkItemAttempt,
-    WorkItemAttemptOutcome, WorkItemId, WorkItemSpec, WorkItemState, WorkItemStatus,
-    WorkItemTransition, WorkflowActivity, WorkflowFailureDisposition, WorkflowId, WorkflowInstance,
-    WorkflowKind, WorkflowState, WorkflowStatus, WorkflowSummary,
+    AllocationCandidate, AllocationId, AllocationLocation, AllocationSet, AllocationState,
+    AutomationPolicy, AutomationTrigger, CampaignCounts, CampaignItemResult, CampaignOutcome,
+    CampaignResult, ClaimAcquireOutcome, FiniteExecution, FiniteExecutionClass,
+    FiniteExecutionStatus, NewTrigger, NewWorkflow, ReplacementOutcome, RequirementScope,
+    ResourceAllocation, ResourceClaim, ResourceKey, ResourceRequirement, ResourceReservation,
+    TriggerId, TriggerState, WorkItem, WorkItemAttempt, WorkItemAttemptOutcome, WorkItemId,
+    WorkItemSpec, WorkItemState, WorkItemStatus, WorkItemTransition, WorkflowActivity,
+    WorkflowFailureDisposition, WorkflowId, WorkflowInstance, WorkflowKind, WorkflowState,
+    WorkflowStatus, WorkflowSummary, WorkflowTarget, WorkflowTargetRecord,
 };
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::Serialize;
@@ -41,7 +42,8 @@ const WORKFLOW_FAILURE_DISPOSITION_SCHEMA: &str =
 const WORK_ITEMS_SCHEMA: &str = include_str!("../migrations/0012_work_items.sql");
 const RESOURCE_ALLOCATIONS_SCHEMA: &str =
     include_str!("../migrations/0013_resource_allocations.sql");
-const CURRENT_DATABASE_SCHEMA: i64 = 13;
+const WORKFLOW_TARGETS_SCHEMA: &str = include_str!("../migrations/0014_workflow_targets.sql");
+const CURRENT_DATABASE_SCHEMA: i64 = 14;
 
 /// Runtime workflow persistence failures.
 #[derive(Debug, thiserror::Error)]
@@ -64,6 +66,14 @@ pub enum RepositoryError {
     /// A resource namespace or identity was malformed.
     #[error("invalid resource key {0:?}")]
     InvalidResourceKey(ResourceKey),
+    /// A workflow target kind or identity was malformed.
+    #[error("invalid workflow target {kind:?}:{key:?}")]
+    InvalidWorkflowTarget {
+        /// Persisted target kind.
+        kind: String,
+        /// Persisted target identity.
+        key: String,
+    },
     /// A malformed lifecycle status was found in SQLite.
     #[error("invalid persisted workflow status {0:?}")]
     InvalidStoredStatus(String),
@@ -458,6 +468,13 @@ impl WorkflowRepository {
             transaction.execute_batch(RESOURCE_ALLOCATIONS_SCHEMA)?;
             transaction.execute(
                 "INSERT INTO runtime_schema_migrations (version) VALUES (13)",
+                [],
+            )?;
+        }
+        if found < 14 {
+            transaction.execute_batch(WORKFLOW_TARGETS_SCHEMA)?;
+            transaction.execute(
+                "INSERT INTO runtime_schema_migrations (version) VALUES (14)",
                 [],
             )?;
         }
@@ -1707,11 +1724,12 @@ impl WorkflowRepository {
         }
         let any_started = items.iter().any(|item| item.state.ever_started);
         let has_terminal_failure = counts.failed != 0 || counts.abandoned != 0;
+        let all_safely_skipped = !has_terminal_failure && counts.skipped == counts.total;
         let outcome = if counts.succeeded != 0 && has_terminal_failure {
             CampaignOutcome::PartialSuccess
         } else if counts.succeeded != 0 {
             CampaignOutcome::AllSucceeded
-        } else if !any_started {
+        } else if all_safely_skipped || !any_started {
             CampaignOutcome::NothingCouldStart
         } else {
             CampaignOutcome::NoSuccess
@@ -1810,6 +1828,191 @@ impl WorkflowRepository {
         let reclaimed = rows.len();
         transaction.commit()?;
         Ok(reclaimed)
+    }
+
+    /// Returns the monotonic persisted revision for workflow allocation/target intelligence.
+    pub fn workflow_intelligence_revision(&self) -> Result<i64, RepositoryError> {
+        Ok(self.connection()?.query_row(
+            "SELECT revision FROM workflow_intelligence_revision WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Lists current quantity reservations owned by non-terminal workflows and work items.
+    pub fn active_resource_reservations(
+        &self,
+    ) -> Result<Vec<ResourceReservation>, RepositoryError> {
+        resource_reservations_in(&self.connection()?, None)
+    }
+
+    /// Lists current quantity reservations owned by one workflow.
+    pub fn workflow_resource_reservations(
+        &self,
+        workflow_id: WorkflowId,
+    ) -> Result<Vec<ResourceReservation>, RepositoryError> {
+        resource_reservations_in(&self.connection()?, Some(workflow_id))
+    }
+
+    /// Idempotently records exact structured targets associated with a workflow.
+    ///
+    /// Existing released associations for the same identity are reactivated. Other target
+    /// associations are left unchanged; use [`Self::replace_workflow_targets`] when a planner
+    /// owns an authoritative replaceable target set.
+    pub fn record_workflow_targets(
+        &self,
+        workflow_id: WorkflowId,
+        targets: &[WorkflowTarget],
+        now_ms: i64,
+    ) -> Result<Vec<WorkflowTargetRecord>, RepositoryError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if read_in(&transaction, workflow_id)?.is_none() {
+            return Err(RepositoryError::NotFound(workflow_id));
+        }
+        for target in targets {
+            validate_workflow_target(target)?;
+            transaction.execute(
+                "INSERT INTO workflow_targets (
+                    workflow_id, target_kind, target_key, target_json, state,
+                    created_at_ms, updated_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, 'active', ?5, ?5)
+                 ON CONFLICT(workflow_id, target_kind, target_key) DO UPDATE SET
+                    target_json = excluded.target_json,
+                    state = 'active',
+                    updated_at_ms = excluded.updated_at_ms
+                 WHERE workflow_targets.target_json != excluded.target_json
+                    OR workflow_targets.state != 'active'",
+                params![
+                    workflow_id.to_string(),
+                    target.kind(),
+                    target.key(),
+                    serde_json::to_string(target)?,
+                    now_ms,
+                ],
+            )?;
+        }
+        let records = workflow_targets_in(&transaction, Some(workflow_id), false)?;
+        transaction.commit()?;
+        Ok(records)
+    }
+
+    /// Replaces the workflow's current structured target set without deleting history.
+    pub fn replace_workflow_targets(
+        &self,
+        workflow_id: WorkflowId,
+        targets: &[WorkflowTarget],
+        now_ms: i64,
+    ) -> Result<Vec<WorkflowTargetRecord>, RepositoryError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if read_in(&transaction, workflow_id)?.is_none() {
+            return Err(RepositoryError::NotFound(workflow_id));
+        }
+
+        let mut incoming = BTreeSet::<(String, String)>::new();
+        for target in targets {
+            validate_workflow_target(target)?;
+            incoming.insert((target.kind().to_owned(), target.key().to_owned()));
+        }
+
+        let existing = workflow_targets_in(&transaction, Some(workflow_id), false)?;
+        for record in existing.iter().filter(|record| record.active) {
+            let identity = (
+                record.target.kind().to_owned(),
+                record.target.key().to_owned(),
+            );
+            if !incoming.contains(&identity) {
+                transaction.execute(
+                    "UPDATE workflow_targets
+                     SET state = 'released', updated_at_ms = ?4
+                     WHERE workflow_id = ?1 AND target_kind = ?2 AND target_key = ?3
+                       AND state = 'active'",
+                    params![workflow_id.to_string(), identity.0, identity.1, now_ms],
+                )?;
+            }
+        }
+
+        for target in targets {
+            transaction.execute(
+                "INSERT INTO workflow_targets (
+                    workflow_id, target_kind, target_key, target_json, state,
+                    created_at_ms, updated_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, 'active', ?5, ?5)
+                 ON CONFLICT(workflow_id, target_kind, target_key) DO UPDATE SET
+                    target_json = excluded.target_json,
+                    state = 'active',
+                    updated_at_ms = excluded.updated_at_ms
+                 WHERE workflow_targets.target_json != excluded.target_json
+                    OR workflow_targets.state != 'active'",
+                params![
+                    workflow_id.to_string(),
+                    target.kind(),
+                    target.key(),
+                    serde_json::to_string(target)?,
+                    now_ms,
+                ],
+            )?;
+        }
+        let records = workflow_targets_in(&transaction, Some(workflow_id), false)?;
+        transaction.commit()?;
+        Ok(records)
+    }
+
+    /// Lists every structured target ever recorded for one workflow.
+    pub fn workflow_targets(
+        &self,
+        workflow_id: WorkflowId,
+    ) -> Result<Vec<WorkflowTargetRecord>, RepositoryError> {
+        workflow_targets_in(&self.connection()?, Some(workflow_id), false)
+    }
+
+    /// Lists targets owned by workflows that are still capable of making progress.
+    pub fn active_workflow_targets(&self) -> Result<Vec<WorkflowTargetRecord>, RepositoryError> {
+        workflow_targets_in(&self.connection()?, None, true)
+    }
+
+    /// Reverse-looks up workflows that have ever recorded one exact target identity.
+    pub fn workflows_targeting(
+        &self,
+        target_kind: &str,
+        target_key: &str,
+    ) -> Result<Vec<WorkflowTargetRecord>, RepositoryError> {
+        validate_target_parts(target_kind, target_key)?;
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT target.workflow_id, target.target_json, target.state,
+                    target.created_at_ms, target.updated_at_ms
+             FROM workflow_targets target
+             WHERE target.target_kind = ?1 AND target.target_key = ?2
+             ORDER BY target.updated_at_ms DESC, target.workflow_id",
+        )?;
+        let rows = statement
+            .query_map(params![target_kind, target_key], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(
+                |(workflow_id, target_json, state, created_at_ms, updated_at_ms)| {
+                    Ok(WorkflowTargetRecord {
+                        workflow_id: workflow_id
+                            .parse()
+                            .map_err(|_| RepositoryError::InvalidStoredId(workflow_id.clone()))?,
+                        target: serde_json::from_str(&target_json)?,
+                        active: state == "active",
+                        created_at_ms,
+                        updated_at_ms,
+                    })
+                },
+            )
+            .collect()
     }
 
     /// Atomically observes candidates and allocates every stored item requirement.
@@ -3236,6 +3439,157 @@ fn candidate_matches_scope(candidate: &AllocationCandidate, scope: &RequirementS
 
 fn is_exclusive_namespace(namespace: &str) -> bool {
     matches!(namespace, "replicant" | "device" | "autofactory")
+}
+
+fn resource_reservations_in(
+    connection: &Connection,
+    workflow_id: Option<WorkflowId>,
+) -> Result<Vec<ResourceReservation>, RepositoryError> {
+    let workflow_id = workflow_id.map(|id| id.to_string());
+    let mut statement = connection.prepare(
+        "SELECT allocation.id, item.workflow_id, allocation.item_id,
+                allocation.requirement_key, allocation.resource_namespace,
+                allocation.resource_key, pool.kind, pool.capabilities_json,
+                pool.location_json, allocation.quantity,
+                allocation.created_at_ms, allocation.updated_at_ms
+         FROM workflow_resource_allocations allocation
+         JOIN workflow_work_items item ON item.id = allocation.item_id
+         JOIN workflow_instances workflow ON workflow.id = item.workflow_id
+         JOIN workflow_resource_pools pool ON pool.pool_key = allocation.pool_key
+         WHERE allocation.state = 'active'
+           AND item.status NOT IN ('succeeded', 'skipped', 'failed', 'abandoned')
+           AND workflow.status NOT IN ('succeeded', 'failed', 'cancelled')
+           AND (?1 IS NULL OR item.workflow_id = ?1)
+         ORDER BY item.workflow_id, allocation.item_id,
+                  allocation.requirement_key, allocation.id",
+    )?;
+    let rows = statement
+        .query_map([workflow_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, i64>(9)?,
+                row.get::<_, i64>(10)?,
+                row.get::<_, i64>(11)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    rows.into_iter()
+        .map(
+            |(
+                allocation_id,
+                workflow_id,
+                item_id,
+                requirement_key,
+                namespace,
+                resource_identity,
+                kind,
+                capabilities_json,
+                location_json,
+                quantity,
+                created_at_ms,
+                updated_at_ms,
+            )| {
+                let quantity = u64::try_from(quantity).map_err(|_| {
+                    RepositoryError::InvalidStoredWorkItemCount {
+                        field: "allocation quantity",
+                        value: quantity,
+                    }
+                })?;
+                Ok(ResourceReservation {
+                    allocation_id: AllocationId::from_str(&allocation_id).map_err(|_| {
+                        RepositoryError::Compatibility(format!(
+                            "invalid persisted allocation id {allocation_id:?}"
+                        ))
+                    })?,
+                    workflow_id: WorkflowId::from_str(&workflow_id)
+                        .map_err(|_| RepositoryError::InvalidStoredId(workflow_id.clone()))?,
+                    item_id: parse_work_item_id(item_id)?,
+                    requirement_key,
+                    resource: resource_key(namespace, resource_identity),
+                    kind,
+                    capabilities: serde_json::from_str(&capabilities_json)?,
+                    location: location_json
+                        .map(|value| serde_json::from_str::<AllocationLocation>(&value))
+                        .transpose()?,
+                    quantity,
+                    created_at_ms,
+                    updated_at_ms,
+                })
+            },
+        )
+        .collect()
+}
+
+fn workflow_targets_in(
+    connection: &Connection,
+    workflow_id: Option<WorkflowId>,
+    active_only: bool,
+) -> Result<Vec<WorkflowTargetRecord>, RepositoryError> {
+    let workflow_id = workflow_id.map(|id| id.to_string());
+    let mut statement = connection.prepare(
+        "SELECT target.workflow_id, target.target_json, target.state,
+                target.created_at_ms, target.updated_at_ms
+         FROM workflow_targets target
+         JOIN workflow_instances workflow ON workflow.id = target.workflow_id
+         WHERE (?1 IS NULL OR target.workflow_id = ?1)
+           AND (?2 = 0 OR (target.state = 'active'
+                AND workflow.status NOT IN ('succeeded', 'failed', 'cancelled')))
+         ORDER BY target.updated_at_ms DESC, target.target_kind,
+                  target.target_key, target.workflow_id",
+    )?;
+    let rows = statement
+        .query_map(params![workflow_id, active_only], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    rows.into_iter()
+        .map(
+            |(workflow_id, target_json, state, created_at_ms, updated_at_ms)| {
+                Ok(WorkflowTargetRecord {
+                    workflow_id: WorkflowId::from_str(&workflow_id)
+                        .map_err(|_| RepositoryError::InvalidStoredId(workflow_id.clone()))?,
+                    target: serde_json::from_str(&target_json)?,
+                    active: state == "active",
+                    created_at_ms,
+                    updated_at_ms,
+                })
+            },
+        )
+        .collect()
+}
+
+fn validate_workflow_target(target: &WorkflowTarget) -> Result<(), RepositoryError> {
+    validate_target_parts(target.kind(), target.key())
+}
+
+fn validate_target_parts(kind: &str, key: &str) -> Result<(), RepositoryError> {
+    let valid_kind = !kind.is_empty()
+        && kind.len() <= 128
+        && kind.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"._-".contains(&byte)
+        });
+    if !valid_kind || key.is_empty() || key.len() > 512 {
+        return Err(RepositoryError::InvalidWorkflowTarget {
+            kind: kind.to_owned(),
+            key: key.to_owned(),
+        });
+    }
+    Ok(())
 }
 
 fn parse_work_item_id(value: String) -> Result<WorkItemId, RepositoryError> {
