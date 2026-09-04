@@ -5973,7 +5973,7 @@ async fn entity_inspector(
                     }),
                 },
                 provenance: star.map(|observation| inspector::provenance(&observation.metadata)),
-                detail: EntityInspectorDetail::System(detail),
+                detail: EntityInspectorDetail::System(Box::new(detail)),
             }
         }
         "location" => {

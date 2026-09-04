@@ -1121,7 +1121,7 @@ pub enum EntityInspectorDetail {
     /// Managed Replicant details.
     Replicant(Box<ReplicantInspectorSummary>),
     /// Managed system details.
-    System(SystemInspectorSummary),
+    System(Box<SystemInspectorSummary>),
     /// Managed location details.
     Location(Box<LocationInspectorSummary>),
 }
@@ -4417,7 +4417,7 @@ mod tests {
                 status: Some("explored".to_owned()),
             },
             provenance: provenance.clone(),
-            detail: EntityInspectorDetail::System(SystemInspectorSummary {
+            detail: EntityInspectorDetail::System(Box::new(SystemInspectorSummary {
                 name: Some("Sol".to_owned()),
                 spectral_type: Some("G".to_owned()),
                 region: Some("Core".to_owned()),
@@ -4440,7 +4440,7 @@ mod tests {
                 active_event_count: None,
                 object_count: None,
                 children: grouped,
-            }),
+            })),
         }));
 
         round_trip(&Versioned::current(EntityInspectorSnapshot {
