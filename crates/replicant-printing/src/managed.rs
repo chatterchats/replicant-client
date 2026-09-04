@@ -2,7 +2,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::{Arc, Mutex as StdMutex, OnceLock},
+    sync::{Arc, LazyLock, Mutex as StdMutex, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -36,6 +36,8 @@ static FACTORY_DETAIL_CACHE: OnceLock<StdMutex<BTreeMap<String, FactoryDetailCac
     OnceLock::new();
 static FACTORY_DETAIL_LOCKS: OnceLock<StdMutex<BTreeMap<String, Arc<TokioMutex<()>>>>> =
     OnceLock::new();
+static HUB_SCHEDULE_LOCKS: LazyLock<StdMutex<BTreeMap<String, Arc<TokioMutex<()>>>>> =
+    LazyLock::new(|| StdMutex::new(BTreeMap::new()));
 
 fn factory_detail_cache() -> &'static StdMutex<BTreeMap<String, FactoryDetailCacheEntry>> {
     FACTORY_DETAIL_CACHE.get_or_init(|| StdMutex::new(BTreeMap::new()))
@@ -50,6 +52,20 @@ fn factory_detail_lock(factory_code: &str) -> Arc<TokioMutex<()>> {
         .entry(factory_code.to_owned())
         .or_insert_with(|| Arc::new(TokioMutex::new(())))
         .clone()
+}
+
+fn hub_schedule_lock(hub: &str) -> Arc<TokioMutex<()>> {
+    let mut locks = HUB_SCHEDULE_LOCKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    locks
+        .entry(hub.to_ascii_uppercase())
+        .or_insert_with(|| Arc::new(TokioMutex::new(())))
+        .clone()
+}
+
+async fn acquire_hub_schedule_guard(hub: &str) -> impl Drop + use<> {
+    hub_schedule_lock(hub).lock_owned().await
 }
 
 fn cached_factory_detail_if_fresh(factory_code: &str) -> Option<raw::devices::DeviceStatus> {
@@ -167,6 +183,94 @@ impl QueueOptions {
             factory_codes: None,
         }
     }
+}
+
+/// One caller-tracked print request for a single durable submission.
+///
+/// Unlike [`PrintRequest`], this preserves request identity and output mode so
+/// checkpointed workflows can reconcile each operation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TrackedPrintRequest {
+    /// Canonical device type to print.
+    pub device_type: String,
+    /// Devices produced by the submission.
+    pub quantity: i64,
+    /// Whether a modular output is printed compacted.
+    pub flatpack: bool,
+    /// Whether to force a targeted live factory read immediately before submission.
+    pub authoritative_factory_check: bool,
+}
+
+impl TrackedPrintRequest {
+    /// Creates one assembled quantity-batched submission.
+    #[must_use]
+    pub fn new(device_type: impl Into<String>, quantity: i64) -> Self {
+        Self {
+            device_type: device_type.into(),
+            quantity,
+            flatpack: false,
+            authoritative_factory_check: false,
+        }
+    }
+
+    /// Requests compacted output for a modular device.
+    #[must_use]
+    pub fn flatpacked(mut self) -> Self {
+        self.flatpack = true;
+        self
+    }
+
+    /// Forces a targeted live factory read immediately before submission.
+    #[must_use]
+    pub fn authoritative_factory_check(mut self) -> Self {
+        self.authoritative_factory_check = true;
+        self
+    }
+}
+
+/// A tracked request assigned to one live Autofactory.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct TrackedPrintAssignment {
+    /// Index in the request slice supplied by the caller.
+    pub request_index: usize,
+    /// Selected Autofactory code.
+    pub factory_code: String,
+    /// Canonical device type.
+    pub device_type: String,
+    /// Quantity submitted in one operation.
+    pub quantity: i64,
+    /// Whether compacted output was requested.
+    pub flatpack: bool,
+}
+
+/// Durable checkpoint boundary emitted around a tracked print submission.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TrackedPrintUpdate {
+    /// Persist assignment and submission intent before the managed mutation.
+    Preparing(TrackedPrintAssignment),
+    /// Persist the durable operation ID before its outcome is classified.
+    OperationRecorded {
+        /// Assignment represented by the operation.
+        assignment: TrackedPrintAssignment,
+        /// Durable managed operation identifier.
+        operation_id: String,
+    },
+}
+
+/// One accepted tracked print submission.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct TrackedPrintSubmission {
+    /// Live assignment used for the operation.
+    pub assignment: TrackedPrintAssignment,
+    /// Durable managed operation identifier.
+    pub operation_id: String,
+}
+
+/// Result of one non-blocking tracked scheduling pass.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct TrackedQueueReport {
+    /// Accepted submissions in request-index order.
+    pub submissions: Vec<TrackedPrintSubmission>,
 }
 
 /// Summary of successfully queued manufacturing work.
@@ -354,6 +458,9 @@ pub enum PrintingError {
         /// Invalid queued quantity.
         quantity: i64,
     },
+    /// A tracked submission checkpoint callback failed.
+    #[error("tracked print checkpoint callback failed: {0}")]
+    SubmissionObserver(String),
     /// The server definitively rejected a managed printing/factory operation.
     #[error("managed operation {operation_id} ended as {status:?}: {response:?}")]
     SubmissionRejected {
@@ -720,6 +827,167 @@ pub async fn ensure_submission_accepted(operation: &Operation) -> Result<(), Pri
     Ok(())
 }
 
+fn assign_tracked_prints(
+    requests: &[TrackedPrintRequest],
+    blueprints: &BTreeMap<String, Blueprint>,
+    factories: &[FactoryState],
+    allowed_factory_codes: Option<&BTreeSet<String>>,
+) -> Vec<TrackedPrintAssignment> {
+    let mut slots = factories
+        .iter()
+        .filter(|factory| allowed_factory_codes.is_none_or(|codes| codes.contains(&factory.code)))
+        .map(|factory| (factory.code.clone(), factory.available_slots()))
+        .collect::<BTreeMap<_, _>>();
+    let mut loads = factories
+        .iter()
+        .filter(|factory| allowed_factory_codes.is_none_or(|codes| codes.contains(&factory.code)))
+        .map(|factory| (factory.code.clone(), factory.remaining_seconds.max(0.0)))
+        .collect::<BTreeMap<_, _>>();
+    let mut order = (0..requests.len()).collect::<Vec<_>>();
+    order.sort_by(|left, right| {
+        let left_request = &requests[*left];
+        let right_request = &requests[*right];
+        let left_seconds = blueprints[&left_request.device_type].print_time_seconds()
+            * left_request.quantity as f64;
+        let right_seconds = blueprints[&right_request.device_type].print_time_seconds()
+            * right_request.quantity as f64;
+        right_seconds
+            .total_cmp(&left_seconds)
+            .then_with(|| left_request.device_type.cmp(&right_request.device_type))
+            .then_with(|| left.cmp(right))
+    });
+
+    let mut assignments = Vec::new();
+    for request_index in order {
+        let request = &requests[request_index];
+        let queue_slots = usize::try_from(request.quantity).unwrap_or(usize::MAX);
+        let Some(factory_code) = loads
+            .iter()
+            .filter(|(code, _)| slots.get(*code).copied().unwrap_or(0) >= queue_slots)
+            .min_by(|left, right| left.1.total_cmp(right.1).then_with(|| left.0.cmp(right.0)))
+            .map(|(code, _)| code.clone())
+        else {
+            continue;
+        };
+        *loads.entry(factory_code.clone()).or_default() += blueprints[&request.device_type]
+            .print_time_seconds()
+            .max(0.0)
+            * request.quantity as f64;
+        let available = slots.entry(factory_code.clone()).or_default();
+        *available = available.saturating_sub(queue_slots);
+        assignments.push(TrackedPrintAssignment {
+            request_index,
+            factory_code,
+            device_type: request.device_type.clone(),
+            quantity: request.quantity,
+            flatpack: request.flatpack,
+        });
+    }
+    assignments.sort_by_key(|assignment| assignment.request_index);
+    assignments
+}
+
+/// Assigns and submits one non-blocking pass of independently checkpointed
+/// print requests.
+///
+/// The hub scheduling guard spans the final live factory read and every
+/// resulting submission. The observer is called before mutation so the caller
+/// can persist assignment and intent, then again as soon as the durable
+/// operation ID exists. The preparing callback returns the exact submission
+/// tags, or `None` to leave that assignment unsubmitted during this pass. The
+/// operation-recorded callback's return value is ignored.
+pub async fn queue_tracked_prints_once<F>(
+    client: &Client,
+    requests: &[TrackedPrintRequest],
+    options: &QueueOptions,
+    blueprints: &BTreeMap<String, Blueprint>,
+    mut observer: F,
+) -> Result<TrackedQueueReport, PrintingError>
+where
+    F: FnMut(TrackedPrintUpdate) -> Result<Option<Vec<String>>, String>,
+{
+    if requests.is_empty() {
+        return Ok(TrackedQueueReport::default());
+    }
+    for request in requests {
+        if request.quantity <= 0 {
+            return Err(ScheduleError::InvalidQuantity {
+                device_type: request.device_type.clone(),
+                quantity: request.quantity,
+            }
+            .into());
+        }
+        let blueprint = blueprints
+            .get(&request.device_type)
+            .ok_or_else(|| ScheduleError::MissingBlueprint(request.device_type.clone()))?;
+        if request.flatpack && !blueprint.is_modular() {
+            return Err(PrintingError::FlatpackRequiresModular(
+                request.device_type.clone(),
+            ));
+        }
+    }
+
+    let _schedule_guard = acquire_hub_schedule_guard(&options.hub).await;
+    let factories = discover_factories(client, &options.hub, blueprints).await?;
+    if factories.is_empty() {
+        return Err(PrintingError::NoFactoryAtHub(options.hub.clone()));
+    }
+    let assignments = assign_tracked_prints(
+        requests,
+        blueprints,
+        &factories,
+        options.factory_codes.as_ref(),
+    );
+
+    let mut report = TrackedQueueReport::default();
+    for assignment in assignments {
+        let request = &requests[assignment.request_index];
+        if request.authoritative_factory_check {
+            let detail = client
+                .raw()
+                .devices()
+                .get(&assignment.factory_code)
+                .await?
+                .value;
+            let required_slots = usize::try_from(request.quantity).unwrap_or(usize::MAX);
+            if factory_status_blocks_printing(detail.status.as_deref())
+                || factory_state_from_detail(&assignment.factory_code, &detail, blueprints)?
+                    .available_slots()
+                    < required_slots
+            {
+                invalidate_factory_detail_cache(&assignment.factory_code);
+                continue;
+            }
+        }
+        let Some(tags) = observer(TrackedPrintUpdate::Preparing(assignment.clone()))
+            .map_err(PrintingError::SubmissionObserver)?
+        else {
+            continue;
+        };
+        let handle = client.devices().get(&assignment.factory_code).await?;
+        let mut print_options = AutofactoryPrintOptions::new(assignment.quantity).tags(tags);
+        if assignment.flatpack {
+            print_options = print_options.flatpacked();
+        }
+        let operation = handle
+            .enqueue_print_configured(&assignment.device_type, print_options)
+            .await?;
+        let operation_id = operation.id().as_str().to_owned();
+        observer(TrackedPrintUpdate::OperationRecorded {
+            assignment: assignment.clone(),
+            operation_id: operation_id.clone(),
+        })
+        .map_err(PrintingError::SubmissionObserver)?;
+        ensure_submission_accepted(&operation).await?;
+        invalidate_factory_detail_cache(&assignment.factory_code);
+        report.submissions.push(TrackedPrintSubmission {
+            assignment,
+            operation_id,
+        });
+    }
+    Ok(report)
+}
+
 /// Continuously fills all eligible Autofactory queues until every direct
 /// request has been accepted.
 ///
@@ -938,6 +1206,10 @@ async fn queue_print_batch_once(
         return Ok((report, true));
     }
 
+    // Discovery and submission are one scheduling transaction within this
+    // process. Concurrent workflows otherwise observe the same idle snapshot
+    // and deterministically pile their small batches onto the same factories.
+    let _schedule_guard = acquire_hub_schedule_guard(&options.hub).await;
     let factories = discover_factories(client, &options.hub, blueprints).await?;
     if factories.is_empty() {
         return Err(PrintingError::NoFactoryAtHub(options.hub.clone()));
@@ -985,17 +1257,23 @@ async fn queue_print_batch(
         if factory_codes.is_empty() {
             return Err(PrintingError::NoFactoryAtHub(options.hub.clone()));
         }
-        let factories = factory_states_for_codes(client, &factory_codes, blueprints).await?;
-        let submitted = submit_schedulable(
-            client,
-            &mut remaining,
-            &mut report,
-            options,
-            blueprints,
-            flatpack,
-            &factories,
-        )
-        .await?;
+        let submitted = {
+            // Serialize the live read and the resulting submissions so a
+            // sibling workflow sees this pass's invalidated factory details
+            // before choosing its own targets.
+            let _schedule_guard = acquire_hub_schedule_guard(&options.hub).await;
+            let factories = factory_states_for_codes(client, &factory_codes, blueprints).await?;
+            submit_schedulable(
+                client,
+                &mut remaining,
+                &mut report,
+                options,
+                blueprints,
+                flatpack,
+                &factories,
+            )
+            .await?
+        };
         if remaining.is_empty() {
             return Ok(report);
         }
@@ -2020,6 +2298,105 @@ fn device_location(device: &Device) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn concurrent_scheduling_is_serialized_per_hub() {
+        let first = hub_schedule_lock("SERIALIZATION-TEST");
+        let first_guard = first.lock().await;
+
+        let same_hub = hub_schedule_lock("serialization-test");
+        assert!(same_hub.try_lock().is_err());
+
+        let other_hub = hub_schedule_lock("OTHER-SERIALIZATION-TEST");
+        let other_guard = other_hub
+            .try_lock()
+            .expect("a different hub must remain independently schedulable");
+
+        drop(first_guard);
+        assert!(same_hub.try_lock().is_ok());
+        drop(other_guard);
+    }
+
+    #[test]
+    fn tracked_assignment_uses_every_equally_idle_factory() {
+        let blueprints = [(
+            "device".into(),
+            Blueprint {
+                device_type: "device".into(),
+                print_time_seconds: 100.0,
+                features: Vec::new(),
+                components: QuantityMap::new(),
+            },
+        )]
+        .into_iter()
+        .collect();
+        let requests = (0..28)
+            .map(|_| TrackedPrintRequest::new("device", 1))
+            .collect::<Vec<_>>();
+        let factories = (0..28)
+            .map(|index| FactoryState {
+                code: format!("AF-{index:02}"),
+                queue_size: 1,
+                queued_units: 0,
+                printing: false,
+                waiting_for_resources: false,
+                remaining_seconds: 0.0,
+            })
+            .collect::<Vec<_>>();
+
+        let assignments = assign_tracked_prints(&requests, &blueprints, &factories, None);
+        let assigned_factories = assignments
+            .iter()
+            .map(|assignment| assignment.factory_code.as_str())
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(assignments.len(), 28);
+        assert_eq!(assigned_factories.len(), 28);
+    }
+
+    #[test]
+    fn tracked_assignment_honors_lane_and_quantity_capacity() {
+        let blueprints = [(
+            "device".into(),
+            Blueprint {
+                device_type: "device".into(),
+                print_time_seconds: 100.0,
+                features: Vec::new(),
+                components: QuantityMap::new(),
+            },
+        )]
+        .into_iter()
+        .collect();
+        let requests = [
+            TrackedPrintRequest::new("device", 2),
+            TrackedPrintRequest::new("device", 1),
+        ];
+        let factories = [
+            FactoryState {
+                code: "AF-1".into(),
+                queue_size: 2,
+                queued_units: 0,
+                printing: false,
+                waiting_for_resources: false,
+                remaining_seconds: 0.0,
+            },
+            FactoryState {
+                code: "AF-2".into(),
+                queue_size: 4,
+                queued_units: 0,
+                printing: false,
+                waiting_for_resources: false,
+                remaining_seconds: 0.0,
+            },
+        ];
+        let lanes = ["AF-1".to_owned()].into_iter().collect();
+
+        let assignments = assign_tracked_prints(&requests, &blueprints, &factories, Some(&lanes));
+
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0].request_index, 0);
+        assert_eq!(assignments[0].factory_code, "AF-1");
+    }
 
     #[test]
     fn queue_occupancy_counts_device_quantities() {

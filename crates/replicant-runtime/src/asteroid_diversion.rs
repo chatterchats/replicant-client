@@ -32,6 +32,8 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::worker_state::OPERATIONAL_REGIONAL_WORKER_CAPABILITY;
+
 const WORKFLOW_NAME: &str = "asteroid.diversion";
 const OBJECTIVE: &str = "Divert incoming asteroids threatening regional systems";
 const PRIORITY: u64 = 800;
@@ -779,7 +781,7 @@ pub(crate) fn asteroid_diversion_item_specs(
                     ResourceRequirement {
                         key: "worker".into(),
                         kind: "replicant".into(),
-                        capabilities: Vec::new(),
+                        capabilities: vec![OPERATIONAL_REGIONAL_WORKER_CAPABILITY.into()],
                         scope: RequirementScope::Region(region.to_owned()),
                         count: 1,
                         quantity: 1,
@@ -2277,6 +2279,27 @@ mod tests {
         replayed.push(replayed[1].clone());
         let (replayed_occurrences, _, _) = fold_asteroid_lifecycle(&replayed, 0);
         assert_eq!(replayed_occurrences.len(), 4);
+    }
+
+    #[test]
+    fn work_items_require_an_operational_regional_worker() {
+        let detections = vec![detection(
+            "1000-0",
+            "2026-07-30T12:00:00Z",
+            "SCEPTURUM-OBJ-1",
+            "SCEPTURUM",
+            "SCEPTURUM-7",
+            "2026-08-02T12:00:00Z",
+        )];
+        let (occurrences, _, _) = fold_asteroid_lifecycle(&detections, 0);
+        let specs =
+            asteroid_diversion_item_specs(WorkflowId::new(), &occurrences, "alpha", "SCEPTURUM-7")
+                .expect("asteroid work item");
+
+        assert_eq!(
+            specs[0].requirements_json[0]["capabilities"],
+            json!([OPERATIONAL_REGIONAL_WORKER_CAPABILITY])
+        );
     }
 
     #[test]

@@ -1218,11 +1218,35 @@ async fn deliver_payload_devices(
         .map(|payload| payload.code.clone())
         .collect::<BTreeSet<_>>();
     let mut by_origin = BTreeMap::<String, Vec<PayloadDevice>>::new();
+    let mut already_delivered = BTreeSet::new();
     for payload in payload_devices {
+        let mut effective = payload.clone();
+        let detail = client.raw().devices().get(&payload.code).await?.value;
+        let free_and_stationary = detail.travel.is_none()
+            && detail.attached_to_device_code.is_none()
+            && detail.stowed_in_device_code.is_none();
+        let (effective_origin, is_delivered) = payload_resume_state(
+            detail.location.as_deref(),
+            free_and_stationary,
+            &payload.origin,
+            destination,
+        );
+        if is_delivered {
+            already_delivered.insert(payload.code.clone());
+        } else if !same_location(&effective_origin, &payload.origin) {
+            info!(
+                payload = %payload.code,
+                planned_origin = %payload.origin,
+                effective_origin = %effective_origin,
+                destination = %destination,
+                "recovering payload already staged inside destination system"
+            );
+            effective.origin = effective_origin;
+        }
         by_origin
-            .entry(payload.origin.clone())
+            .entry(effective.origin.clone())
             .or_default()
-            .push(payload.clone());
+            .push(effective);
     }
 
     let mut delivered = Vec::new();
@@ -1234,7 +1258,7 @@ async fn deliver_payload_devices(
         // The last two states continue the achieved attachment to the
         // destination; they must never detach at the origin and retry attach.
         for payload in &remaining_payloads {
-            if device_already_delivered(client, &payload.code, destination).await? {
+            if already_delivered.contains(&payload.code) {
                 if options.unfurl_modular_payload {
                     unfurl_modular_devices(client, std::slice::from_ref(&payload.code), options)
                         .await?;
@@ -1375,6 +1399,8 @@ async fn continue_attached_delivery(
             destination,
         )
         .is_none()
+            && !same_system(planned, origin)
+            && !same_system(planned, destination)
         {
             return Err(TransportError::Invalid(format!(
                 "carrier {carrier} is already travelling to {planned}, outside this delivery"
@@ -1388,6 +1414,12 @@ async fn continue_attached_delivery(
     match attached_delivery_state(current.location.as_deref(), None, origin, destination) {
         Some(AttachedDeliveryState::AtDestination) => {}
         Some(AttachedDeliveryState::AtOrigin) => {
+            ensure_device_at(client, carrier, destination, options, &attached_leg).await?;
+        }
+        _ if current.location.as_deref().is_some_and(|location| {
+            same_system(location, origin) || same_system(location, destination)
+        }) =>
+        {
             ensure_device_at(client, carrier, destination, options, &attached_leg).await?;
         }
         _ => {
@@ -1567,18 +1599,33 @@ fn ensure_only_delivery_attachments(
         )))
     }
 }
-async fn device_already_delivered(client: &Client, code: &str, destination: &str) -> Result<bool> {
-    let detail = client.raw().devices().get(code).await?.value;
-    Ok(detail.travel.is_none()
-        && detail
-            .location
-            .as_deref()
-            .is_some_and(|location| same_location(location, destination))
-        && detail.attached_to_device_code.is_none()
-        && detail.stowed_in_device_code.is_none())
-}
 fn same_location(left: &str, right: &str) -> bool {
     left.trim().eq_ignore_ascii_case(right.trim())
+}
+
+fn same_system(left: &str, right: &str) -> bool {
+    system_designation(left).eq_ignore_ascii_case(system_designation(right))
+}
+
+fn payload_resume_state(
+    current_location: Option<&str>,
+    free_and_stationary: bool,
+    planned_origin: &str,
+    destination: &str,
+) -> (String, bool) {
+    if !free_and_stationary {
+        return (planned_origin.to_owned(), false);
+    }
+    let Some(current_location) = current_location else {
+        return (planned_origin.to_owned(), false);
+    };
+    if same_location(current_location, destination) {
+        (planned_origin.to_owned(), true)
+    } else if same_system(current_location, destination) {
+        (current_location.to_owned(), false)
+    } else {
+        (planned_origin.to_owned(), false)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1644,12 +1691,16 @@ async fn settle_transport_between(
             ))
         })?;
 
-    if !same_location(&planned, origin) && !same_location(&planned, destination) {
+    let endpoint = if same_location(&planned, origin) || same_system(&planned, origin) {
+        origin
+    } else if same_location(&planned, destination) || same_system(&planned, destination) {
+        destination
+    } else {
         return Err(TransportError::Invalid(format!(
             "transport {code} is already travelling to {planned}, outside this delivery"
         )));
-    }
-    ensure_device_at(client, code, &planned, options, leg).await
+    };
+    ensure_device_at(client, code, endpoint, options, leg).await
 }
 /// Builds a deterministic operation identity for one restart-safe transport
 /// mutation. Length-prefixing every component prevents delimiter ambiguity and
@@ -1704,6 +1755,63 @@ fn canonical_payload_key(codes: &[String]) -> String {
     canonical_payload_codes(codes).join(",")
 }
 
+fn travel_operation_leg(leg: &str, current_location: Option<&str>, destination: &str) -> String {
+    if let Some(location) = current_location
+        && !same_location(location, destination)
+        && system_designation(location).eq_ignore_ascii_case(system_designation(destination))
+    {
+        format!("{leg}:local-from:{}", canonical_device_code(location))
+    } else {
+        leg.to_owned()
+    }
+}
+
+async fn dispatch_transport_travel(
+    client: &Client,
+    code: &str,
+    destination: &str,
+    current_location: Option<&str>,
+    options: DeliveryOptions,
+    leg: &str,
+) -> Result<Operation> {
+    let operation_leg = travel_operation_leg(leg, current_location, destination);
+    info!(
+        device = %code,
+        destination = %destination,
+        current_location = ?current_location,
+        operation_leg = %operation_leg,
+        "dispatching transport travel"
+    );
+    let via = client
+        .smart_travel()
+        .route_for_device(code, destination)
+        .await?
+        .filter(|plan| !plan.is_direct && !plan.intermediate_systems.is_empty())
+        .map(|plan| {
+            Value::Array(
+                plan.explicit_waypoints_for(destination)
+                    .into_iter()
+                    .map(Value::String)
+                    .collect(),
+            )
+        });
+    let command = raw::devices::DeviceCommand::Travel {
+        destination: destination.to_owned(),
+        dry_run: None,
+        via,
+    };
+    let handle = client.devices().get(code).await?;
+    let operation = if let Some(operation_id) =
+        managed_operation_id(options, "travel", code, destination, &operation_leg)
+    {
+        handle.command_with_id(operation_id, command).await?
+    } else {
+        handle.command(command).await?
+    };
+    ensure_operation_accepted(&operation).await?;
+    Ok(operation)
+}
+
 async fn ensure_device_at(
     client: &Client,
     code: &str,
@@ -1711,6 +1819,8 @@ async fn ensure_device_at(
     options: DeliveryOptions,
     leg: &str,
 ) -> Result<()> {
+    const MAX_LOCAL_CONTINUATIONS: usize = 3;
+
     let code = canonical_device_code(code);
     let destination = canonical_device_code(destination);
     let handle = client.devices().get(&code).await?;
@@ -1723,13 +1833,24 @@ async fn ensure_device_at(
     {
         return Ok(());
     }
-    let operation = if let Some(travel) = &snapshot.travel {
+
+    let mut last_stationary_location = if snapshot.travel.is_none() {
+        snapshot
+            .location
+            .as_ref()
+            .map(|location| location.id.as_str().to_owned())
+    } else {
+        None
+    };
+    let mut operation = if let Some(travel) = &snapshot.travel {
         let planned = travel
             .final_destination
             .as_ref()
             .or(travel.destination.as_ref())
             .map(|location| location.id.as_str());
-        if !planned.is_some_and(|planned| same_location(planned, &destination)) {
+        if !planned.is_some_and(|planned| {
+            same_location(planned, &destination) || same_system(planned, &destination)
+        }) {
             return Err(TransportError::Invalid(format!(
                 "device {code} is already travelling to {:?}, not {destination}",
                 planned
@@ -1737,44 +1858,84 @@ async fn ensure_device_at(
         }
         None
     } else {
-        info!(device = %code, destination = %destination, "dispatching transport travel");
-        let via = client
-            .smart_travel()
-            .route_for_device(&code, &destination)
-            .await?
-            .filter(|plan| !plan.is_direct && !plan.intermediate_systems.is_empty())
-            .map(|plan| {
-                Value::Array(
-                    plan.explicit_waypoints_for(&destination)
-                        .into_iter()
-                        .map(Value::String)
-                        .collect(),
-                )
-            });
-        let command = raw::devices::DeviceCommand::Travel {
-            destination: destination.clone(),
-            dry_run: None,
-            via,
-        };
-        let operation = if let Some(operation_id) =
-            managed_operation_id(options, "travel", &code, &destination, leg)
-        {
-            handle.command_with_id(operation_id, command).await?
-        } else {
-            handle.command(command).await?
-        };
-        ensure_operation_accepted(&operation).await?;
-        Some(operation)
+        Some(
+            dispatch_transport_travel(
+                client,
+                &code,
+                &destination,
+                last_stationary_location.as_deref(),
+                options,
+                leg,
+            )
+            .await?,
+        )
     };
 
-    wait_for_device(client, &code, operation.as_ref(), options, |device| {
-        device.travel.is_none()
-            && device
+    let deadline = Instant::now() + options.wait_timeout;
+    let mut local_continuations = 0_usize;
+    loop {
+        let snapshot = client.devices().get(&code).await?.snapshot().await?;
+        if snapshot.travel.is_none()
+            && snapshot
                 .location
                 .as_ref()
                 .is_some_and(|location| same_location(location.id.as_str(), &destination))
-    })
-    .await
+        {
+            return Ok(());
+        }
+        ensure_operation_not_rejected(operation.as_ref(), &code).await?;
+
+        if snapshot.travel.is_none()
+            && let Some(location) = snapshot
+                .location
+                .as_ref()
+                .map(|location| location.id.as_str())
+            && !same_location(location, &destination)
+            && system_designation(location).eq_ignore_ascii_case(system_designation(&destination))
+            && last_stationary_location
+                .as_deref()
+                .is_none_or(|previous| !same_location(previous, location))
+        {
+            if local_continuations >= MAX_LOCAL_CONTINUATIONS {
+                return Err(TransportError::Invalid(format!(
+                    "device {code} repeatedly stopped in {} without reaching {destination}",
+                    system_designation(&destination)
+                )));
+            }
+            local_continuations += 1;
+            info!(
+                device = %code,
+                location,
+                destination = %destination,
+                continuation = local_continuations,
+                "continuing transport from destination-system arrival to exact local destination"
+            );
+            operation = Some(
+                dispatch_transport_travel(
+                    client,
+                    &code,
+                    &destination,
+                    Some(location),
+                    options,
+                    leg,
+                )
+                .await?,
+            );
+            last_stationary_location = Some(location.to_owned());
+            continue;
+        }
+
+        if Instant::now() >= deadline {
+            return Err(TransportError::TimedOut(format!(
+                "timed out waiting for device {code} state"
+            )));
+        }
+        let eta_seconds = snapshot
+            .travel
+            .as_ref()
+            .and_then(|travel| travel.eta_seconds);
+        sleep(travel_poll_interval(eta_seconds, options.poll_interval)).await;
+    }
 }
 
 /// Polls the managed device state until `predicate` holds.
@@ -2487,6 +2648,7 @@ mod tests {
             system_status: None,
             active_directive: None,
             travel: None,
+            runtime: Default::default(),
             access: replicant_client::domain::AccessScope::Owned,
         }
     }
@@ -2524,6 +2686,7 @@ mod tests {
             system_status: None,
             active_directive: None,
             travel: None,
+            runtime: Default::default(),
             access: replicant_client::domain::AccessScope::Owned,
         }
     }
@@ -2667,6 +2830,40 @@ mod tests {
         assert_ne!(
             return_location_for_transport(&plan, "REMOTE"),
             Some(plan.origin.as_str())
+        );
+    }
+
+    #[test]
+    fn travel_operation_leg_distinguishes_local_continuation_from_interstellar_leg() {
+        assert!(same_system("BETA-7-L4", "BETA-KUIPER"));
+        assert!(!same_system("ALPHA-7-L4", "BETA-KUIPER"));
+        assert_eq!(
+            travel_operation_leg("delivery", Some("ALPHA-7-L4"), "BETA-KUIPER"),
+            "delivery"
+        );
+        assert_eq!(
+            travel_operation_leg("delivery", Some("BETA-7-L4"), "BETA-KUIPER"),
+            "delivery:local-from:BETA-7-L4"
+        );
+        assert_eq!(
+            travel_operation_leg("delivery", Some("BETA-KUIPER"), "BETA-KUIPER"),
+            "delivery"
+        );
+    }
+
+    #[test]
+    fn payload_resume_state_recovers_destination_system_staging() {
+        assert_eq!(
+            payload_resume_state(Some("BETA-7-L4"), true, "ALPHA-BELT-1", "BETA-KUIPER",),
+            ("BETA-7-L4".into(), false)
+        );
+        assert_eq!(
+            payload_resume_state(Some("BETA-KUIPER"), true, "ALPHA-BELT-1", "BETA-KUIPER",),
+            ("ALPHA-BELT-1".into(), true)
+        );
+        assert_eq!(
+            payload_resume_state(Some("GAMMA-7-L4"), true, "ALPHA-BELT-1", "BETA-KUIPER",),
+            ("ALPHA-BELT-1".into(), false)
         );
     }
 

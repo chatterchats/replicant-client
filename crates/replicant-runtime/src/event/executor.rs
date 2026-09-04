@@ -6,8 +6,7 @@ use std::{
 
 use futures::future::{join_all, try_join_all};
 use replicant_client::{
-    AutofactoryPrintOptions, Client, Device, DeviceType, Operation, OperationId, OperationStatus,
-    domain::AccessScope, raw,
+    Client, Device, DeviceType, Operation, OperationId, OperationStatus, domain::AccessScope, raw,
 };
 use replicant_event_planner::{
     BeaconAction, DeviceRequirement, DeviceStock, ResourceMap, blueprint_resource_cost,
@@ -16,9 +15,9 @@ use replicant_event_planner::{
 use replicant_printing::{
     PrintRequest,
     managed::{
-        QueueOptions, discover_factories, factory_queue_slots,
-        fetch_blueprints as fetch_print_blueprints, invalidate_factory_detail_cache,
-        queue_print_prerequisites, queue_print_prerequisites_ahead,
+        QueueOptions, TrackedPrintRequest, TrackedPrintUpdate, discover_factories,
+        fetch_blueprints as fetch_print_blueprints, queue_print_prerequisites,
+        queue_print_prerequisites_ahead, queue_tracked_prints_once,
     },
 };
 use replicant_transport::{DeliveryOptions, PayloadDevice as TransportPayloadDevice};
@@ -1141,6 +1140,19 @@ fn split_pending_print_batches(plan: &mut EventMissionPlan) -> usize {
     split
 }
 
+fn ensure_queue_safe_print_batch(batch: &ExecutionPrintBatch) -> AnyResult<()> {
+    if batch.quantity == 1 {
+        return Ok(());
+    }
+    Err(app_error(
+        io::ErrorKind::InvalidData,
+        format!(
+            "pending print batch {} has queue-unsafe quantity {}; recreate the plan or clear its unsubmitted execution batches",
+            batch.batch_tag, batch.quantity
+        ),
+    ))
+}
+
 fn role_for_device_type(device_type: &str) -> &'static str {
     match device_type {
         CARGO_FREIGHTER => "cargo",
@@ -1646,146 +1658,83 @@ async fn submit_available_print_batches(
     }
 
     let printing_blueprints = fetch_print_blueprints(client).await?;
-    let allowed_lanes = plan
-        .execution
-        .printer_lanes
-        .iter()
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    let factories = discover_factories(client, &plan.home_location, &printing_blueprints)
-        .await?
+    let prepared = pending
         .into_iter()
-        .filter(|factory| allowed_lanes.is_empty() || allowed_lanes.contains(&factory.code))
+        .take(submission_limit)
         .collect::<Vec<_>>();
-    let mut preparation_slots = factories
-        .iter()
-        .map(|factory| (factory.code.clone(), factory.available_slots()))
-        .collect::<BTreeMap<_, _>>();
-    let mut projected_work = factories
-        .iter()
-        .map(|factory| (factory.code.clone(), factory.remaining_seconds.max(0.0)))
-        .collect::<BTreeMap<_, _>>();
-    let mut prepared = Vec::new();
-    for index in pending {
-        if prepared.len() >= submission_limit {
-            break;
-        }
-        let Some(factory_code) = projected_work
-            .iter()
-            .filter_map(|(factory_code, work)| {
-                (preparation_slots.get(factory_code).copied().unwrap_or(0) > 0)
-                    .then_some((factory_code, *work))
-            })
-            .min_by(|(left_code, left_work), (right_code, right_work)| {
-                left_work
-                    .total_cmp(right_work)
-                    .then_with(|| left_code.cmp(right_code))
-            })
-            .map(|(factory_code, _)| factory_code.clone())
-        else {
-            break;
-        };
-        let slots = preparation_slots.get(&factory_code).copied().unwrap_or(0);
-        let batch_device_type = plan.execution.print_batches[index].device_type.clone();
-        let previous_factory = plan.execution.print_batches[index].factory_code.clone();
-        let batch_tag = plan.execution.print_batches[index].batch_tag.clone();
-        let duration = printing_blueprints
-            .get(&batch_device_type)
-            .map_or(0.0, |blueprint| blueprint.print_time_seconds.max(0.0));
-        if previous_factory != factory_code {
-            info!(
-                mission = %plan.mission_id,
-                batch = %batch_tag,
-                from_factory = %previous_factory,
-                to_factory = %factory_code,
-                "reassigning unsubmitted event print batch to live Autofactory"
-            );
-            plan.execution.print_batches[index].factory_code = factory_code.clone();
-        }
-        prepared.push(index);
-        preparation_slots.insert(factory_code.clone(), slots - 1);
-        *projected_work.entry(factory_code).or_default() += duration;
-    }
-    if prepared.is_empty() {
+    let parent_ready = prepare_print_prerequisites(client, config, plan, &prepared).await?;
+    let ready = prepared
+        .into_iter()
+        .filter(|index| parent_ready.contains(index))
+        .collect::<Vec<_>>();
+    if ready.is_empty() {
         return Ok(0);
     }
-    save_plan(&config.plan_path, plan)?;
 
-    let parent_ready = prepare_print_prerequisites(client, config, plan, &prepared).await?;
+    for index in &ready {
+        ensure_queue_safe_print_batch(&plan.execution.print_batches[*index])?;
+    }
 
-    let prepared_factories = prepared
+    let requests = ready
         .iter()
-        .filter(|index| parent_ready.contains(index))
-        .map(|index| plan.execution.print_batches[*index].factory_code.clone())
-        .collect::<BTreeSet<_>>();
-    let mut queue_slots = BTreeMap::new();
-    for factory_code in prepared_factories {
-        queue_slots.insert(
-            factory_code.clone(),
-            factory_queue_slots(client, &factory_code).await?,
-        );
+        .map(|index| {
+            let batch = &plan.execution.print_batches[*index];
+            let request = TrackedPrintRequest::new(batch.device_type.clone(), batch.quantity);
+            if printing_blueprints
+                .get(&batch.device_type)
+                .is_some_and(replicant_printing::Blueprint::is_modular)
+            {
+                request.flatpacked()
+            } else {
+                request
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut options = QueueOptions::at(plan.home_location.clone());
+    if !plan.execution.printer_lanes.is_empty() {
+        options.factory_codes = Some(plan.execution.printer_lanes.iter().cloned().collect());
     }
-
-    let modular_device_types = printing_blueprints
-        .into_iter()
-        .filter_map(|(device_type, blueprint)| blueprint.is_modular().then_some(device_type))
-        .collect::<BTreeSet<_>>();
-
-    let mut submitted = 0usize;
-    for index in prepared {
-        if !parent_ready.contains(&index) {
-            continue;
-        }
-        let factory_code = plan.execution.print_batches[index].factory_code.clone();
-        let slots = queue_slots.get(&factory_code).copied().unwrap_or(0);
-        if slots == 0 {
-            continue;
-        }
-        let batch = plan.execution.print_batches[index].clone();
-        if batch.quantity != 1 {
-            return Err(app_error(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "pending print batch {} has queue-unsafe quantity {}; recreate the plan or clear its unsubmitted execution batches",
-                    batch.batch_tag, batch.quantity
-                ),
-            ));
-        }
-        plan.execution.print_batches[index].submission_started = true;
-        save_plan(&config.plan_path, plan)?;
-
-        let flatpacked = modular_device_types.contains(&batch.device_type);
-        let mut options = AutofactoryPrintOptions::new(1).tags([
-            plan.mission_tag.clone(),
-            role_tag(&batch.role),
-            batch.batch_tag.clone(),
-        ]);
-        if flatpacked {
-            options = options.flatpacked();
-        }
-        info!(
-            factory = %batch.factory_code,
-            device_type = %batch.device_type,
-            flatpacked,
-            "submitting event print batch"
-        );
-        // Factory planning already populated the selected factory projection.
-        let factory = match client.devices().cached(&batch.factory_code) {
-            Some(handle) => handle,
-            None => client.devices().get(&batch.factory_code).await?,
-        };
-        let operation = factory
-            .enqueue_print_configured(batch.device_type.clone(), options)
-            .await?;
-        plan.execution.print_batches[index].operation_id = Some(operation.id().as_str().to_owned());
-        plan.execution.print_batches[index].submitted = true;
-        save_plan(&config.plan_path, plan)?;
-        ensure_operation_accepted(&operation).await?;
-        invalidate_factory_detail_cache(&batch.factory_code);
-        queue_slots.insert(factory_code, slots - 1);
-        submitted += 1;
-    }
-    Ok(submitted)
+    let report = queue_tracked_prints_once(
+        client,
+        &requests,
+        &options,
+        &printing_blueprints,
+        |update| match update {
+            TrackedPrintUpdate::Preparing(assignment) => {
+                let index = ready[assignment.request_index];
+                let mission_tag = plan.mission_tag.clone();
+                let (role, batch_tag) = {
+                    let batch = &mut plan.execution.print_batches[index];
+                    if batch.factory_code != assignment.factory_code {
+                        info!(
+                            mission = %plan.mission_id,
+                            batch = %batch.batch_tag,
+                            from_factory = %batch.factory_code,
+                            to_factory = %assignment.factory_code,
+                            "reassigning unsubmitted event print batch to live Autofactory"
+                        );
+                        batch.factory_code.clone_from(&assignment.factory_code);
+                    }
+                    batch.submission_started = true;
+                    (batch.role.clone(), batch.batch_tag.clone())
+                };
+                save_plan(&config.plan_path, plan).map_err(|error| error.to_string())?;
+                Ok(Some(vec![mission_tag, role_tag(&role), batch_tag]))
+            }
+            TrackedPrintUpdate::OperationRecorded {
+                assignment,
+                operation_id,
+            } => {
+                let batch = &mut plan.execution.print_batches[ready[assignment.request_index]];
+                batch.operation_id = Some(operation_id);
+                batch.submitted = true;
+                save_plan(&config.plan_path, plan).map_err(|error| error.to_string())?;
+                Ok(None)
+            }
+        },
+    )
+    .await?;
+    Ok(report.submissions.len())
 }
 
 async fn prepare_print_prerequisites(
@@ -4828,10 +4777,10 @@ mod tests {
     };
 
     use super::{
-        ReplicantTravelDecision, ResourceMap, allocate_manifests, command_available,
-        is_modular_device, legacy_recovered_rewards, merge_recovered_rewards, merge_resources,
-        print_batch_tag, replicant_travel_decision, resources_available_from,
-        reward_cargo_is_loaded, status_is,
+        ExecutionPrintBatch, ReplicantTravelDecision, ResourceMap, allocate_manifests,
+        command_available, ensure_queue_safe_print_batch, is_modular_device,
+        legacy_recovered_rewards, merge_recovered_rewards, merge_resources, print_batch_tag,
+        replicant_travel_decision, resources_available_from, reward_cargo_is_loaded, status_is,
     };
 
     async fn test_client_at(server: &MockServer) -> Client {
@@ -4896,6 +4845,28 @@ mod tests {
             print_batch_tag(mission_tag, "sensor_array", 0),
             print_batch_tag(mission_tag, "ftl_beacon", 0)
         );
+    }
+
+    #[test]
+    fn rejects_queue_unsafe_event_print_batch_quantities() {
+        let mut batch = ExecutionPrintBatch {
+            factory_code: "AF-1".into(),
+            device_type: "sensor_array".into(),
+            quantity: 2,
+            role: "payload".into(),
+            batch_tag: "evt-b:test".into(),
+            prerequisites_queued: true,
+            submission_started: false,
+            submitted: false,
+            operation_id: None,
+            produced_codes: Vec::new(),
+        };
+
+        let error = ensure_queue_safe_print_batch(&batch).expect_err("quantity two must fail");
+        assert!(error.to_string().contains("queue-unsafe quantity 2"));
+
+        batch.quantity = 1;
+        ensure_queue_safe_print_batch(&batch).expect("unit batch");
     }
 
     #[test]

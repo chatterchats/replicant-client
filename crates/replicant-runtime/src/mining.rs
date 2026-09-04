@@ -26,6 +26,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::info;
 
+use crate::worker_state::OPERATIONAL_REGIONAL_WORKER_CAPABILITY;
+
 mod executor;
 mod validation;
 
@@ -437,7 +439,7 @@ pub fn mining_work_item_specs(
             ResourceRequirement {
                 key: "worker".into(),
                 kind: "replicant".into(),
-                capabilities: Vec::new(),
+                capabilities: vec![OPERATIONAL_REGIONAL_WORKER_CAPABILITY.into()],
                 scope: RequirementScope::Region(region.to_owned()),
                 count: 1,
                 quantity: 1,
@@ -517,7 +519,7 @@ fn mining_site_item_requirements(region: &str, site: &SiteMission) -> Vec<Resour
     let mut requirements = vec![ResourceRequirement {
         key: "worker".into(),
         kind: "replicant".into(),
-        capabilities: Vec::new(),
+        capabilities: vec![OPERATIONAL_REGIONAL_WORKER_CAPABILITY.into()],
         scope: scope(),
         count: 1,
         quantity: 1,
@@ -572,7 +574,7 @@ fn mining_route_item_requirements(region: &str) -> Vec<ResourceRequirement> {
         ResourceRequirement {
             key: "worker".into(),
             kind: "replicant".into(),
-            capabilities: Vec::new(),
+            capabilities: vec![OPERATIONAL_REGIONAL_WORKER_CAPABILITY.into()],
             scope: scope(),
             count: 1,
             quantity: 1,
@@ -2354,6 +2356,7 @@ mod tests {
             system_status: None,
             active_directive: None,
             travel: None,
+            runtime: Default::default(),
             access: AccessScope::Owned,
         }
     }

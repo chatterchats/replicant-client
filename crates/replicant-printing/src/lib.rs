@@ -409,6 +409,43 @@ mod tests {
     }
 
     #[test]
+    fn successive_small_batches_fill_all_equally_idle_factories() {
+        let blueprints = [(
+            "device".into(),
+            Blueprint {
+                device_type: "device".into(),
+                print_time_seconds: 100.0,
+                features: Vec::new(),
+                components: QuantityMap::new(),
+            },
+        )]
+        .into_iter()
+        .collect();
+        let required = [("device".into(), 4)].into_iter().collect();
+        let mut factories = (0..28)
+            .map(|index| FactoryWorkload {
+                code: format!("AF-{index:02}"),
+                remaining_seconds: 0.0,
+            })
+            .collect::<Vec<_>>();
+        let mut used = std::collections::BTreeSet::new();
+
+        for _ in 0..7 {
+            let schedule = schedule_prints(&required, &blueprints, &factories).unwrap();
+            for batch in schedule.batches {
+                used.insert(batch.factory_code.clone());
+                let workload = factories
+                    .iter_mut()
+                    .find(|factory| factory.code == batch.factory_code)
+                    .unwrap();
+                workload.remaining_seconds += 100.0 * batch.quantity as f64;
+            }
+        }
+
+        assert_eq!(used.len(), 28);
+    }
+
+    #[test]
     fn rejects_non_positive_quantities() {
         let error = normalize_requests(&[PrintRequest::new("autofactory", 0)]).unwrap_err();
         assert!(matches!(error, ScheduleError::InvalidQuantity { .. }));

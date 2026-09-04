@@ -24,9 +24,9 @@ use replicant_client::{
 };
 use replicant_protocol::{
     DirectorGoalKind, DirectorGoalStatus, DirectorGoalSummary, DirectorMiningPolicySummary,
-    DirectorMode, DirectorRegionStatus, DirectorRegionSummary, DirectorReplicantAssignment,
-    DirectorSnapshot, DirectorUrgencyFact, DirectorWorkforceSummary, SnapshotMetadata,
-    WorkflowId as ProtocolWorkflowId,
+    DirectorMode, DirectorRegionStatus, DirectorRegionSummary, DirectorRegionalWorkforceSummary,
+    DirectorReplicantAssignment, DirectorSnapshot, DirectorUrgencyFact, DirectorWorkerState,
+    DirectorWorkforceSummary, SnapshotMetadata, WorkflowId as ProtocolWorkflowId,
 };
 use replicant_transport::ResourceMap;
 use replicant_workflow::{
@@ -59,9 +59,9 @@ use crate::{
         new_salvage_recovery_workflow, new_scan_tour_workflow, placement_recovery_authorization,
         placement_recovery_authorization_matches, placement_recovery_metadata_matches_snapshot,
         read_placement_recovery_authorization, recoverable_salvage_sites,
-        revoke_placement_recovery_authorization, salvage_recovery_history_snapshot,
-        salvage_recovery_workflow_kind, salvage_recovery_workflow_matches,
-        write_placement_recovery_authorization,
+        replicant_provision_workflow_kind, revoke_placement_recovery_authorization,
+        salvage_recovery_history_snapshot, salvage_recovery_workflow_kind,
+        salvage_recovery_workflow_matches, write_placement_recovery_authorization,
     },
     canonical_region,
     device_placement::{DevicePlacementClass, DevicePlacementContext, classify_device_placement},
@@ -70,6 +70,7 @@ use crate::{
     },
     event::active_events,
     trade::{TradeBundle, TraderSummary, shop_trades, trader_directory},
+    worker_state::{WorkerState, classify_regional_worker},
 };
 
 const SETTINGS_NS: &str = "director.settings";
@@ -99,6 +100,7 @@ const DEFAULT_PROSPECT_COOLDOWN_MS: i64 = 10 * 60 * 1000;
 const DEFAULT_RETRY_COOLDOWN_MS: i64 = 5 * 60 * 1000;
 const DEFAULT_IDLE_TARGET: f64 = 0.15;
 const DEFAULT_SCALE_THRESHOLD: f64 = 0.10;
+const REGION_BOOTSTRAP_TARGET: usize = 2;
 const MINING_WARD_SITES_PER_REGION: usize = 4;
 const MINING_EXPANSION_RADIUS_LY: f64 = 30.0;
 const MINING_BATCH_SIZE: usize = 4;
@@ -315,6 +317,21 @@ struct WorkerView {
     role_affinity: Option<String>,
     busy_workflow: Option<WorkflowId>,
     racing_vessel: Option<String>,
+    physical_location: Option<String>,
+    state: WorkerState,
+}
+
+#[derive(Clone, Debug)]
+struct ManufacturingHomeSelection {
+    location: String,
+    reason: String,
+    local: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+struct WorkforceReconciliation {
+    recommendations: Vec<String>,
+    regions: Vec<DirectorRegionalWorkforceSummary>,
 }
 
 #[derive(Clone, Debug)]
@@ -612,6 +629,9 @@ pub fn cached_director_snapshot(
                 workforce: DirectorWorkforceSummary {
                     total: 0,
                     busy: 0,
+                    operational: 0,
+                    in_transit: 0,
+                    unavailable: 0,
                     idle: 0,
                     idle_ratio: 1.0,
                     pending_worker_demand: 0,
@@ -620,6 +640,7 @@ pub fn cached_director_snapshot(
                         "Automation Director is warming up; the last successful projection is not available yet"
                             .to_owned(),
                     ),
+                    regions: Vec::new(),
                 },
                 urgency: Vec::new(),
             }
@@ -846,18 +867,56 @@ pub async fn reconcile_director(
         .map(|replicant| {
             let code = replicant.key.id.as_str().to_owned();
             let assignment = assignments.get(&code);
+            let region = assignment.and_then(|value| value.region.clone());
+            let racing_vessel = racing_vessels.get(&code).cloned();
+            let vessel = racing_vessel.as_deref().and_then(|vessel_code| {
+                devices
+                    .iter()
+                    .find(|device| device.key.id.as_str() == vessel_code)
+            });
+            let physical_location = vessel
+                .and_then(|vessel| vessel.location.as_ref())
+                .map(|location| location.id.as_str().to_owned());
+            let physical_region = vessel
+                .and_then(|vessel| device_system(vessel, &location_systems))
+                .and_then(|system| {
+                    system_regions
+                        .get(&system)
+                        .cloned()
+                        .or_else(|| operational_region_for_system(&system, &regions))
+                });
+            let busy_workflow = busy.get(&code).copied();
+            let state = if busy_workflow.is_some() {
+                WorkerState::Busy
+            } else {
+                region
+                    .as_deref()
+                    .map_or(WorkerState::WrongRegion, |assigned_region| {
+                        classify_regional_worker(
+                            &replicant,
+                            vessel,
+                            Some(assigned_region),
+                            Some(assigned_region),
+                            physical_region.as_deref(),
+                            false,
+                        )
+                    })
+            };
             WorkerView {
-                region: assignment.and_then(|value| value.region.clone()),
+                region,
                 role_affinity: assignment.and_then(|value| value.role_affinity.clone()),
-                busy_workflow: busy.get(&code).copied(),
-                racing_vessel: racing_vessels.get(&code).cloned(),
+                busy_workflow,
+                racing_vessel,
+                physical_location,
                 replicant,
+                state,
             }
         })
         .collect::<Vec<_>>();
     workers.sort_by(|left, right| left.replicant.key.id.cmp(&right.replicant.key.id));
-    mark_partial_region_footholds(&mut regions, &workers, &location_systems, &system_regions);
-    mark_manufacturing_footholds(&mut regions, &devices, &location_systems, &system_regions);
+    mark_partial_region_footholds(&mut regions, &workers);
+    let manufacturing_homes =
+        mark_manufacturing_footholds(&mut regions, &devices, &location_systems, &system_regions);
 
     let goal_controls = load_goal_controls(&repository, regions.keys().map(String::as_str))?;
     let mut requirements = DirectorRequirementGraph::load(&repository, now)?;
@@ -1396,10 +1455,11 @@ pub async fn reconcile_director(
     let worker_demand = requirements.worker_demand_by_region();
     let mut pending_worker_demand = worker_demand.values().sum::<usize>();
     let mut workforce_states = load_workforce_states(&repository)?;
-    let scale_recommendations = reconcile_workforce(
+    let workforce_reconciliation = reconcile_workforce(
         &repository,
         &settings,
         &regions,
+        &manufacturing_homes,
         &workers,
         &workflows,
         &reserved_workers,
@@ -1428,16 +1488,40 @@ pub async fn reconcile_director(
     repository.put_document("automation.scheduler", "latest", &schedule)?;
     let busy_count = workers
         .iter()
-        .filter(|worker| worker.busy_workflow.is_some())
+        .filter(|worker| worker.state == WorkerState::Busy)
         .count();
-    let idle = total.saturating_sub(busy_count);
+    let operational_count = workers
+        .iter()
+        .filter(|worker| worker.state == WorkerState::Operational)
+        .count();
+    let in_transit_count = workers
+        .iter()
+        .filter(|worker| worker.state == WorkerState::InTransit)
+        .count();
+    let unavailable_count = total
+        .saturating_sub(busy_count)
+        .saturating_sub(operational_count)
+        .saturating_sub(in_transit_count);
+    let idle = workers
+        .iter()
+        .filter(|worker| {
+            worker.state == WorkerState::Operational
+                && worker.busy_workflow.is_none()
+                && !reserved_workers.contains(worker.replicant.key.id.as_str())
+        })
+        .count();
     let idle_ratio = if total == 0 {
         1.0
     } else {
         idle as f64 / total as f64
     };
-    let scale_up_recommended = !scale_recommendations.is_empty() || unmet_scheduler_floors != 0;
-    let scale_reason = scale_recommendations.first().cloned().or_else(|| {
+    let scale_up_recommended =
+        !workforce_reconciliation.recommendations.is_empty() || unmet_scheduler_floors != 0;
+    let scale_reason = workforce_reconciliation
+        .recommendations
+        .first()
+        .cloned()
+        .or_else(|| {
         (pending_worker_demand > 0).then(|| format!(
             "{pending_worker_demand} regional assignment(s) are worker-blocked; waiting for the grow-only scale policy"
         ))
@@ -1445,17 +1529,34 @@ pub async fn reconcile_director(
 
     let mut region_summaries = regions
         .values()
-        .map(|region| DirectorRegionSummary {
-            region: region.region.clone(),
-            status: region.status,
-            hub_system: region.hub_system.clone(),
-            hub_location: region.hub_location.clone(),
-            replicants: workers
+        .map(|region| {
+            let regional_workers = workers
                 .iter()
                 .filter(|worker| worker.region.as_deref() == Some(region.region.as_str()))
-                .map(|worker| worker.replicant.key.id.as_str().to_owned())
-                .collect(),
-            known_systems: region.known_systems.len(),
+                .collect::<Vec<_>>();
+            DirectorRegionSummary {
+                region: region.region.clone(),
+                status: region.status,
+                hub_system: region.hub_system.clone(),
+                hub_location: region.hub_location.clone(),
+                replicants: regional_workers
+                    .iter()
+                    .map(|worker| worker.replicant.key.id.as_str().to_owned())
+                    .collect(),
+                known_systems: region.known_systems.len(),
+                operational_workers: regional_workers
+                    .iter()
+                    .filter(|worker| worker.state == WorkerState::Operational)
+                    .count(),
+                workers_in_transit: regional_workers
+                    .iter()
+                    .filter(|worker| worker.state == WorkerState::InTransit)
+                    .count(),
+                busy_workers: regional_workers
+                    .iter()
+                    .filter(|worker| worker.state == WorkerState::Busy)
+                    .count(),
+            }
         })
         .collect::<Vec<_>>();
     region_summaries.sort_by(|left, right| left.region.cmp(&right.region));
@@ -1474,6 +1575,9 @@ pub async fn reconcile_director(
         regions = regions.len(),
         established_regions = established_regions.len(),
         workers = workers.len(),
+        operational_workers = operational_count,
+        workers_in_transit = in_transit_count,
+        unavailable_workers = unavailable_count,
         busy_workers = busy_count,
         pending_worker_demand,
         scale_up_recommended,
@@ -1501,17 +1605,22 @@ pub async fn reconcile_director(
                     .busy_workflow
                     .map(|id| ProtocolWorkflowId(id.to_string())),
                 role_affinity: worker.role_affinity,
+                state: protocol_worker_state(worker.state),
             })
             .collect(),
         requirements: requirement_summaries,
         workforce: DirectorWorkforceSummary {
             total,
             busy: busy_count,
+            operational: operational_count,
+            in_transit: in_transit_count,
+            unavailable: unavailable_count,
             idle,
             idle_ratio,
             pending_worker_demand,
             scale_up_recommended,
             scale_reason,
+            regions: workforce_reconciliation.regions,
         },
         urgency: schedule
             .into_iter()
@@ -1548,6 +1657,21 @@ pub async fn reconcile_director(
         "Director snapshot persisted"
     );
     Ok(snapshot)
+}
+
+fn incoming_replicant_provisions(
+    workflows: &[WorkflowInstance],
+) -> Result<BTreeMap<String, usize>, ApplicationError> {
+    let mut incoming = BTreeMap::new();
+    for workflow in workflows.iter().filter(|workflow| {
+        workflow.kind == replicant_provision_workflow_kind() && !workflow.status.is_terminal()
+    }) {
+        let intent = workflow.config::<ReplicantProvisionIntent>()?;
+        *incoming
+            .entry(canonical_region(&intent.region))
+            .or_default() += 1;
+    }
+    Ok(incoming)
 }
 
 fn reconcile_establish_regions(
@@ -1595,14 +1719,13 @@ fn reconcile_establish_regions(
             .iter()
             .filter(|worker| worker.region.as_deref() == Some(target.region.as_str()))
             .collect::<Vec<_>>();
-        if target.status == DirectorRegionStatus::Establishing {
-            next_action = Some(format!(
-                "Continue useful {} bootstrap work while the regional System Hub becomes available",
-                target.region
-            ));
-            DirectorGoalStatus::Active
-        } else if target_workers.len() < 2 {
-            let needed = 2usize.saturating_sub(target_workers.len());
+        let incoming = incoming_replicant_provisions(context.workflows)?
+            .get(&target.region)
+            .copied()
+            .unwrap_or_default();
+        let bootstrap_population = target_workers.len().saturating_add(incoming);
+        if bootstrap_population < REGION_BOOTSTRAP_TARGET {
+            let needed = REGION_BOOTSTRAP_TARGET.saturating_sub(bootstrap_population);
             let reason = format!(
                 "{} needs {needed} additional permanently assigned bootstrap worker(s)",
                 target.region
@@ -1619,10 +1742,16 @@ fn reconcile_establish_regions(
             )?;
             blocker = Some(reason);
             next_action = Some(format!(
-                "Grow the {} workforce to two Replicants before dispatching the regional ark",
+                "Grow the {} workforce to {REGION_BOOTSTRAP_TARGET} Replicants before dispatching the regional ark",
                 target.region
             ));
             DirectorGoalStatus::Blocked
+        } else if target.status == DirectorRegionStatus::Establishing {
+            next_action = Some(format!(
+                "Continue useful {} bootstrap work while the regional System Hub becomes available",
+                target.region
+            ));
+            DirectorGoalStatus::Active
         } else if let Some((source_hub, operator, explorer)) =
             bootstrap_assignment(regions, &target_workers)
         {
@@ -4829,6 +4958,10 @@ fn reconcile_event_completion(
             reserved.insert(worker);
         }
         DirectorGoalStatus::Active
+    } else if regional_workers_in_transit(workers, &region.region, reserved) > 0 {
+        blocker = Some("assigned regional workers are still in transit".to_owned());
+        next_action = Some("Wait for an assigned regional worker to arrive".to_owned());
+        DirectorGoalStatus::Waiting
     } else {
         let reason = format!(
             "{} has active events but no idle regional Replicant",
@@ -4868,17 +5001,7 @@ fn reconcile_event_completion(
 }
 
 fn planetary_survey_complete(location: &Location) -> bool {
-    let progress = &location.survey_progress;
-    let planets_complete = matches!(
-        (progress.planets_total, progress.planets_scanned),
-        (Some(total), Some(scanned)) if total == scanned
-    );
-    let moons_complete = progress.moons_total_estimated == Some(false)
-        && matches!(
-            (progress.moons_total, progress.moons_scanned),
-            (Some(total), Some(scanned)) if total == scanned
-        );
-    planets_complete && moons_complete
+    location.survey_progress.system_survey_complete() == Some(true)
 }
 
 fn reconcile_enhance_catalogue(
@@ -4897,9 +5020,11 @@ fn reconcile_enhance_catalogue(
 
     // Season Three regenerated every planet and moon. `Star::explored` is
     // catalogue history, not proof that the current planetary generation has
-    // been surveyed. Treat only exact current aggregate planet/moon counters
-    // as completed coverage. The v9 managed-store migration clears pre-3.0
-    // counters, so existing installations naturally schedule a fresh survey.
+    // been surveyed. Exact current aggregate counters are preferred when the
+    // API supplies them; a terminal post-reset `survey_system` digest is the
+    // durable fallback on live responses that omit those aggregate counters.
+    // The v9 managed-store migration clears pre-3.0 survey evidence, so
+    // existing installations naturally schedule a fresh survey.
     let catalogue = client.galaxy().catalogue();
     let survey_scope = catalogue_survey_scope_from_hub(region, &catalogue);
     let (survey_targets, missing_positions) = survey_scope
@@ -4965,8 +5090,10 @@ fn reconcile_enhance_catalogue(
     };
     let open_slots = desired_parallel.saturating_sub(active.len());
     let available_workers = idle_catalogue_workers(workers, &region.region, reserved);
+    let in_transit_workers = regional_workers_in_transit(workers, &region.region, reserved);
     let launch_slots = open_slots.min(available_workers.len());
-    let worker_shortage = open_slots.saturating_sub(available_workers.len());
+    let worker_shortage =
+        open_slots.saturating_sub(available_workers.len().saturating_add(in_transit_workers));
 
     let mut blocker = None;
     let mut next_action = None;
@@ -5050,7 +5177,7 @@ fn reconcile_enhance_catalogue(
                             .create(new_scan_tour_workflow(ScanTourIntent {
                                 center: center.clone(),
                                 radius_ly: REGIONAL_AUTOMATION_RADIUS_LY,
-                                system_limit: systems.len().saturating_add(1),
+                                system_limit: systems.len(),
                                 target_systems: Some(systems),
                                 replicant: Some(worker.clone()),
                                 vessel: Some(vessel),
@@ -5093,6 +5220,10 @@ fn reconcile_enhance_catalogue(
                 unsurveyed.len()
             ));
             DirectorGoalStatus::Active
+        } else if in_transit_workers > 0 {
+            blocker = Some("assigned regional workers are still in transit".to_owned());
+            next_action = Some("Wait for an assigned catalogue worker to arrive".to_owned());
+            DirectorGoalStatus::Waiting
         } else {
             next_action = Some(
                 "Free catalogue-capable regional workers or grow the regional workforce".to_owned(),
@@ -6762,10 +6893,17 @@ fn reconcile_expand_ftl_network(
                 reserved.insert(worker);
             }
             (DirectorGoalStatus::Active, next_action)
+        } else if regional_workers_in_transit(workers, &region.region, reserved) > 0 {
+            blocker = Some("assigned regional workers are still in transit".to_owned());
+            (
+                DirectorGoalStatus::Waiting,
+                Some("Wait for an assigned regional worker to arrive".to_owned()),
+            )
         } else {
             let has_idle_racing_worker = workers.iter().any(|worker| {
                 worker.region.as_deref() == Some(region.region.as_str())
                     && worker.busy_workflow.is_none()
+                    && worker.state == WorkerState::Operational
                     && !reserved.contains(worker.replicant.key.id.as_str())
                     && worker.racing_vessel.is_some()
             });
@@ -6976,7 +7114,7 @@ fn bootstrap_assignment(
         };
         let colocated = target_workers
             .iter()
-            .filter(|worker| replicant_near_home(&worker.replicant, home))
+            .filter(|worker| worker_near_home(worker, home))
             .take(2)
             .collect::<Vec<_>>();
         if colocated.len() == 2 {
@@ -6990,11 +7128,47 @@ fn bootstrap_assignment(
     None
 }
 
+fn manufacturing_home_candidates(
+    region_name: &str,
+    regions: &BTreeMap<String, RegionView>,
+    manufacturing_homes: &BTreeMap<String, String>,
+) -> Vec<ManufacturingHomeSelection> {
+    let mut candidates = Vec::new();
+    if let Some(location) = manufacturing_homes.get(region_name) {
+        candidates.push(ManufacturingHomeSelection {
+            location: location.clone(),
+            reason: "owned Autofactory at the designated regional home".to_owned(),
+            local: true,
+        });
+    }
+    for (source_region, location) in manufacturing_homes {
+        if source_region == region_name
+            || regions
+                .get(source_region)
+                .is_none_or(|region| region.status != DirectorRegionStatus::Established)
+            || candidates
+                .iter()
+                .any(|candidate| candidate.location == *location)
+        {
+            continue;
+        }
+        candidates.push(ManufacturingHomeSelection {
+            location: location.clone(),
+            reason: format!(
+                "fallback to established {source_region} manufacturing because {region_name} has no usable local source"
+            ),
+            local: false,
+        });
+    }
+    candidates
+}
+
 #[allow(clippy::too_many_arguments)]
 fn reconcile_workforce(
     repository: &WorkflowRepository,
     settings: &DirectorSettings,
     regions: &BTreeMap<String, RegionView>,
+    manufacturing_homes: &BTreeMap<String, String>,
     workers: &[WorkerView],
     workflows: &[WorkflowInstance],
     reserved: &BTreeSet<String>,
@@ -7002,21 +7176,90 @@ fn reconcile_workforce(
     states: &mut BTreeMap<String, RegionWorkforceState>,
     automatic: bool,
     now: i64,
-) -> Result<Vec<String>, ApplicationError> {
-    let mut recommendations = Vec::new();
-    for (region_name, pending) in demand {
-        if *pending == 0 {
+) -> Result<WorkforceReconciliation, ApplicationError> {
+    let incoming = incoming_replicant_provisions(workflows)?;
+    let mut result = WorkforceReconciliation::default();
+    for region_name in regions.keys() {
+        let pending = demand.get(region_name).copied().unwrap_or_default();
+        let state = states.entry(region_name.clone()).or_default();
+        let regional = workers
+            .iter()
+            .filter(|worker| worker.region.as_deref() == Some(region_name.as_str()))
+            .collect::<Vec<_>>();
+        let assigned = regional.len();
+        let incoming_count = incoming.get(region_name).copied().unwrap_or_default();
+        let bootstrap_population = assigned.saturating_add(incoming_count);
+        let bootstrap_deficit = REGION_BOOTSTRAP_TARGET.saturating_sub(bootstrap_population);
+        let operational = regional
+            .iter()
+            .filter(|worker| worker.state == WorkerState::Operational)
+            .count();
+        let in_transit = regional
+            .iter()
+            .filter(|worker| worker.state == WorkerState::InTransit)
+            .count();
+        let busy = regional
+            .iter()
+            .filter(|worker| worker.state == WorkerState::Busy)
+            .count();
+        let temporarily_unavailable = regional
+            .iter()
+            .filter(|worker| {
+                matches!(worker.state, WorkerState::Busy | WorkerState::InTransit)
+                    || reserved.contains(worker.replicant.key.id.as_str())
+            })
+            .count();
+        let ordinary_shortfall = pending.saturating_sub(temporarily_unavailable);
+        let idle = regional
+            .iter()
+            .filter(|worker| {
+                worker.state == WorkerState::Operational
+                    && worker.busy_workflow.is_none()
+                    && !reserved.contains(worker.replicant.key.id.as_str())
+            })
+            .count();
+        let idle_ratio = if assigned == 0 {
+            0.0
+        } else {
+            idle as f64 / assigned as f64
+        };
+        let homes = manufacturing_home_candidates(region_name, regions, manufacturing_homes);
+        let selected_home = homes.first().cloned();
+        let mut diagnostic = DirectorRegionalWorkforceSummary {
+            region: region_name.clone(),
+            bootstrap_target: REGION_BOOTSTRAP_TARGET,
+            assigned,
+            incoming: incoming_count,
+            operational,
+            in_transit,
+            busy,
+            desired_ordinary_capacity: if bootstrap_deficit == 0 {
+                assigned.saturating_add(ordinary_shortfall)
+            } else {
+                assigned
+            },
+            scale_up_suppressed: false,
+            scale_up_suppression_reason: None,
+            manufacturing_home: selected_home
+                .as_ref()
+                .map(|selection| selection.location.clone()),
+            manufacturing_home_reason: selected_home.map(|selection| selection.reason),
+        };
+
+        if pending == 0 {
+            state.pressure_since_ms = None;
+            result.regions.push(diagnostic);
             continue;
         }
-        let state = states.entry(region_name.clone()).or_default();
-        let Some(region) = regions.get(region_name) else {
-            continue;
-        };
-        let bootstrap_region = region.status != DirectorRegionStatus::Established;
+
         if let Some(workflow_id) = state.provision_workflow_id {
             if let Some(workflow) = workflows.iter().find(|workflow| workflow.id == workflow_id) {
                 if !workflow.status.is_terminal() {
-                    recommendations.push(format!("{region_name} workforce is already growing"));
+                    state.pressure_since_ms = None;
+                    diagnostic.scale_up_suppressed = true;
+                    diagnostic.scale_up_suppression_reason =
+                        Some("an existing Replicant provision is still in progress".to_owned());
+                    result.regions.push(diagnostic);
                     continue;
                 }
                 if workflow.status == WorkflowStatus::Failed
@@ -7024,118 +7267,105 @@ fn reconcile_workforce(
                         .last_scaled_at_ms
                         .is_some_and(|last| now.saturating_sub(last) < DEFAULT_RETRY_COOLDOWN_MS)
                 {
-                    recommendations.push(format!(
-                        "{region_name} worker provisioning failed recently; waiting for retry cooldown"
-                    ));
+                    diagnostic.scale_up_suppressed = true;
+                    diagnostic.scale_up_suppression_reason = Some(
+                        "worker provisioning failed recently; retry cooldown is active".to_owned(),
+                    );
+                    result.regions.push(diagnostic);
                     continue;
-                }
-                if workflow.status == WorkflowStatus::Succeeded && bootstrap_region {
-                    // Missing regions intentionally grow to the bootstrap pair one at a time.
-                    state.last_scaled_at_ms = None;
                 }
             }
             state.provision_workflow_id = None;
         }
-        let regional = workers
-            .iter()
-            .filter(|worker| worker.region.as_deref() == Some(region_name.as_str()))
-            .collect::<Vec<_>>();
-        let idle = regional
-            .iter()
-            .filter(|worker| worker.busy_workflow.is_none())
-            .count();
-        let idle_ratio = if regional.is_empty() {
-            0.0
-        } else {
-            idle as f64 / regional.len() as f64
-        };
-        if !bootstrap_region && idle_ratio >= settings.scale_up_idle_threshold {
+
+        let bootstrap_growth = bootstrap_deficit > 0;
+        if bootstrap_growth && incoming_count > 0 {
             state.pressure_since_ms = None;
+            diagnostic.scale_up_suppressed = true;
+            diagnostic.scale_up_suppression_reason = Some(format!(
+                "{incoming_count} incoming bootstrap worker(s) already count toward the target"
+            ));
+            result.regions.push(diagnostic);
             continue;
         }
-        let since = *state.pressure_since_ms.get_or_insert(now);
-        let held_long_enough =
-            bootstrap_region || now.saturating_sub(since) >= settings.scale_up_hold_ms;
-        let cooled_down = bootstrap_region
-            || state
-                .last_scaled_at_ms
-                .is_none_or(|last| now.saturating_sub(last) >= settings.scale_up_cooldown_ms);
-        if !held_long_enough || !cooled_down {
+        if !bootstrap_growth && ordinary_shortfall == 0 {
+            state.pressure_since_ms = None;
+            diagnostic.scale_up_suppressed = true;
+            diagnostic.scale_up_suppression_reason = Some(format!(
+                "current pressure is transient: {temporarily_unavailable} assigned worker(s) are travelling, busy, or reserved"
+            ));
+            result.regions.push(diagnostic);
             continue;
         }
-        let (home, source) = if bootstrap_region {
-            let mut homes = regions
-                .values()
-                .filter(|candidate| candidate.status == DirectorRegionStatus::Established)
-                .filter_map(|candidate| {
-                    candidate
-                        .hub_location
-                        .as_deref()
-                        .or(candidate.hub_system.as_deref())
-                        .map(str::to_owned)
-                })
-                .collect::<Vec<_>>();
-            // Once the first target-region worker exists, keep subsequent
-            // bootstrap clones at the same established home so the pair is
-            // immediately eligible for the regional ark workflow.
-            if let Some(preferred) = regional.iter().find_map(|target_worker| {
-                homes
-                    .iter()
-                    .find(|home| replicant_near_home(&target_worker.replicant, home))
-                    .cloned()
-            }) {
-                homes.sort_by_key(|home| home != &preferred);
+        if !bootstrap_growth && idle_ratio >= settings.scale_up_idle_threshold {
+            state.pressure_since_ms = None;
+            diagnostic.scale_up_suppressed = true;
+            diagnostic.scale_up_suppression_reason = Some(format!(
+                "idle reserve is {:.0}%, at or above the {:.0}% scale-up threshold",
+                idle_ratio * 100.0,
+                settings.scale_up_idle_threshold * 100.0
+            ));
+            result.regions.push(diagnostic);
+            continue;
+        }
+
+        if !bootstrap_growth {
+            let since = *state.pressure_since_ms.get_or_insert(now);
+            if now.saturating_sub(since) < settings.scale_up_hold_ms {
+                diagnostic.scale_up_suppressed = true;
+                diagnostic.scale_up_suppression_reason =
+                    Some("ordinary capacity pressure has not reached the hold time".to_owned());
+                result.regions.push(diagnostic);
+                continue;
             }
-            let candidate = homes.into_iter().find_map(|home| {
-                workers
-                    .iter()
-                    .filter(|worker| worker.region.as_deref() != Some(region_name.as_str()))
-                    .find(|worker| {
-                        worker.busy_workflow.is_none()
-                            && !reserved.contains(worker.replicant.key.id.as_str())
-                            && replicant_near_home(&worker.replicant, &home)
-                    })
-                    .map(|worker| (home, worker))
-            });
-            let Some(candidate) = candidate else {
-                recommendations.push(format!("{region_name} needs bootstrap workers but no idle source Replicant is at an established manufacturing home"));
+            if state
+                .last_scaled_at_ms
+                .is_some_and(|last| now.saturating_sub(last) < settings.scale_up_cooldown_ms)
+            {
+                diagnostic.scale_up_suppressed = true;
+                diagnostic.scale_up_suppression_reason =
+                    Some("ordinary scale-up cooldown is active".to_owned());
+                result.regions.push(diagnostic);
                 continue;
-            };
-            candidate
-        } else {
-            let Some(home) = region
-                .hub_location
-                .clone()
-                .or_else(|| region.hub_system.clone())
-            else {
-                recommendations.push(format!(
-                    "{region_name} needs another worker but has no regional manufacturing home"
-                ));
-                continue;
-            };
-            let source = regional
+            }
+        }
+
+        let source = homes.iter().find_map(|selection| {
+            workers
                 .iter()
+                .filter(|worker| {
+                    bootstrap_growth
+                        || !selection.local
+                        || worker.region.as_deref() == Some(region_name.as_str())
+                })
                 .find(|worker| {
                     worker.busy_workflow.is_none()
+                        && worker.state == WorkerState::Operational
                         && !reserved.contains(worker.replicant.key.id.as_str())
-                        && replicant_near_home(&worker.replicant, &home)
+                        && worker_near_home(worker, &selection.location)
                 })
-                .copied();
-            let Some(source) = source else {
-                recommendations.push(format!("{region_name} needs another worker but no idle assigned Replicant is at the regional home"));
-                continue;
-            };
-            (home, source)
+                .map(|worker| (selection, worker))
+        });
+        let Some((home, source)) = source else {
+            diagnostic.scale_up_suppressed = true;
+            diagnostic.scale_up_suppression_reason = Some(
+                "no idle source Replicant is available at a viable manufacturing home".to_owned(),
+            );
+            result.regions.push(diagnostic);
+            continue;
         };
-        recommendations.push(format!(
-            "{region_name} has {pending} worker-blocked campaign(s) and {:.0}% idle reserve; provision one additional Replicant",
-            idle_ratio * 100.0
+        diagnostic.manufacturing_home = Some(home.location.clone());
+        diagnostic.manufacturing_home_reason = Some(home.reason.clone());
+        result.recommendations.push(format!(
+            "{region_name} has {pending} worker-blocked campaign(s), {} assigned and {incoming_count} incoming; provision one additional Replicant at {}",
+            assigned,
+            home.location
         ));
         if automatic {
             let workflow =
                 repository.create(new_replicant_provision_workflow(ReplicantProvisionIntent {
                     region: region_name.clone(),
-                    home,
+                    home: home.location.clone(),
                     source_replicant: source.replicant.key.id.as_str().to_owned(),
                     cradle_type: "racing_vessel".to_owned(),
                     name: None,
@@ -7143,21 +7373,27 @@ fn reconcile_workforce(
             tracing::info!(
                 workflow_id = %workflow.id,
                 region = %region_name,
+                home = %home.location,
                 source_replicant = %source.replicant.key.id.as_str(),
+                bootstrap_growth,
                 "Director launched grow-only workforce provisioning"
             );
             state.provision_workflow_id = Some(workflow.id);
             state.last_scaled_at_ms = Some(now);
             state.pressure_since_ms = None;
         }
+        result.regions.push(diagnostic);
     }
+    result
+        .regions
+        .sort_by(|left, right| left.region.cmp(&right.region));
     for (region, state) in states.iter_mut() {
         if !demand.contains_key(region) {
             state.pressure_since_ms = None;
         }
         repository.put_document(WORKFORCE_NS, region, state)?;
     }
-    Ok(recommendations)
+    Ok(result)
 }
 
 fn group_active_events_by_region(
@@ -7390,28 +7626,17 @@ fn mark_establishing_regions(
 fn mark_partial_region_footholds(
     regions: &mut BTreeMap<String, RegionView>,
     workers: &[WorkerView],
-    location_systems: &BTreeMap<String, String>,
-    system_regions: &BTreeMap<String, String>,
 ) {
     for region in regions
         .values_mut()
         .filter(|region| region.status == DirectorRegionStatus::Discovered)
     {
+        // WorkerState::Operational already guarantees that the authoritative
+        // hosted-vessel location resolves to the worker's assigned region.
         let staged_workers = workers
             .iter()
             .filter(|worker| worker.region.as_deref() == Some(region.region.as_str()))
-            .filter(|worker| {
-                worker.replicant.location.as_ref().is_some_and(|location| {
-                    let location = location.id.as_str();
-                    let system = location_systems
-                        .get(location)
-                        .map(String::as_str)
-                        .unwrap_or_else(|| system_prefix(location));
-                    system_regions
-                        .get(system)
-                        .is_some_and(|candidate| candidate == &region.region)
-                })
-            })
+            .filter(|worker| worker.state == WorkerState::Operational)
             .count();
         if staged_workers >= 2 {
             tracing::info!(
@@ -7430,7 +7655,8 @@ fn mark_manufacturing_footholds(
     devices: &[Device],
     location_systems: &BTreeMap<String, String>,
     system_regions: &BTreeMap<String, String>,
-) {
+) -> BTreeMap<String, String> {
+    let mut manufacturing_homes = BTreeMap::new();
     for region in regions.values_mut() {
         let Some(home) = preferred_home_location(
             &region.region,
@@ -7453,8 +7679,10 @@ fn mark_manufacturing_footholds(
             region.status = DirectorRegionStatus::Establishing;
             region.hub_system = Some(system);
         }
-        region.hub_location = Some(home);
+        region.hub_location = Some(home.clone());
+        manufacturing_homes.insert(region.region.clone(), home);
     }
+    manufacturing_homes
 }
 
 fn preferred_home_location(
@@ -7885,6 +8113,19 @@ fn nonterminal_ids(runtime: &GoalRuntime, workflows: &[WorkflowInstance]) -> Vec
         .collect()
 }
 
+fn regional_workers_in_transit(
+    workers: &[WorkerView],
+    region: &str,
+    reserved: &BTreeSet<String>,
+) -> usize {
+    workers
+        .iter()
+        .filter(|worker| worker.region.as_deref() == Some(region))
+        .filter(|worker| worker.state == WorkerState::InTransit)
+        .filter(|worker| !reserved.contains(worker.replicant.key.id.as_str()))
+        .count()
+}
+
 fn idle_catalogue_workers(
     workers: &[WorkerView],
     region: &str,
@@ -7894,6 +8135,7 @@ fn idle_catalogue_workers(
         .iter()
         .filter(|worker| worker.region.as_deref() == Some(region))
         .filter(|worker| worker.busy_workflow.is_none())
+        .filter(|worker| worker.state == WorkerState::Operational)
         .filter(|worker| !reserved.contains(worker.replicant.key.id.as_str()))
         .filter_map(|worker| {
             worker.racing_vessel.as_ref().map(|vessel| {
@@ -7944,6 +8186,7 @@ fn select_idle_ftl_worker(
         .iter()
         .filter(|worker| worker.region.as_deref() == Some(region))
         .filter(|worker| worker.busy_workflow.is_none())
+        .filter(|worker| worker.state == WorkerState::Operational)
         .filter(|worker| !reserved.contains(worker.replicant.key.id.as_str()))
         .filter_map(|worker| {
             let vessel_code = worker.racing_vessel.as_deref()?;
@@ -7972,10 +8215,24 @@ fn select_idle_worker(
         .iter()
         .filter(|worker| worker.region.as_deref() == Some(region))
         .filter(|worker| worker.busy_workflow.is_none())
+        .filter(|worker| worker.state == WorkerState::Operational)
         .filter(|worker| !reserved.contains(worker.replicant.key.id.as_str()))
         .filter(|worker| !require_racing_vessel || worker.racing_vessel.is_some())
         .min_by_key(|worker| worker.role_affinity.is_none())
         .map(|worker| worker.replicant.key.id.as_str().to_owned())
+}
+
+fn protocol_worker_state(state: WorkerState) -> DirectorWorkerState {
+    match state {
+        WorkerState::Operational => DirectorWorkerState::Operational,
+        WorkerState::InTransit => DirectorWorkerState::InTransit,
+        WorkerState::Busy => DirectorWorkerState::Busy,
+        WorkerState::WrongRegion
+        | WorkerState::MissingVessel
+        | WorkerState::UnknownLocation
+        | WorkerState::LocationMismatch
+        | WorkerState::Unavailable => DirectorWorkerState::Unavailable,
+    }
 }
 
 fn regional_radius_resolution_blocker(
@@ -8036,11 +8293,11 @@ fn catalogue_survey_scope_from_hub(
     regional_system_scope_from_hub(region, &positions, REGIONAL_AUTOMATION_RADIUS_LY)
 }
 
-fn replicant_near_home(replicant: &Replicant, home: &str) -> bool {
-    replicant.location.as_ref().is_some_and(|location| {
-        let current = location.id.as_str();
-        current == home || same_system(current, home)
-    })
+fn worker_near_home(worker: &WorkerView, home: &str) -> bool {
+    worker
+        .physical_location
+        .as_deref()
+        .is_some_and(|current| current == home || same_system(current, home))
 }
 
 fn same_system(left: &str, right: &str) -> bool {
@@ -8205,6 +8462,10 @@ pub fn director_reconcile_event_names() -> &'static [&'static str] {
         "diversion.partial",
         "diversion.diverted",
         "diversion.impacted",
+        "travel.arrived",
+        "travel.cancelled",
+        "travel.departed",
+        "replicant.transferred",
         "device.attached",
         "device.compacted",
         "device.deployed",
@@ -8353,7 +8614,474 @@ mod tests {
             role_affinity: None,
             busy_workflow: None,
             racing_vessel: None,
+            physical_location: Some(location.to_owned()),
+            state: WorkerState::Operational,
         }
+    }
+
+    #[test]
+    fn in_transit_worker_remains_assigned_capacity_and_recovers_after_arrival() {
+        let mut worker = test_worker("R-1", "alpha", "ALPHA-1");
+        worker.racing_vessel = Some("V-1".to_owned());
+        worker.state = WorkerState::InTransit;
+        let workers = vec![worker];
+
+        assert_eq!(
+            workers
+                .iter()
+                .filter(|worker| worker.region.as_deref() == Some("alpha"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            regional_workers_in_transit(&workers, "alpha", &BTreeSet::new()),
+            1
+        );
+        assert!(idle_catalogue_workers(&workers, "alpha", &BTreeSet::new()).is_empty());
+
+        let mut arrived = workers;
+        arrived[0].state = WorkerState::Operational;
+        assert_eq!(
+            idle_catalogue_workers(&arrived, "alpha", &BTreeSet::new()),
+            vec![(String::from("R-1"), String::from("V-1"))]
+        );
+    }
+    fn workforce_test_regions(status: DirectorRegionStatus) -> BTreeMap<String, RegionView> {
+        BTreeMap::from([
+            (
+                "alpha".to_owned(),
+                RegionView {
+                    region: "alpha".to_owned(),
+                    status: DirectorRegionStatus::Established,
+                    hub_system: Some("SCEPTURUM".to_owned()),
+                    hub_location: Some("SCEPTURUM-BELT-1".to_owned()),
+                    known_systems: BTreeSet::from(["SCEPTURUM".to_owned()]),
+                },
+            ),
+            (
+                "delta".to_owned(),
+                RegionView {
+                    region: "delta".to_owned(),
+                    status,
+                    hub_system: Some("PHASYRIS".to_owned()),
+                    hub_location: Some("PHASYRIS-BELT-1".to_owned()),
+                    known_systems: BTreeSet::from(["PHASYRIS".to_owned()]),
+                },
+            ),
+        ])
+    }
+
+    fn global_manufacturing_home() -> BTreeMap<String, String> {
+        BTreeMap::from([("alpha".to_owned(), "SCEPTURUM-BELT-1".to_owned())])
+    }
+
+    fn workforce_settings_without_delays() -> DirectorSettings {
+        DirectorSettings {
+            scale_up_idle_threshold: 1.0,
+            scale_up_hold_ms: 0,
+            scale_up_cooldown_ms: 0,
+            ..DirectorSettings::default()
+        }
+    }
+
+    fn provision_intents(repository: &WorkflowRepository) -> Vec<ReplicantProvisionIntent> {
+        repository
+            .list()
+            .expect("provision workflows")
+            .into_iter()
+            .filter(|workflow| workflow.kind == replicant_provision_workflow_kind())
+            .map(|workflow| workflow.config().expect("provision intent"))
+            .collect()
+    }
+
+    fn reconcile_test_workforce(
+        repository: &WorkflowRepository,
+        settings: &DirectorSettings,
+        regions: &BTreeMap<String, RegionView>,
+        manufacturing_homes: &BTreeMap<String, String>,
+        workers: &[WorkerView],
+        demand: usize,
+        states: &mut BTreeMap<String, RegionWorkforceState>,
+    ) -> WorkforceReconciliation {
+        reconcile_workforce(
+            repository,
+            settings,
+            regions,
+            manufacturing_homes,
+            workers,
+            &repository.list().expect("workflows"),
+            &BTreeSet::new(),
+            &BTreeMap::from([("delta".to_owned(), demand)]),
+            states,
+            true,
+            100,
+        )
+        .expect("reconcile workforce")
+    }
+    fn establishment_worker_demand(
+        repository: &WorkflowRepository,
+        regions: &BTreeMap<String, RegionView>,
+        workers: &[WorkerView],
+    ) -> usize {
+        let controls = GoalControls::default();
+        let workflows = repository.list().expect("workflows");
+        let context = GoalReconcileContext {
+            repository,
+            workflows: &workflows,
+            controls: &controls,
+            automatic: false,
+            now: 100,
+        };
+        let mut requirements =
+            DirectorRequirementGraph::load(repository, context.now).expect("requirements");
+        reconcile_establish_regions(
+            &context,
+            regions,
+            workers,
+            &mut BTreeSet::new(),
+            &mut requirements,
+        )
+        .expect("reconcile establishment");
+        requirements
+            .worker_demand_by_region()
+            .get("delta")
+            .copied()
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn establishing_region_with_zero_assigned_provisions_toward_bootstrap_target() {
+        let repository = WorkflowRepository::open_in_memory().expect("repository");
+        let workers = vec![test_worker("A-1", "alpha", "SCEPTURUM-BELT-1")];
+        let regions = workforce_test_regions(DirectorRegionStatus::Establishing);
+        let demand = establishment_worker_demand(&repository, &regions, &workers);
+        let result = reconcile_test_workforce(
+            &repository,
+            &DirectorSettings::default(),
+            &regions,
+            &global_manufacturing_home(),
+            &workers,
+            demand,
+            &mut BTreeMap::new(),
+        );
+
+        let intents = provision_intents(&repository);
+        assert_eq!(intents.len(), 1);
+        assert_eq!(intents[0].region, "delta");
+        assert_eq!(result.regions[1].bootstrap_target, REGION_BOOTSTRAP_TARGET);
+        assert_eq!(result.regions[1].assigned, 0);
+    }
+
+    #[test]
+    fn establishing_region_with_one_assigned_provisions_one_more() {
+        let repository = WorkflowRepository::open_in_memory().expect("repository");
+        let workers = vec![
+            test_worker("A-1", "alpha", "SCEPTURUM-BELT-1"),
+            test_worker("D-1", "delta", "SCEPTURUM-BELT-1"),
+        ];
+        let regions = workforce_test_regions(DirectorRegionStatus::Establishing);
+        let demand = establishment_worker_demand(&repository, &regions, &workers);
+        reconcile_test_workforce(
+            &repository,
+            &DirectorSettings::default(),
+            &regions,
+            &global_manufacturing_home(),
+            &workers,
+            demand,
+            &mut BTreeMap::new(),
+        );
+
+        assert_eq!(provision_intents(&repository).len(), 1);
+    }
+
+    #[test]
+    fn assigned_plus_incoming_worker_satisfies_bootstrap_target() {
+        let repository = WorkflowRepository::open_in_memory().expect("repository");
+        repository
+            .create(new_replicant_provision_workflow(ReplicantProvisionIntent {
+                region: "delta".to_owned(),
+                home: "SCEPTURUM-BELT-1".to_owned(),
+                source_replicant: "A-1".to_owned(),
+                cradle_type: "racing_vessel".to_owned(),
+                name: None,
+            }))
+            .expect("incoming provision");
+        let workers = vec![
+            test_worker("A-1", "alpha", "SCEPTURUM-BELT-1"),
+            test_worker("D-1", "delta", "SCEPTURUM-BELT-1"),
+        ];
+        let regions = workforce_test_regions(DirectorRegionStatus::Establishing);
+        let demand = establishment_worker_demand(&repository, &regions, &workers);
+        let result = reconcile_test_workforce(
+            &repository,
+            &DirectorSettings::default(),
+            &regions,
+            &global_manufacturing_home(),
+            &workers,
+            demand,
+            &mut BTreeMap::new(),
+        );
+
+        assert_eq!(demand, 0);
+        assert_eq!(provision_intents(&repository).len(), 1);
+        assert_eq!(result.regions[1].assigned, 1);
+        assert_eq!(result.regions[1].incoming, 1);
+    }
+
+    #[test]
+    fn establishing_region_with_two_assigned_does_not_bootstrap_a_third() {
+        let repository = WorkflowRepository::open_in_memory().expect("repository");
+        let workers = vec![
+            test_worker("A-1", "alpha", "SCEPTURUM-BELT-1"),
+            test_worker("D-1", "delta", "PHASYRIS-BELT-1"),
+            test_worker("D-2", "delta", "PHASYRIS-BELT-1"),
+        ];
+        let result = reconcile_test_workforce(
+            &repository,
+            &DirectorSettings::default(),
+            &workforce_test_regions(DirectorRegionStatus::Establishing),
+            &global_manufacturing_home(),
+            &workers,
+            1,
+            &mut BTreeMap::new(),
+        );
+
+        assert!(provision_intents(&repository).is_empty());
+        assert!(
+            result.regions[1]
+                .scale_up_suppression_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("idle reserve"))
+        );
+    }
+
+    #[test]
+    fn travelling_assigned_workers_satisfy_bootstrap_population() {
+        let repository = WorkflowRepository::open_in_memory().expect("repository");
+        let mut first = test_worker("D-1", "delta", "SCEPTURUM-BELT-1");
+        first.state = WorkerState::InTransit;
+        let mut second = test_worker("D-2", "delta", "SCEPTURUM-BELT-1");
+        second.state = WorkerState::InTransit;
+        let workers = vec![
+            test_worker("A-1", "alpha", "SCEPTURUM-BELT-1"),
+            first,
+            second,
+        ];
+        let result = reconcile_test_workforce(
+            &repository,
+            &DirectorSettings::default(),
+            &workforce_test_regions(DirectorRegionStatus::Establishing),
+            &global_manufacturing_home(),
+            &workers,
+            2,
+            &mut BTreeMap::new(),
+        );
+
+        assert!(provision_intents(&repository).is_empty());
+        assert_eq!(result.regions[1].assigned, REGION_BOOTSTRAP_TARGET);
+        assert_eq!(result.regions[1].in_transit, REGION_BOOTSTRAP_TARGET);
+    }
+
+    #[test]
+    fn seven_assigned_workers_cannot_trigger_bootstrap_scale_eighth() {
+        let repository = WorkflowRepository::open_in_memory().expect("repository");
+        let mut workers = vec![test_worker("A-1", "alpha", "SCEPTURUM-BELT-1")];
+        for index in 1..=7 {
+            let mut worker = test_worker(&format!("D-{index}"), "delta", "PHASYRIS-BELT-1");
+            worker.state = WorkerState::Unavailable;
+            workers.push(worker);
+        }
+        let mut states = BTreeMap::from([(
+            "delta".to_owned(),
+            RegionWorkforceState {
+                pressure_since_ms: Some(0),
+                last_scaled_at_ms: Some(90),
+                provision_workflow_id: None,
+            },
+        )]);
+        let result = reconcile_test_workforce(
+            &repository,
+            &DirectorSettings {
+                scale_up_idle_threshold: 1.0,
+                scale_up_hold_ms: 0,
+                scale_up_cooldown_ms: 100,
+                ..DirectorSettings::default()
+            },
+            &workforce_test_regions(DirectorRegionStatus::Establishing),
+            &global_manufacturing_home(),
+            &workers,
+            1,
+            &mut states,
+        );
+
+        assert!(provision_intents(&repository).is_empty());
+        assert_eq!(result.regions[1].assigned, 7);
+        assert_eq!(
+            result.regions[1].scale_up_suppression_reason.as_deref(),
+            Some("ordinary scale-up cooldown is active")
+        );
+    }
+
+    #[test]
+    fn ordinary_scale_up_after_bootstrap_respects_idle_and_cooldown_guards() {
+        let repository = WorkflowRepository::open_in_memory().expect("repository");
+        let workers = vec![
+            test_worker("A-1", "alpha", "SCEPTURUM-BELT-1"),
+            test_worker("D-1", "delta", "PHASYRIS-BELT-1"),
+            test_worker("D-2", "delta", "PHASYRIS-BELT-1"),
+        ];
+        let idle_result = reconcile_test_workforce(
+            &repository,
+            &DirectorSettings::default(),
+            &workforce_test_regions(DirectorRegionStatus::Establishing),
+            &global_manufacturing_home(),
+            &workers,
+            1,
+            &mut BTreeMap::new(),
+        );
+        assert!(
+            idle_result.regions[1]
+                .scale_up_suppression_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("idle reserve"))
+        );
+
+        let unavailable = workers
+            .into_iter()
+            .map(|mut worker| {
+                if worker.region.as_deref() == Some("delta") {
+                    worker.state = WorkerState::Unavailable;
+                }
+                worker
+            })
+            .collect::<Vec<_>>();
+        let mut states = BTreeMap::from([(
+            "delta".to_owned(),
+            RegionWorkforceState {
+                pressure_since_ms: Some(0),
+                last_scaled_at_ms: Some(90),
+                provision_workflow_id: None,
+            },
+        )]);
+        let cooldown_result = reconcile_test_workforce(
+            &repository,
+            &DirectorSettings {
+                scale_up_idle_threshold: 1.0,
+                scale_up_hold_ms: 0,
+                scale_up_cooldown_ms: 100,
+                ..DirectorSettings::default()
+            },
+            &workforce_test_regions(DirectorRegionStatus::Establishing),
+            &global_manufacturing_home(),
+            &unavailable,
+            1,
+            &mut states,
+        );
+        assert_eq!(
+            cooldown_result.regions[1]
+                .scale_up_suppression_reason
+                .as_deref(),
+            Some("ordinary scale-up cooldown is active")
+        );
+        assert!(provision_intents(&repository).is_empty());
+    }
+
+    #[test]
+    fn temporary_campaign_claim_does_not_create_growth_pressure() {
+        let repository = WorkflowRepository::open_in_memory().expect("repository");
+        let mut busy = test_worker("D-1", "delta", "PHASYRIS-BELT-1");
+        busy.state = WorkerState::Busy;
+        busy.busy_workflow = Some(WorkflowId::new());
+        let mut unavailable = test_worker("D-2", "delta", "PHASYRIS-BELT-1");
+        unavailable.state = WorkerState::Unavailable;
+        let workers = vec![
+            test_worker("A-1", "alpha", "SCEPTURUM-BELT-1"),
+            busy,
+            unavailable,
+        ];
+        let result = reconcile_test_workforce(
+            &repository,
+            &workforce_settings_without_delays(),
+            &workforce_test_regions(DirectorRegionStatus::Establishing),
+            &global_manufacturing_home(),
+            &workers,
+            1,
+            &mut BTreeMap::new(),
+        );
+
+        assert!(provision_intents(&repository).is_empty());
+        assert!(
+            result.regions[1]
+                .scale_up_suppression_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("transient"))
+        );
+    }
+
+    #[test]
+    fn post_bootstrap_growth_prefers_local_manufacturing_foothold() {
+        let repository = WorkflowRepository::open_in_memory().expect("repository");
+        let mut unavailable = test_worker("D-2", "delta", "PHASYRIS-BELT-1");
+        unavailable.state = WorkerState::Unavailable;
+        let workers = vec![
+            test_worker("A-1", "alpha", "SCEPTURUM-BELT-1"),
+            test_worker("D-1", "delta", "PHASYRIS-BELT-1"),
+            unavailable,
+        ];
+        let homes = BTreeMap::from([
+            ("alpha".to_owned(), "SCEPTURUM-BELT-1".to_owned()),
+            ("delta".to_owned(), "PHASYRIS-BELT-1".to_owned()),
+        ]);
+        let result = reconcile_test_workforce(
+            &repository,
+            &workforce_settings_without_delays(),
+            &workforce_test_regions(DirectorRegionStatus::Establishing),
+            &homes,
+            &workers,
+            1,
+            &mut BTreeMap::new(),
+        );
+
+        let intents = provision_intents(&repository);
+        assert_eq!(intents.len(), 1);
+        assert_eq!(intents[0].home, "PHASYRIS-BELT-1");
+        assert_eq!(
+            result.regions[1].manufacturing_home.as_deref(),
+            Some("PHASYRIS-BELT-1")
+        );
+    }
+
+    #[test]
+    fn post_bootstrap_growth_falls_back_when_local_manufacturing_is_unavailable() {
+        let repository = WorkflowRepository::open_in_memory().expect("repository");
+        let mut first = test_worker("D-1", "delta", "PHASYRIS-BELT-1");
+        first.state = WorkerState::Unavailable;
+        let mut second = test_worker("D-2", "delta", "PHASYRIS-BELT-1");
+        second.state = WorkerState::Unavailable;
+        let workers = vec![
+            test_worker("A-1", "alpha", "SCEPTURUM-BELT-1"),
+            first,
+            second,
+        ];
+        let result = reconcile_test_workforce(
+            &repository,
+            &workforce_settings_without_delays(),
+            &workforce_test_regions(DirectorRegionStatus::Establishing),
+            &global_manufacturing_home(),
+            &workers,
+            1,
+            &mut BTreeMap::new(),
+        );
+
+        let intents = provision_intents(&repository);
+        assert_eq!(intents.len(), 1);
+        assert_eq!(intents[0].home, "SCEPTURUM-BELT-1");
+        assert!(
+            result.regions[1]
+                .manufacturing_home_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("fallback"))
+        );
     }
 
     fn test_hub_device() -> Device {
@@ -8381,6 +9109,7 @@ mod tests {
             system_status: None,
             active_directive: None,
             travel: None,
+            runtime: Default::default(),
             access: replicant_client::domain::AccessScope::Owned,
         }
     }
@@ -8616,15 +9345,41 @@ mod tests {
             test_worker("BETA-1", "beta", "BETA-STAR-2"),
             test_worker("BETA-2", "beta", "BETA-STAR-3"),
         ];
-        let location_systems = BTreeMap::from([
-            ("BETA-STAR-2".to_owned(), "BETA-STAR".to_owned()),
-            ("BETA-STAR-3".to_owned(), "BETA-STAR".to_owned()),
-        ]);
-        let system_regions = BTreeMap::from([("BETA-STAR".to_owned(), "beta".to_owned())]);
-
-        mark_partial_region_footholds(&mut regions, &workers, &location_systems, &system_regions);
+        mark_partial_region_footholds(&mut regions, &workers);
 
         assert_eq!(regions["beta"].status, DirectorRegionStatus::Establishing);
+    }
+
+    #[test]
+    fn in_transit_bootstrap_workers_do_not_mark_a_physical_foothold() {
+        let mut regions = BTreeMap::from([(
+            "beta".to_owned(),
+            RegionView {
+                region: "beta".to_owned(),
+                status: DirectorRegionStatus::Discovered,
+                hub_system: None,
+                hub_location: None,
+                known_systems: BTreeSet::from(["BETA-STAR".to_owned()]),
+            },
+        )]);
+        let mut workers = vec![
+            test_worker("BETA-1", "beta", "SOURCE-1"),
+            test_worker("BETA-2", "beta", "SOURCE-2"),
+        ];
+        for worker in &mut workers {
+            worker.state = WorkerState::InTransit;
+        }
+
+        mark_partial_region_footholds(&mut regions, &workers);
+
+        assert_eq!(regions["beta"].status, DirectorRegionStatus::Discovered);
+        assert_eq!(
+            workers
+                .iter()
+                .filter(|worker| worker.region.as_deref() == Some("beta"))
+                .count(),
+            2
+        );
     }
 
     #[test]
@@ -8644,7 +9399,7 @@ mod tests {
         factory.location = Some(replicant_client::LocationKey::live(
             "PHASYRIS-BELT-1".into(),
         ));
-        mark_manufacturing_footholds(
+        let homes = mark_manufacturing_footholds(
             &mut regions,
             &[factory],
             &BTreeMap::from([("PHASYRIS-BELT-1".to_owned(), "PHASYRIS".to_owned())]),
@@ -8655,6 +9410,10 @@ mod tests {
         assert_eq!(regions["delta"].hub_system.as_deref(), Some("PHASYRIS"));
         assert_eq!(
             regions["delta"].hub_location.as_deref(),
+            Some("PHASYRIS-BELT-1")
+        );
+        assert_eq!(
+            homes.get("delta").map(String::as_str),
             Some("PHASYRIS-BELT-1")
         );
     }
@@ -9836,6 +10595,7 @@ mod tests {
             busy: false,
             workflow_id: None,
             role_affinity: None,
+            state: DirectorWorkerState::Unavailable,
         });
         stored.regions.push(DirectorRegionSummary {
             region: "alpha".to_owned(),
@@ -9844,6 +10604,9 @@ mod tests {
             hub_location: Some("SCEPTURUM-BELT-1".to_owned()),
             replicants: Vec::new(),
             known_systems: 4,
+            operational_workers: 0,
+            workers_in_transit: 0,
+            busy_workers: 0,
         });
         stored.goals.push(DirectorGoalSummary {
             id: goal_instance_id(DirectorGoalKind::ExpandFtlNetwork, Some("alpha")),
@@ -11314,6 +12077,10 @@ mod tests {
                 "diversion.partial",
                 "diversion.diverted",
                 "diversion.impacted",
+                "travel.arrived",
+                "travel.cancelled",
+                "travel.departed",
+                "replicant.transferred",
                 "device.attached",
                 "device.compacted",
                 "device.deployed",

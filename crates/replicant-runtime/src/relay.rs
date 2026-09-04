@@ -49,6 +49,7 @@ use crate::{
     },
     orchestration::REGION_GATEWAY_HUB_RANGE_LY,
     start_managed_client,
+    worker_state::OPERATIONAL_REGIONAL_WORKER_CAPABILITY,
 };
 use replicant_client::{
     Client, Device, DeviceHandle, DeviceType, Operation, OperationId, OperationStatus, Replicant,
@@ -59,12 +60,11 @@ use replicant_client::{
 use replicant_printing::{
     Blueprint as PrintingBlueprint, FactoryWorkload, PrintRequest, QuantityMap,
     managed::{
-        FactoryState, PrintingError, QueueOptions, discover_factories as discover_print_factories,
+        FactoryState, PrintingError, QueueOptions, TrackedPrintRequest, TrackedPrintUpdate,
+        discover_factories as discover_print_factories,
         discover_factory_codes as discover_print_factory_codes,
-        enqueue_print as enqueue_shared_print,
-        enqueue_print_flatpacked as enqueue_shared_print_flatpacked,
         fetch_blueprints as fetch_print_blueprints, printing_status_in_system,
-        queue_print_prerequisites_ahead,
+        queue_print_prerequisites_ahead, queue_tracked_prints_once,
     },
     schedule_prints,
 };
@@ -575,7 +575,7 @@ pub fn relay_work_item_specs(
                     ResourceRequirement {
                         key: "worker".into(),
                         kind: "replicant".into(),
-                        capabilities: Vec::new(),
+                        capabilities: vec![OPERATIONAL_REGIONAL_WORKER_CAPABILITY.into()],
                         scope: RequirementScope::Region(region.to_owned()),
                         count: 1,
                         quantity: 1,
@@ -3297,6 +3297,15 @@ fn print_job_correlation_tag(job: &PrintJob) -> &str {
     job.batch_tag.as_deref().unwrap_or(&job.site_tag)
 }
 
+fn pending_print_job_indices(jobs: &[PrintJob]) -> Vec<usize> {
+    jobs.iter()
+        .enumerate()
+        .filter_map(|(index, job)| {
+            (job.relay_code.is_none() && !job.submitted && !job.submission_started).then_some(index)
+        })
+        .collect()
+}
+
 fn normalize_relay_print_jobs(jobs: &mut [PrintJob]) {
     // Ordinary FTL relays are directly attachable and should be printed
     // assembled. Deep Space Relay Stations are modular and must be printed as
@@ -3358,19 +3367,6 @@ fn assign_safe_legacy_print_batches(plan: &mut MissionPlan) {
             }
         }
     }
-}
-
-fn pending_print_groups(jobs: &[PrintJob], factory_code: &str) -> Vec<Vec<usize>> {
-    let mut groups = BTreeMap::<String, Vec<usize>>::new();
-    for (index, job) in jobs.iter().enumerate() {
-        if job.factory_code == factory_code && !job.submitted && !job.submission_started {
-            groups
-                .entry(print_job_correlation_tag(job).to_owned())
-                .or_default()
-                .push(index);
-        }
-    }
-    groups.into_values().collect()
 }
 
 fn normalize_print_job_tags(plan: &mut MissionPlan) -> AnyResult<()> {
@@ -5710,129 +5706,91 @@ async fn submit_print_jobs(
             save_plan(&config.plan_path, plan)?;
             continue;
         }
-
-        let states = discover_print_factories(client, &plan.hub_location, &blueprints).await?;
-        let mission_id = plan.mission_id.clone();
-        let reassigned = reassign_unavailable_print_jobs(
-            &mut plan.print_jobs,
-            &mission_id,
-            &states,
-            &blueprints,
-            &plan.hub_location,
-        )?;
-        if reassigned != 0 {
-            save_plan(&config.plan_path, plan)?;
-        }
-        let mut submitted_any = false;
-        let mut refresh_factories = false;
-        for state in states {
-            let mut slots = state.available_slots();
-            for job_indices in pending_print_groups(&plan.print_jobs, &state.code) {
-                if slots == 0 {
-                    break;
-                }
-                let selected = job_indices.into_iter().take(slots).collect::<Vec<_>>();
-                if selected.is_empty() {
-                    continue;
-                }
-                let first_index = *selected
-                    .first()
-                    .ok_or_else(|| app_error(io::ErrorKind::InvalidData, "empty print batch"))?;
-                let mission_tag = plan.print_jobs[first_index].mission_tag.clone();
-                let correlation_tag =
-                    print_job_correlation_tag(&plan.print_jobs[first_index]).to_owned();
-                let device_type = plan.print_jobs[first_index].device_type.clone();
-                let flatpack = plan.print_jobs[first_index].flatpack;
-                if selected.iter().any(|index| {
-                    plan.print_jobs[*index].device_type != device_type
-                        || plan.print_jobs[*index].flatpack != flatpack
-                }) {
-                    return Err(app_error(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "relay print batch {correlation_tag} mixes device types or output modes"
-                        ),
-                    ));
-                }
-                let quantity = i64::try_from(selected.len())?;
-                for index in &selected {
-                    plan.print_jobs[*index].submission_started = true;
-                }
-                save_plan(&config.plan_path, plan)?;
-
-                let tags = [mission_tag, correlation_tag];
-                let submission = if flatpack {
-                    enqueue_shared_print_flatpacked(
-                        client,
-                        &state.code,
-                        &device_type,
-                        quantity,
-                        &tags,
-                    )
-                    .await
+        let jobs = pending_print_job_indices(&plan.print_jobs);
+        let requests = jobs
+            .iter()
+            .map(|index| {
+                let job = &plan.print_jobs[*index];
+                let request = TrackedPrintRequest::new(job.device_type.clone(), 1);
+                if job.flatpack {
+                    request.flatpacked()
                 } else {
-                    enqueue_shared_print(client, &state.code, &device_type, quantity, &tags).await
-                };
-                match submission {
-                    Ok(operation) => {
-                        let operation_id = operation.id().as_str().to_owned();
-                        for index in &selected {
-                            plan.print_jobs[*index].operation_id = Some(operation_id.clone());
-                            plan.print_jobs[*index].submitted = true;
-                        }
+                    request
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let options = QueueOptions::at(plan.hub_location.clone());
+        let mission_id = plan.mission_id.clone();
+        let result =
+            queue_tracked_prints_once(client, &requests, &options, &blueprints, |update| {
+                match update {
+                    TrackedPrintUpdate::Preparing(assignment) => {
+                        let index = jobs[assignment.request_index];
+                        let job = &plan.print_jobs[index];
+                        let mission_tag = job.mission_tag.clone();
+                        let batch_tag = relay_batch_tag(
+                            &mission_id,
+                            &assignment.factory_code,
+                            &assignment.device_type,
+                            assignment.flatpack,
+                        );
+                        let job = &mut plan.print_jobs[index];
+                        job.factory_code.clone_from(&assignment.factory_code);
+                        job.batch_tag = Some(batch_tag.clone());
+                        job.submission_started = true;
+                        save_plan(&config.plan_path, plan).map_err(|error| error.to_string())?;
+                        Ok(Some(vec![mission_tag, batch_tag]))
                     }
-                    Err(error) => {
-                        let operation_id = match &error {
-                            PrintingError::SubmissionRejected { operation_id, .. }
-                            | PrintingError::SubmissionUnresolved { operation_id, .. } => {
-                                Some(operation_id.clone())
-                            }
-                            _ => None,
-                        };
-                        if let Some(operation_id) = operation_id {
-                            for index in &selected {
-                                plan.print_jobs[*index].operation_id = Some(operation_id.clone());
-                            }
-                        }
-                        if error.is_factory_unavailable_rejection() {
-                            for index in &selected {
-                                plan.print_jobs[*index].submission_started = false;
-                                plan.print_jobs[*index].operation_id = None;
-                                plan.print_jobs[*index].submitted = false;
-                            }
-                            save_plan(&config.plan_path, plan)?;
-                            warn!(factory = %state.code, %error, "Autofactory became unavailable; refreshing relay print assignments");
-                            refresh_factories = true;
-                            break;
-                        }
-                        save_plan(&config.plan_path, plan)?;
-                        return Err(error.into());
+                    TrackedPrintUpdate::OperationRecorded {
+                        assignment,
+                        operation_id,
+                    } => {
+                        let job = &mut plan.print_jobs[jobs[assignment.request_index]];
+                        job.operation_id = Some(operation_id);
+                        job.submitted = true;
+                        save_plan(&config.plan_path, plan).map_err(|error| error.to_string())?;
+                        Ok(None)
+                    }
+                }
+            })
+            .await;
+        let report = match result {
+            Ok(report) => report,
+            Err(error) if error.is_factory_unavailable_rejection() => {
+                let operation_id = match &error {
+                    PrintingError::SubmissionRejected { operation_id, .. }
+                    | PrintingError::SubmissionUnresolved { operation_id, .. } => {
+                        Some(operation_id.as_str())
+                    }
+                    _ => None,
+                };
+                for job in &mut plan.print_jobs {
+                    if operation_id.is_some_and(|operation_id| {
+                        job.operation_id.as_deref() == Some(operation_id)
+                    }) {
+                        job.submission_started = false;
+                        job.operation_id = None;
+                        job.submitted = false;
                     }
                 }
                 save_plan(&config.plan_path, plan)?;
-                info!(
-                    factory = %state.code,
-                    quantity,
-                    systems = %selected
-                        .iter()
-                        .map(|index| plan.print_jobs[*index].system.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    device_type = %device_type,
-                    flatpack,
-                    "queued relay print batch through shared printing crate"
-                );
-                slots = slots.saturating_sub(selected.len());
-                submitted_any = true;
+                warn!(%error, "Autofactory became unavailable; refreshing relay print assignments");
+                continue;
             }
-            if refresh_factories {
-                break;
-            }
+            Err(error) => return Err(error.into()),
+        };
+        for submission in &report.submissions {
+            let job = &plan.print_jobs[jobs[submission.assignment.request_index]];
+            info!(
+                factory = %submission.assignment.factory_code,
+                system = %job.system,
+                device_type = %submission.assignment.device_type,
+                flatpack = submission.assignment.flatpack,
+                "queued relay print through managed printing"
+            );
         }
-        if refresh_factories {
-            continue;
-        }
-        if !submitted_any {
+        if report.submissions.is_empty() {
             wait_for_relevant_event(&mut watch, deadline, &["print.completed"]).await?;
             reconcile_plan(client, plan).await?;
             save_plan(&config.plan_path, plan)?;
@@ -7537,6 +7495,7 @@ mod tests {
             system_status: None,
             active_directive: None,
             travel: None,
+            runtime: Default::default(),
             access: replicant_client::domain::AccessScope::Owned,
         }
     }
@@ -8339,10 +8298,7 @@ mod tests {
         pending.operation_id = None;
         plan.print_jobs = vec![resumed, pending];
 
-        assert_eq!(
-            pending_print_groups(&plan.print_jobs, "FACTORY-1"),
-            vec![vec![1]]
-        );
+        assert_eq!(pending_print_job_indices(&plan.print_jobs), vec![1]);
     }
 
     #[tokio::test]
@@ -9483,10 +9439,6 @@ mod tests {
         assert!(!jobs[0].flatpack);
         assert!(jobs[1].flatpack);
         assert_ne!(jobs[0].batch_tag, jobs[1].batch_tag);
-        let groups = pending_print_groups(&jobs, "6523AC61");
-        assert_eq!(groups.len(), 2);
-        assert!(groups.contains(&vec![0]));
-        assert!(groups.contains(&vec![1]));
     }
 
     #[test]
@@ -9499,28 +9451,15 @@ mod tests {
     }
 
     #[test]
-    fn pending_jobs_with_one_batch_tag_share_one_quantity_submission() {
-        let jobs = vec![
+    fn pending_jobs_remain_independent_managed_requests() {
+        let mut jobs = vec![
             print_job("WIHAX", "6523AC61", Some("relay-b:one")),
             print_job("KRAKHUX", "6523AC61", Some("relay-b:one")),
             print_job("XHAKHKHU", "850547EE", Some("relay-b:two")),
         ];
+        jobs[1].submission_started = true;
 
-        let groups = pending_print_groups(&jobs, "6523AC61");
-
-        assert_eq!(groups, vec![vec![0, 1]]);
-    }
-
-    #[test]
-    fn legacy_site_tags_remain_individual_submissions() {
-        let jobs = vec![
-            print_job("WIHAX", "6523AC61", None),
-            print_job("KRAKHUX", "6523AC61", None),
-        ];
-
-        let groups = pending_print_groups(&jobs, "6523AC61");
-
-        assert_eq!(groups, vec![vec![1], vec![0]]);
+        assert_eq!(pending_print_job_indices(&jobs), vec![0, 2]);
     }
     #[test]
     fn relay_assignment_two_four_slot_lanes_leave_shared_tail() {

@@ -15,8 +15,10 @@ use std::error::Error;
 /// Durable work-item resource discovery and allocation.
 pub mod assignment;
 mod failure;
-/// Derived-urgency and elastic worker scheduling.
+/// Scheduler declarations and shared workflow-allocation policy.
 pub mod scheduler;
+/// Derived-urgency and elastic worker scheduling.
+mod worker_state;
 
 /// Error returned by an application report or action.
 pub type ApplicationError = Box<dyn Error + Send + Sync + 'static>;

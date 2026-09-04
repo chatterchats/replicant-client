@@ -9,6 +9,8 @@ use replicant_workflow::{
     RepositoryError, ResourceKey, WorkItemId, WorkflowRepository,
 };
 
+use crate::worker_state::{OPERATIONAL_REGIONAL_WORKER_CAPABILITY, classify_regional_worker};
+
 /// Runtime failure while assigning resources to durable work.
 #[derive(Debug, thiserror::Error)]
 pub enum AssignmentError {
@@ -64,13 +66,24 @@ impl ResourceBroker {
         let catalogue = client.galaxy().catalogue();
         let mut candidates = Vec::new();
         for replicant in owned_replicants {
+            let vessel = operational_vessel_for(&replicant, &devices);
+            let mut capabilities = capabilities_for_replicant(&replicant, &hosted_capabilities);
+            if classify_regional_worker(&replicant, vessel, None, None, None, false)
+                .is_operational()
+            {
+                capabilities.push(OPERATIONAL_REGIONAL_WORKER_CAPABILITY.to_owned());
+                capabilities.sort();
+                capabilities.dedup();
+            }
+            let location = replicant
+                .location
+                .as_ref()
+                .map(|location| allocation_location(location.id.as_str(), &catalogue));
             candidates.push(AllocationCandidate {
                 resource: ResourceKey::Replicant(replicant.key.id.to_string()),
                 kind: "replicant".into(),
-                capabilities: capabilities_for_replicant(&replicant, &hosted_capabilities),
-                location: replicant
-                    .location
-                    .map(|location| allocation_location(location.id.as_str(), &catalogue)),
+                capabilities,
+                location,
                 available_quantity: 1,
                 observed_revision: revision,
                 observed_at_ms,
@@ -317,6 +330,17 @@ fn json_string_values<T: serde::Serialize>(values: &[T]) -> Vec<String> {
         .collect()
 }
 
+fn operational_vessel_for<'a>(replicant: &Replicant, devices: &'a [Device]) -> Option<&'a Device> {
+    devices.iter().find(|device| {
+        device
+            .device_type
+            .as_ref()
+            .is_some_and(|kind| kind.as_str() == "racing_vessel")
+            && (replicant.hosted_device.as_ref() == Some(&device.key)
+                || device.relationships.hosting_replicant.as_ref() == Some(&replicant.key))
+    })
+}
+
 fn hosted_device_capabilities(devices: &[Device]) -> BTreeMap<DeviceKey, Vec<String>> {
     devices
         .iter()
@@ -407,6 +431,7 @@ mod tests {
             system_status: None,
             active_directive: None,
             travel: None,
+            runtime: Default::default(),
             access: AccessScope::Owned,
         }
     }

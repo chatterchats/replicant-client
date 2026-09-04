@@ -285,10 +285,17 @@ Automated workforce management is deliberately **grow-only**. There is no Direct
 workflow, or policy that deletes, retires, decommissions, or otherwise scales down Replicants.
 Idle Replicants are retained permanently.
 
-Scale-up is based on regional useful-work pressure rather than utilization alone. Ordinary
-established regions must have campaign work blocked on a missing worker, remain below the idle
-reserve threshold for a sustained hold period, and respect a scale-up cooldown. Establishing a new
-region is the exception: it may explicitly request the two-worker bootstrap pool even before that
-region has a local hub. The resulting `replicant.provision` workflow prints an empty Replicant
-matrix and cradle vessel at an established manufacturing home, performs replication, and records
-the new Replicant as permanently assigned to the target region.
+Scale-up is based on regional useful-work pressure rather than utilization alone. Once a region
+has its bootstrap population, ordinary growth must have campaign work blocked on genuine missing
+capacity, remain below the idle reserve threshold for a sustained hold period, and respect a
+scale-up cooldown. Travelling, workflow-busy, and reserved assigned workers are transient capacity,
+not immediate evidence for cloning.
+
+Establishing a new region may explicitly request a two-worker bootstrap pool before it has a local
+hub. Permanently assigned workers and non-terminal `replicant.provision` workflows for that region
+both count toward the target, regardless of current operational availability. Bootstrap growth
+stops at that target; a region remaining `establishing` does not disable ordinary safeguards. The
+provision workflow prints an empty Replicant matrix and cradle vessel, performs replication, and
+records the new Replicant as permanently assigned to the target region. Ordinary growth prefers an
+owned Autofactory at the designated regional home, falling back to an established manufacturing
+region only when no usable local source Replicant is available.

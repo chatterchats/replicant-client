@@ -19,9 +19,15 @@ use replicant_client::{
     Client, Device, DeviceHandle, DeviceType, MiningDirective, Operation, OperationId,
     OperationStatus, SurveyDirective, domain::AccessScope,
 };
+#[cfg(test)]
+use replicant_printing::managed::TrackedPrintAssignment;
 use replicant_printing::{
     PrintRequest,
-    managed::{QueueOptions, printing_status_in_system, queue_prints_with_components},
+    managed::{
+        FactoryPrintStatus, PrintingError, QueueOptions, SystemPrintingStatus, TrackedPrintRequest,
+        TrackedPrintUpdate, fetch_blueprints, printing_status_in_system, queue_print_prerequisites,
+        queue_prints_with_components, queue_tracked_prints_once,
+    },
 };
 use replicant_protocol::{workflow_reserved, workflow_tag_reserved};
 #[cfg(test)]
@@ -51,9 +57,11 @@ use crate::{
     event::{
         EventCampaignArchive, EventCampaignPlanningRequest, EventExecutionRequest, EventItemStage,
         EventPlanningRequest, EventStockReconcileOptions, archive_event_campaign,
-        event_campaign_target_systems, event_campaign_work_item_specs, event_mission_target_system,
-        execute_event_item, execute_event_mission, haul_allocated_resources, plan_event_campaign,
-        plan_event_mission, prestage_event_mission, reconcile_event_stock, restore_event_campaign,
+        event_campaign_target_systems, event_campaign_work_item_specs,
+        event_campaign_workflow_targets, event_mission_target_system,
+        event_mission_workflow_target, execute_event_item, execute_event_mission,
+        haul_allocated_resources, plan_event_campaign, plan_event_mission, prestage_event_mission,
+        reconcile_event_stock, restore_event_campaign,
     },
     failure::{FailureClass, failure_class, failure_class_from_message, failure_disposition},
     mining::{AmiTransportRouteIntent, MiningExpansionRequest, MiningMission, execute_expansion},
@@ -68,6 +76,7 @@ use crate::{
         restore_survey_checkpoint,
     },
     trade::{TradeBundle, shop_trades},
+    worker_state::{OPERATIONAL_REGIONAL_WORKER_CAPABILITY, WorkerState, classify_regional_worker},
     workflows::{
         ManagedMiningItemExecutor, MiningWorkflowCheckpoint, MiningWorkflowConfig,
         execute_mining_pool_config,
@@ -1041,6 +1050,9 @@ pub struct ReplicantProvisionIntent {
 pub struct ReplicantProvisionCheckpoint {
     /// Unique manufacturing tag for this provisioning request.
     pub tag: Option<String>,
+    /// Durable direct-output manufacturing intents.
+    #[serde(default)]
+    pub manufacturing: Option<ReplicantManufacturingCheckpoint>,
     /// Printed empty matrix code.
     pub matrix: Option<String>,
     /// Printed cradle vessel code.
@@ -1049,6 +1061,35 @@ pub struct ReplicantProvisionCheckpoint {
     pub stowed: bool,
     /// New Replicant code after successful replication.
     pub new_replicant: Option<String>,
+}
+
+/// Durable manufacturing state for the two provisioning outputs.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ReplicantManufacturingCheckpoint {
+    /// Empty Replicant matrix print intent.
+    pub matrix: ReplicantPrintIntent,
+    /// Cradle vessel print intent.
+    pub cradle: ReplicantPrintIntent,
+}
+
+/// One durably tracked provisioning print submission.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ReplicantPrintIntent {
+    /// Immutable requested device type.
+    pub device_type: String,
+    /// Deterministic tag identifying this output within the workflow.
+    pub job_tag: String,
+    /// Autofactory selected immediately before submission.
+    pub factory_code: Option<String>,
+    /// Whether the external-submission boundary has been crossed.
+    #[serde(default)]
+    pub submission_started: bool,
+    /// Whether operation or queue evidence established acceptance.
+    #[serde(default)]
+    pub accepted: bool,
+    /// Managed operation identity, when the submission response was recorded.
+    #[serde(default)]
+    pub operation_id: Option<String>,
 }
 
 /// Goal-level intent for establishing one newly discovered region.
@@ -2730,10 +2771,10 @@ impl WorkflowExecutor for ScanTourWorkflow {
             let intent: ScanTourIntent = context.config().map_err(string_error)?;
             let client = managed_client(context)?;
             let mut checkpoint: ScanTourCheckpoint = context.checkpoint().map_err(string_error)?;
-            let (replicant, vessel) = if let (Some(replicant), Some(vessel)) =
+            let assignment = if let (Some(replicant), Some(vessel)) =
                 (checkpoint.replicant.clone(), checkpoint.vessel.clone())
             {
-                (replicant, vessel)
+                Some((replicant, vessel))
             } else {
                 resolve_survey_assignment(
                     &client,
@@ -2742,9 +2783,37 @@ impl WorkflowExecutor for ScanTourWorkflow {
                 )
                 .await?
             };
-            let maintenance_home = match checkpoint.maintenance_home.clone() {
-                Some(value) => value,
-                None => resolve_home(&client, None).await?,
+            let Some((replicant, vessel)) = assignment else {
+                context
+                    .advance_to("waiting_for_operational_worker", &checkpoint)
+                    .map_err(string_error)?;
+                context
+                    .emit_activity("assigned regional workers are still in transit")
+                    .map_err(string_error)?;
+                context.mark_waiting().map_err(string_error)?;
+                return Ok(());
+            };
+            let worker_state = survey_worker_state(&client, &replicant, &vessel).await?;
+            if let Some(reason) = scan_tour_worker_wait_reason(worker_state) {
+                context
+                    .advance_to("waiting_for_operational_worker", &checkpoint)
+                    .map_err(string_error)?;
+                context.emit_activity(reason).map_err(string_error)?;
+                context.mark_waiting().map_err(string_error)?;
+                return Ok(());
+            }
+            let maintenance_home = if checkpoint.state.is_none() {
+                // Re-resolve pre-launch checkpoints so workflows created by an
+                // older build do not stay pinned to a global factory after a
+                // regional manufacturing home is available. Once the survey
+                // executor has durable state, preserve its existing home for
+                // restart consistency.
+                resolve_scan_tour_home(&client, &intent.center).await?
+            } else {
+                match checkpoint.maintenance_home.clone() {
+                    Some(value) => value,
+                    None => resolve_scan_tour_home(&client, &intent.center).await?,
+                }
             };
             checkpoint.replicant = Some(replicant.clone());
             checkpoint.vessel = Some(vessel.clone());
@@ -3075,7 +3144,7 @@ fn salvage_recovery_item_specs(
                     ResourceRequirement {
                         key: "worker".into(),
                         kind: "replicant".into(),
-                        capabilities: Vec::new(),
+                        capabilities: vec![OPERATIONAL_REGIONAL_WORKER_CAPABILITY.into()],
                         scope: RequirementScope::Region(region.to_owned()),
                         count: 1,
                         quantity: 1,
@@ -3797,18 +3866,14 @@ impl WorkflowExecutor for BeltSearchCampaignWorkflow {
                                 ResourceKey::Replicant(worker)
                                     if assignments.contains(worker)
                                         && !excluded_workers.contains(worker)
+                                        && candidate.location.as_ref().and_then(|location| {
+                                            location.region.as_deref()
+                                        }).is_some_and(|physical_region| {
+                                            canonical_region(physical_region)
+                                                == canonical_region(&intent.region)
+                                        })
                             )
                     });
-                    for candidate in &mut candidates {
-                        if let Some(location) = &mut candidate.location {
-                            location.region = Some(intent.region.clone());
-                        } else {
-                            candidate.location = Some(replicant_workflow::AllocationLocation {
-                                region: Some(intent.region.clone()),
-                                ..replicant_workflow::AllocationLocation::default()
-                            });
-                        }
-                    }
                     let mut running = Vec::new();
                     while running.len() < candidates.len() {
                         let Some(assigned) = repository
@@ -4045,7 +4110,11 @@ fn resolve_belt_campaign_region(
         }))
 }
 
-const BELT_SCAN_CAPABILITIES: [&str; 2] = ["census", "system_scan"];
+const BELT_SCAN_CAPABILITIES: [&str; 3] = [
+    "census",
+    "system_scan",
+    OPERATIONAL_REGIONAL_WORKER_CAPABILITY,
+];
 
 fn belt_worker_candidate(candidate: &replicant_workflow::AllocationCandidate) -> bool {
     BELT_SCAN_CAPABILITIES.iter().all(|required| {
@@ -4112,7 +4181,11 @@ fn belt_search_item_specs(
             requirements_json: serde_json::json!([{
                 "key": "worker",
                 "kind": "replicant",
-                "capabilities": ["census", "system_scan"],
+                "capabilities": [
+                    "census",
+                    "system_scan",
+                    OPERATIONAL_REGIONAL_WORKER_CAPABILITY
+                ],
                 "scope": {
                     "kind": "region",
                     "value": intent.region
@@ -4552,11 +4625,23 @@ impl WorkflowExecutor for LogisticsManifestWorkflow {
             // Claims are established before any recovery reservation tag is
             // touched.  In particular, a resumed workflow must not perform
             // cleanup merely because its intent names a device.
-            for code in &intent.device_codes {
-                claim_device(context, code)?;
-            }
-            for code in &intent.pre_deactivate_device_codes {
-                claim_device(context, code)?;
+            if let Some((code, owner)) = claim_devices_until_conflict(
+                context,
+                intent
+                    .device_codes
+                    .iter()
+                    .chain(intent.pre_deactivate_device_codes.iter()),
+            )? {
+                context
+                    .advance_to("waiting_for_payload_claim", &checkpoint)
+                    .map_err(string_error)?;
+                context
+                    .emit_activity(format!(
+                        "manifest payload device {code} is reserved by workflow {owner}; waiting for the claim instead of failing the delivery"
+                    ))
+                    .map_err(string_error)?;
+                context.mark_waiting().map_err(string_error)?;
+                return Ok(());
             }
             ensure_logistics_pre_deactivation(&client, &intent.pre_deactivate_device_codes).await?;
             if let Some(metadata) = intent.placement_recovery.as_ref()
@@ -4670,13 +4755,28 @@ impl WorkflowExecutor for LogisticsManifestWorkflow {
                     Err(error) => return Err(string_error(error)),
                 }
 
-                for code in plan
-                    .cargo_transports
-                    .iter()
-                    .chain(plan.device_carriers.iter())
-                    .chain(plan.payload_devices.iter().map(|device| &device.code))
-                {
-                    claim_device(context, code)?;
+                if let Some((code, owner)) = claim_devices_until_conflict(
+                    context,
+                    plan.cargo_transports
+                        .iter()
+                        .chain(plan.device_carriers.iter())
+                        .chain(plan.payload_devices.iter().map(|device| &device.code)),
+                )? {
+                    for resource in &source_claims {
+                        context.release_claim(resource).map_err(string_error)?;
+                    }
+                    checkpoint.plan = None;
+                    checkpoint.started = false;
+                    context
+                        .advance_to("waiting_for_transport_claim", &checkpoint)
+                        .map_err(string_error)?;
+                    context
+                        .emit_activity(format!(
+                            "delivery device {code} is reserved by workflow {owner}; discarding the stale transport plan and waiting to replan"
+                        ))
+                        .map_err(string_error)?;
+                    context.mark_waiting().map_err(string_error)?;
+                    return Ok(());
                 }
                 checkpoint.plan = Some(plan.clone());
                 context
@@ -6060,6 +6160,11 @@ impl WorkflowExecutor for EventDeliveryWorkflow {
                         .map_err(string_error)?;
                 }
 
+                let workflow_target =
+                    event_mission_workflow_target(&plan_file).map_err(string_error)?;
+                context
+                    .record_target(workflow_target)
+                    .map_err(string_error)?;
                 let target = event_mission_target_system(&plan_file).map_err(string_error)?;
                 let targets = BTreeSet::from([target]);
                 if !reconcile_event_connectivity(
@@ -6208,6 +6313,9 @@ impl WorkflowExecutor for EventTourWorkflow {
                 .map_err(string_error)?;
             let plan_file = scratch_file(context.id(), "event-plan.json")?;
             materialize_json(&plan_file, Some(&plan_json))?;
+            context
+                .record_target(event_mission_workflow_target(&plan_file).map_err(string_error)?)
+                .map_err(string_error)?;
             let state = execute_event_mission(
                 &client,
                 &EventExecutionRequest::new(
@@ -6287,6 +6395,11 @@ impl WorkflowExecutor for EventCampaignWorkflow {
                     context
                         .persist_checkpoint(&checkpoint)
                         .map_err(string_error)?;
+                }
+
+                if let Some(archive) = checkpoint.archive.as_ref() {
+                    let targets = event_campaign_workflow_targets(archive).map_err(string_error)?;
+                    context.replace_targets(&targets).map_err(string_error)?;
                 }
 
                 if !ensure_event_campaign_connectivity(
@@ -7163,6 +7276,378 @@ impl WorkflowExecutor for ObservatoryWorkflow {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProvisionPrintRole {
+    Matrix,
+    Cradle,
+}
+
+#[derive(Clone, Debug)]
+struct ProvisionTaggedDevice {
+    code: String,
+    device_type: String,
+    tags: Vec<String>,
+}
+
+#[derive(Default)]
+struct ProvisionReconciliation {
+    changed: bool,
+    completed: usize,
+    in_flight: usize,
+    duplicate_outputs: usize,
+    duplicate_jobs: usize,
+}
+
+fn provision_workflow_tag(workflow_id: WorkflowId) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"replicant.provision.manufacturing.v1\0");
+    hasher.update(workflow_id.to_string().as_bytes());
+    let digest = hasher.finalize();
+    let suffix = digest[..10]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("dir-p:{suffix}")
+}
+fn new_provision_manufacturing(
+    workflow_tag: &str,
+    cradle_type: &str,
+) -> ReplicantManufacturingCheckpoint {
+    ReplicantManufacturingCheckpoint {
+        matrix: ReplicantPrintIntent {
+            device_type: "empty_replicant_matrix".to_owned(),
+            job_tag: format!("{workflow_tag}:m"),
+            factory_code: None,
+            submission_started: false,
+            accepted: false,
+            operation_id: None,
+        },
+        cradle: ReplicantPrintIntent {
+            device_type: cradle_type.to_owned(),
+            job_tag: format!("{workflow_tag}:c"),
+            factory_code: None,
+            submission_started: false,
+            accepted: false,
+            operation_id: None,
+        },
+    }
+}
+
+fn provision_print(
+    manufacturing: &ReplicantManufacturingCheckpoint,
+    role: ProvisionPrintRole,
+) -> &ReplicantPrintIntent {
+    match role {
+        ProvisionPrintRole::Matrix => &manufacturing.matrix,
+        ProvisionPrintRole::Cradle => &manufacturing.cradle,
+    }
+}
+
+fn provision_print_mut(
+    manufacturing: &mut ReplicantManufacturingCheckpoint,
+    role: ProvisionPrintRole,
+) -> &mut ReplicantPrintIntent {
+    match role {
+        ProvisionPrintRole::Matrix => &mut manufacturing.matrix,
+        ProvisionPrintRole::Cradle => &mut manufacturing.cradle,
+    }
+}
+
+fn provision_output(
+    checkpoint: &ReplicantProvisionCheckpoint,
+    role: ProvisionPrintRole,
+) -> Option<&str> {
+    match role {
+        ProvisionPrintRole::Matrix => checkpoint.matrix.as_deref(),
+        ProvisionPrintRole::Cradle => checkpoint.cradle.as_deref(),
+    }
+}
+
+fn provision_output_mut(
+    checkpoint: &mut ReplicantProvisionCheckpoint,
+    role: ProvisionPrintRole,
+) -> &mut Option<String> {
+    match role {
+        ProvisionPrintRole::Matrix => &mut checkpoint.matrix,
+        ProvisionPrintRole::Cradle => &mut checkpoint.cradle,
+    }
+}
+
+fn reconcile_provision_evidence(
+    checkpoint: &mut ReplicantProvisionCheckpoint,
+    workflow_tag: &str,
+    devices: &[ProvisionTaggedDevice],
+    status: &SystemPrintingStatus,
+) -> Result<ProvisionReconciliation, String> {
+    let mut report = ProvisionReconciliation::default();
+    for role in [ProvisionPrintRole::Matrix, ProvisionPrintRole::Cradle] {
+        let device_type = checkpoint
+            .manufacturing
+            .as_ref()
+            .map(|manufacturing| provision_print(manufacturing, role).device_type.clone())
+            .ok_or_else(|| "provisioning manufacturing intent is missing".to_owned())?;
+        let mut completed = devices
+            .iter()
+            .filter(|device| {
+                device.device_type == device_type
+                    && device.tags.iter().any(|tag| tag == workflow_tag)
+            })
+            .map(|device| device.code.clone())
+            .collect::<Vec<_>>();
+        completed.sort();
+        completed.dedup();
+        report.completed += usize::from(!completed.is_empty());
+        report.duplicate_outputs += completed.len().saturating_sub(1);
+        if provision_output(checkpoint, role).is_none()
+            && let Some(code) = completed.first()
+        {
+            *provision_output_mut(checkpoint, role) = Some(code.clone());
+            report.changed = true;
+        }
+        if provision_output(checkpoint, role).is_some() {
+            continue;
+        }
+
+        let mut matching_factories = Vec::new();
+        let mut matching_jobs = 0usize;
+        for factory in &status.factories {
+            let active = factory.active.iter();
+            let queued = factory.queued.iter();
+            let matches = active.chain(queued).filter(|job| {
+                job.device_type == device_type
+                    && job.quantity >= 1
+                    && job.tags.iter().any(|tag| tag == workflow_tag)
+            });
+            let count = matches.count();
+            if count > 0 {
+                matching_factories.push(factory.code.clone());
+                matching_jobs += count;
+            }
+        }
+        matching_factories.sort();
+        matching_factories.dedup();
+        if let Some(factory_code) = matching_factories.first() {
+            let manufacturing = checkpoint
+                .manufacturing
+                .as_mut()
+                .ok_or_else(|| "provisioning manufacturing intent is missing".to_owned())?;
+            let print = provision_print_mut(manufacturing, role);
+            if print.factory_code.as_ref() != Some(factory_code)
+                || !print.submission_started
+                || !print.accepted
+            {
+                print.factory_code = Some(factory_code.clone());
+                print.submission_started = true;
+                print.accepted = true;
+                report.changed = true;
+            }
+            report.in_flight += 1;
+            report.duplicate_jobs += matching_jobs.saturating_sub(1);
+        }
+    }
+    Ok(report)
+}
+
+fn provision_pending_roles(checkpoint: &ReplicantProvisionCheckpoint) -> Vec<ProvisionPrintRole> {
+    let Some(manufacturing) = checkpoint.manufacturing.as_ref() else {
+        return Vec::new();
+    };
+    [ProvisionPrintRole::Matrix, ProvisionPrintRole::Cradle]
+        .into_iter()
+        .filter(|role| {
+            provision_output(checkpoint, *role).is_none()
+                && !provision_print(manufacturing, *role).submission_started
+        })
+        .collect()
+}
+
+fn provision_tracked_requests(
+    checkpoint: &ReplicantProvisionCheckpoint,
+    roles: &[ProvisionPrintRole],
+) -> Result<Vec<TrackedPrintRequest>, String> {
+    let manufacturing = checkpoint
+        .manufacturing
+        .as_ref()
+        .ok_or_else(|| "provisioning manufacturing intent is missing".to_owned())?;
+    Ok(roles
+        .iter()
+        .map(|role| {
+            TrackedPrintRequest::new(provision_print(manufacturing, *role).device_type.clone(), 1)
+                .authoritative_factory_check()
+        })
+        .collect())
+}
+
+fn apply_provision_print_update(
+    checkpoint: &mut ReplicantProvisionCheckpoint,
+    roles: &[ProvisionPrintRole],
+    workflow_tag: &str,
+    update: TrackedPrintUpdate,
+) -> Result<Option<Vec<String>>, String> {
+    match update {
+        TrackedPrintUpdate::Preparing(assignment) => {
+            let role = roles
+                .get(assignment.request_index)
+                .copied()
+                .ok_or_else(|| "tracked provisioning request index is invalid".to_owned())?;
+            let manufacturing = checkpoint
+                .manufacturing
+                .as_mut()
+                .ok_or_else(|| "provisioning manufacturing intent is missing".to_owned())?;
+            let print = provision_print_mut(manufacturing, role);
+            print.factory_code = Some(assignment.factory_code);
+            print.submission_started = true;
+            Ok(Some(vec![workflow_tag.to_owned(), print.job_tag.clone()]))
+        }
+        TrackedPrintUpdate::OperationRecorded {
+            assignment,
+            operation_id,
+        } => {
+            let role = roles
+                .get(assignment.request_index)
+                .copied()
+                .ok_or_else(|| "tracked provisioning request index is invalid".to_owned())?;
+            let manufacturing = checkpoint
+                .manufacturing
+                .as_mut()
+                .ok_or_else(|| "provisioning manufacturing intent is missing".to_owned())?;
+            provision_print_mut(manufacturing, role).operation_id = Some(operation_id);
+            Ok(None)
+        }
+    }
+}
+
+fn matching_factory_jobs(
+    factory: &FactoryPrintStatus,
+    device_type: &str,
+    workflow_tag: &str,
+) -> usize {
+    factory
+        .active
+        .iter()
+        .chain(factory.queued.iter())
+        .filter(|job| {
+            job.device_type == device_type
+                && job.quantity >= 1
+                && job.tags.iter().any(|tag| tag == workflow_tag)
+        })
+        .count()
+}
+
+fn apply_provision_operation_status(
+    print: &mut ReplicantPrintIntent,
+    status: OperationStatus,
+    queue_visible: bool,
+) -> bool {
+    if status == OperationStatus::Rejected && !queue_visible {
+        print.factory_code = None;
+        print.submission_started = false;
+        print.accepted = false;
+        print.operation_id = None;
+        return true;
+    }
+    if (queue_visible
+        || matches!(
+            status,
+            OperationStatus::Accepted
+                | OperationStatus::InProgress
+                | OperationStatus::AwaitingEvidence
+                | OperationStatus::Completed
+        ))
+        && !print.accepted
+    {
+        print.accepted = true;
+        return true;
+    }
+    false
+}
+
+async fn reconcile_provision_operations(
+    client: &Client,
+    checkpoint: &mut ReplicantProvisionCheckpoint,
+    status: &SystemPrintingStatus,
+    workflow_tag: &str,
+) -> Result<bool, String> {
+    let mut changed = false;
+    for role in [ProvisionPrintRole::Matrix, ProvisionPrintRole::Cradle] {
+        if provision_output(checkpoint, role).is_some() {
+            continue;
+        }
+        let manufacturing = checkpoint
+            .manufacturing
+            .as_mut()
+            .ok_or_else(|| "provisioning manufacturing intent is missing".to_owned())?;
+        let print = provision_print_mut(manufacturing, role);
+        let Some(operation_id) = print.operation_id.clone() else {
+            continue;
+        };
+        let operation = client.operations().get(OperationId::from(operation_id));
+        let outcome = operation.outcome().await.map_err(string_error)?;
+        let queue_visible = print.factory_code.as_deref().is_some_and(|factory_code| {
+            status
+                .factories
+                .iter()
+                .find(|factory| factory.code == factory_code)
+                .is_some_and(|factory| {
+                    matching_factory_jobs(factory, &print.device_type, workflow_tag) > 0
+                })
+        });
+        changed |= apply_provision_operation_status(print, outcome.status, queue_visible);
+    }
+    Ok(changed)
+}
+
+fn validate_provision_manufacturing(
+    manufacturing: &ReplicantManufacturingCheckpoint,
+    cradle_type: &str,
+) -> Result<(), String> {
+    if manufacturing.matrix.device_type != "empty_replicant_matrix" {
+        return Err("provisioning matrix intent has an incompatible device type".to_owned());
+    }
+    if manufacturing.cradle.device_type != cradle_type {
+        return Err("provisioning cradle intent has an incompatible device type".to_owned());
+    }
+    Ok(())
+}
+
+async fn provision_tagged_devices(
+    client: &Client,
+    workflow_tag: &str,
+    authoritative: bool,
+) -> Result<Vec<ProvisionTaggedDevice>, String> {
+    let handles = if authoritative {
+        client
+            .devices()
+            .refresh_many()
+            .with_tag(workflow_tag.to_owned())
+            .collect()
+            .await
+            .map_err(string_error)?
+    } else {
+        client
+            .devices()
+            .find()
+            .owned()
+            .with_tag(workflow_tag.to_owned())
+            .collect()
+            .await
+            .map_err(string_error)?
+    };
+    let mut devices = Vec::new();
+    for handle in handles {
+        let snapshot = handle.snapshot().await.map_err(string_error)?;
+        if let Some(device_type) = snapshot.device_type.as_ref() {
+            devices.push(ProvisionTaggedDevice {
+                code: handle.id().as_str().to_owned(),
+                device_type: device_type.as_str().to_owned(),
+                tags: snapshot.tags,
+            });
+        }
+    }
+    devices.sort_by(|left, right| left.code.cmp(&right.code));
+    Ok(devices)
+}
+
 struct ReplicantProvisionWorkflow;
 impl WorkflowExecutor for ReplicantProvisionWorkflow {
     fn execute<'a>(&'a mut self, context: &'a mut WorkflowContext) -> BoxWorkflowFuture<'a> {
@@ -7178,58 +7663,197 @@ impl WorkflowExecutor for ReplicantProvisionWorkflow {
             )?;
             let tag = checkpoint
                 .tag
-                .get_or_insert_with(|| format!("dir-p:{}", &context.id().to_string()[..8]))
+                .get_or_insert_with(|| provision_workflow_tag(context.id()))
                 .clone();
-            let requests = [
-                PrintRequest::new("empty_replicant_matrix", 1),
-                PrintRequest::new(intent.cradle_type.clone(), 1),
-            ];
-            if checkpoint.matrix.is_none() || checkpoint.cradle.is_none() {
-                context
-                    .advance_to("manufacturing", &checkpoint)
-                    .map_err(string_error)?;
-                let mut options = QueueOptions::at(intent.home.clone());
-                options.tags = vec![tag.clone()];
-                options.wait_timeout = Duration::from_secs(DEFAULT_WAIT_SECONDS);
-                queue_prints_with_components(&client, &requests, &options)
-                    .await
-                    .map_err(string_error)?;
-                loop {
-                    let status = printing_status_in_system(
-                        &client,
-                        &intent.home,
-                        &requests,
-                        std::slice::from_ref(&tag),
-                    )
-                    .await
-                    .map_err(string_error)?;
-                    if status
-                        .requested
-                        .iter()
-                        .all(|line| line.available >= line.required)
-                    {
-                        break;
-                    }
-                    match context.control_request().map_err(string_error)? {
-                        replicant_workflow::ControlRequest::Continue => {}
-                        replicant_workflow::ControlRequest::Pause
-                        | replicant_workflow::ControlRequest::Cancel => return Ok(()),
-                    }
-                    tokio::time::sleep(Duration::from_secs(5)).await;
-                }
-                let devices = tagged_devices(&client, &tag).await?;
-                checkpoint.matrix = devices
-                    .iter()
-                    .find(|(_, kind)| kind == "empty_replicant_matrix")
-                    .map(|(code, _)| code.clone());
-                checkpoint.cradle = devices
-                    .iter()
-                    .find(|(_, kind)| kind == &intent.cradle_type)
-                    .map(|(code, _)| code.clone());
+            if checkpoint.manufacturing.is_none() {
+                checkpoint.manufacturing =
+                    Some(new_provision_manufacturing(&tag, &intent.cradle_type));
                 context
                     .persist_checkpoint(&checkpoint)
                     .map_err(string_error)?;
             }
+            validate_provision_manufacturing(
+                checkpoint
+                    .manufacturing
+                    .as_ref()
+                    .ok_or_else(|| "provisioning manufacturing intent is missing".to_owned())?,
+                &intent.cradle_type,
+            )?;
+            context
+                .advance_to("manufacturing", &checkpoint)
+                .map_err(string_error)?;
+
+            let all_requests = [
+                PrintRequest::new("empty_replicant_matrix", 1),
+                PrintRequest::new(intent.cradle_type.clone(), 1),
+            ];
+            let mut authoritative = true;
+            loop {
+                let initial_reconciliation = authoritative;
+                let devices = provision_tagged_devices(&client, &tag, authoritative).await?;
+                authoritative = false;
+                let status = printing_status_in_system(
+                    &client,
+                    &intent.home,
+                    &all_requests,
+                    std::slice::from_ref(&tag),
+                )
+                .await
+                .map_err(string_error)?;
+                let mut reconciliation =
+                    reconcile_provision_evidence(&mut checkpoint, &tag, &devices, &status)?;
+                reconciliation.changed |=
+                    reconcile_provision_operations(&client, &mut checkpoint, &status, &tag).await?;
+                if reconciliation.changed {
+                    context
+                        .persist_checkpoint(&checkpoint)
+                        .map_err(string_error)?;
+                }
+                if (initial_reconciliation || reconciliation.changed)
+                    && (reconciliation.duplicate_outputs > 0 || reconciliation.duplicate_jobs > 0)
+                {
+                    tracing::warn!(
+                        workflow_id = %context.id(),
+                        manufacturing_tag = %tag,
+                        duplicate_outputs = reconciliation.duplicate_outputs,
+                        duplicate_jobs = reconciliation.duplicate_jobs,
+                        "provisioning reconciliation found duplicate or orphaned manufacturing output"
+                    );
+                }
+                if initial_reconciliation || reconciliation.changed {
+                    let manufacturing = checkpoint
+                        .manufacturing
+                        .as_ref()
+                        .ok_or_else(|| "provisioning manufacturing intent is missing".to_owned())?;
+                    let in_flight_intents =
+                        [ProvisionPrintRole::Matrix, ProvisionPrintRole::Cradle]
+                            .into_iter()
+                            .filter(|role| {
+                                provision_output(&checkpoint, *role).is_none()
+                                    && provision_print(manufacturing, *role).submission_started
+                            })
+                            .count();
+                    tracing::info!(
+                        workflow_id = %context.id(),
+                        manufacturing_tag = %tag,
+                        completed_outputs = reconciliation.completed,
+                        in_flight_intents,
+                        "reconciled provisioning manufacturing evidence"
+                    );
+                }
+                if checkpoint.matrix.is_some() && checkpoint.cradle.is_some() {
+                    break;
+                }
+
+                let pending_roles = provision_pending_roles(&checkpoint);
+                let unresolved_intents = 2usize
+                    .saturating_sub(reconciliation.completed)
+                    .saturating_sub(pending_roles.len());
+                if initial_reconciliation || reconciliation.changed {
+                    tracing::info!(
+                        workflow_id = %context.id(),
+                        manufacturing_tag = %tag,
+                        remaining_print_deficit = pending_roles.len(),
+                        unresolved_intents,
+                        "calculated provisioning manufacturing deficit"
+                    );
+                }
+                if !pending_roles.is_empty() {
+                    let manufacturing = checkpoint
+                        .manufacturing
+                        .as_ref()
+                        .ok_or_else(|| "provisioning manufacturing intent is missing".to_owned())?;
+                    let pending_requests = pending_roles
+                        .iter()
+                        .map(|role| {
+                            PrintRequest::new(
+                                provision_print(manufacturing, *role).device_type.clone(),
+                                1,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    let mut options = QueueOptions::at(intent.home.clone());
+                    options.tags = vec![tag.clone()];
+                    options.wait_timeout = Duration::from_secs(DEFAULT_WAIT_SECONDS);
+                    queue_print_prerequisites(&client, &pending_requests, &options)
+                        .await
+                        .map_err(string_error)?;
+                    let blueprints = fetch_blueprints(&client).await.map_err(string_error)?;
+                    let tracked_requests = provision_tracked_requests(&checkpoint, &pending_roles)?;
+                    let report = match queue_tracked_prints_once(
+                        &client,
+                        &tracked_requests,
+                        &options,
+                        &blueprints,
+                        |update| {
+                            let tags = apply_provision_print_update(
+                                &mut checkpoint,
+                                &pending_roles,
+                                &tag,
+                                update,
+                            )?;
+                            context
+                                .persist_checkpoint(&checkpoint)
+                                .map_err(string_error)?;
+                            Ok(tags)
+                        },
+                    )
+                    .await
+                    {
+                        Ok(report) => Some(report),
+                        Err(PrintingError::SubmissionUnresolved {
+                            operation_id,
+                            status,
+                        }) => {
+                            tracing::warn!(
+                                workflow_id = %context.id(),
+                                manufacturing_tag = %tag,
+                                operation_id,
+                                ?status,
+                                "provisioning print submission is unresolved; awaiting durable evidence"
+                            );
+                            None
+                        }
+                        Err(PrintingError::SubmissionRejected {
+                            operation_id,
+                            status,
+                            ..
+                        }) => {
+                            tracing::warn!(
+                                workflow_id = %context.id(),
+                                manufacturing_tag = %tag,
+                                operation_id,
+                                ?status,
+                                "provisioning print operation ended without acceptance; reconciling before any retry"
+                            );
+                            None
+                        }
+                        Err(error) => return Err(string_error(error)),
+                    };
+                    if let Some(report) = report
+                        && !report.submissions.is_empty()
+                    {
+                        let manufacturing = checkpoint.manufacturing.as_mut().ok_or_else(|| {
+                            "provisioning manufacturing intent is missing".to_owned()
+                        })?;
+                        for submission in report.submissions {
+                            let role = pending_roles[submission.assignment.request_index];
+                            provision_print_mut(manufacturing, role).accepted = true;
+                        }
+                        context
+                            .persist_checkpoint(&checkpoint)
+                            .map_err(string_error)?;
+                        continue;
+                    }
+                }
+
+                match context.control_request().map_err(string_error)? {
+                    ControlRequest::Continue => {}
+                    ControlRequest::Pause | ControlRequest::Cancel => return Ok(()),
+                }
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+
             let matrix = checkpoint
                 .matrix
                 .clone()
@@ -7238,6 +7862,13 @@ impl WorkflowExecutor for ReplicantProvisionWorkflow {
                 .cradle
                 .clone()
                 .ok_or_else(|| "provisioned cradle vessel was not found".to_owned())?;
+            tracing::info!(
+                workflow_id = %context.id(),
+                manufacturing_tag = %tag,
+                matrix = %matrix,
+                cradle = %cradle,
+                "adopted reconciled provisioning outputs"
+            );
             claim_device(context, &matrix)?;
             claim_device(context, &cradle)?;
             if !checkpoint.stowed {
@@ -7648,6 +8279,38 @@ fn claim(context: &WorkflowContext, key: ResourceKey) -> Result<(), String> {
 
 fn claim_device(context: &WorkflowContext, code: &str) -> Result<(), String> {
     claim(context, ResourceKey::Device(code.to_owned()))
+}
+
+fn claim_devices_until_conflict<I, S>(
+    context: &WorkflowContext,
+    codes: I,
+) -> Result<Option<(String, WorkflowId)>, String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut newly_acquired = Vec::new();
+    for code in codes {
+        let code = code.as_ref();
+        let resource = ResourceKey::Device(code.to_owned());
+        match context.acquire_claim(resource.clone()) {
+            Ok(ClaimAcquireOutcome::Acquired(_)) => newly_acquired.push(resource),
+            Ok(ClaimAcquireOutcome::AlreadyOwned(_)) => {}
+            Err(RepositoryError::ClaimConflict { owner, .. }) => {
+                for resource in &newly_acquired {
+                    context.release_claim(resource).map_err(string_error)?;
+                }
+                return Ok(Some((code.to_owned(), owner)));
+            }
+            Err(error) => {
+                for resource in &newly_acquired {
+                    context.release_claim(resource).map_err(string_error)?;
+                }
+                return Err(string_error(error));
+            }
+        }
+    }
+    Ok(None)
 }
 
 fn claim_relay_resource(
@@ -10681,12 +11344,94 @@ fn claimed_scan_tour_devices(context: &WorkflowContext) -> Result<BTreeSet<Strin
         .collect())
 }
 
+#[derive(Clone, Debug)]
+struct ScanTourFleetDeviceCandidate {
+    code: String,
+    stowed: bool,
+    controller: Option<String>,
+    controlled_devices: BTreeSet<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ScanTourFleetAvailability {
+    controllers: Vec<String>,
+    drones: Vec<String>,
+    stowed_selected: usize,
+}
+
+fn scan_tour_available_device(device: &Device, device_type: &str, stowed: bool) -> bool {
+    device
+        .device_type
+        .as_ref()
+        .is_some_and(|kind| kind.as_str().eq_ignore_ascii_case(device_type))
+        && device.status.as_ref().is_some_and(|status| {
+            status.as_str().eq_ignore_ascii_case("idle")
+                || (stowed && status.as_str().eq_ignore_ascii_case("stowed"))
+        })
+}
+
+fn scan_tour_candidate(device: &Device, stowed: bool) -> ScanTourFleetDeviceCandidate {
+    ScanTourFleetDeviceCandidate {
+        code: device.key.id.as_str().to_owned(),
+        stowed,
+        controller: device
+            .relationships
+            .controller
+            .as_ref()
+            .map(|controller| controller.id.as_str().to_owned()),
+        controlled_devices: device
+            .relationships
+            .controlled_devices
+            .iter()
+            .map(|device| device.id.as_str().to_owned())
+            .collect(),
+    }
+}
+
 async fn available_scan_tour_fleet(
     context: &WorkflowContext,
     client: &Client,
     staging_location: &str,
-) -> Result<(Vec<String>, Vec<String>), String> {
+    vessel: &Device,
+) -> Result<ScanTourFleetAvailability, String> {
     let claimed = claimed_scan_tour_devices(context)?;
+    let vessel_code = vessel.key.id.as_str();
+    let mut controllers = Vec::new();
+    let mut drones = Vec::new();
+
+    // A completed survey tour normally leaves its controller and drones stowed
+    // in the assigned racing vessel. These devices have no ordinary location,
+    // so a location-only query misses them and causes the next tour to print a
+    // duplicate fleet. Inspect the vessel relationship first and prefer those
+    // already-stowed assets.
+    for key in &vessel.relationships.stowed_devices {
+        let code = key.id.as_str();
+        if claimed.contains(code) {
+            continue;
+        }
+        let snapshot = client
+            .devices()
+            .get(code)
+            .await
+            .map_err(string_error)?
+            .snapshot()
+            .await
+            .map_err(string_error)?;
+        if snapshot
+            .relationships
+            .stowed_in
+            .as_ref()
+            .is_none_or(|container| container.id.as_str() != vessel_code)
+        {
+            continue;
+        }
+        if scan_tour_available_device(&snapshot, DeviceType::SurveyController.as_str(), true) {
+            controllers.push(scan_tour_candidate(&snapshot, true));
+        } else if scan_tour_available_device(&snapshot, "survey_drone", true) {
+            drones.push(scan_tour_candidate(&snapshot, true));
+        }
+    }
+
     let controller_handles = client
         .devices()
         .controllers(DeviceType::SurveyController)
@@ -10697,6 +11442,15 @@ async fn available_scan_tour_fleet(
         .collect()
         .await
         .map_err(string_error)?;
+    for handle in controller_handles {
+        let code = handle.id().as_str();
+        if claimed.contains(code) {
+            continue;
+        }
+        let snapshot = handle.snapshot().await.map_err(string_error)?;
+        controllers.push(scan_tour_candidate(&snapshot, false));
+    }
+
     let drone_handles = client
         .devices()
         .find()
@@ -10708,20 +11462,172 @@ async fn available_scan_tour_fleet(
         .collect()
         .await
         .map_err(string_error)?;
+    for handle in drone_handles {
+        let code = handle.id().as_str();
+        if claimed.contains(code) {
+            continue;
+        }
+        let snapshot = handle.snapshot().await.map_err(string_error)?;
+        drones.push(scan_tour_candidate(&snapshot, false));
+    }
 
-    let mut controllers = controller_handles
+    select_scan_tour_fleet_availability(controllers, drones)
+}
+
+fn select_scan_tour_fleet_availability(
+    mut controllers: Vec<ScanTourFleetDeviceCandidate>,
+    mut drones: Vec<ScanTourFleetDeviceCandidate>,
+) -> Result<ScanTourFleetAvailability, String> {
+    controllers.sort_by(|left, right| {
+        right
+            .stowed
+            .cmp(&left.stowed)
+            .then_with(|| left.code.cmp(&right.code))
+    });
+    drones.sort_by(|left, right| {
+        right
+            .stowed
+            .cmp(&left.stowed)
+            .then_with(|| left.code.cmp(&right.code))
+    });
+
+    let required_drones = usize::try_from(SCAN_TOUR_SURVEY_DRONES)
+        .map_err(|_| "invalid survey drone requirement".to_owned())?;
+    let drone_by_code = drones
+        .iter()
+        .map(|drone| (drone.code.as_str(), drone))
+        .collect::<BTreeMap<_, _>>();
+    let mut best: Option<(usize, usize, bool, String, Vec<String>)> = None;
+
+    for controller in &controllers {
+        if controller.controlled_devices.len() > required_drones
+            || controller.controlled_devices.iter().any(|code| {
+                drone_by_code.get(code.as_str()).is_none_or(|drone| {
+                    drone
+                        .controller
+                        .as_deref()
+                        .is_some_and(|owner| owner != controller.code.as_str())
+                })
+            })
+        {
+            continue;
+        }
+
+        let mut selected = controller
+            .controlled_devices
+            .iter()
+            .filter_map(|code| drone_by_code.get(code.as_str()).copied())
+            .collect::<Vec<_>>();
+        selected.sort_by(|left, right| {
+            right
+                .stowed
+                .cmp(&left.stowed)
+                .then_with(|| left.code.cmp(&right.code))
+        });
+        let already_selected = selected
+            .iter()
+            .map(|drone| drone.code.as_str())
+            .collect::<BTreeSet<_>>();
+        let mut fill = drones
+            .iter()
+            .filter(|drone| !already_selected.contains(drone.code.as_str()))
+            .filter(|drone| {
+                drone
+                    .controller
+                    .as_deref()
+                    .is_none_or(|owner| owner == controller.code.as_str())
+            })
+            .collect::<Vec<_>>();
+        fill.sort_by(|left, right| {
+            right
+                .stowed
+                .cmp(&left.stowed)
+                .then_with(|| left.code.cmp(&right.code))
+        });
+        selected.extend(fill);
+        selected.truncate(required_drones);
+
+        let stowed_selected =
+            usize::from(controller.stowed) + selected.iter().filter(|drone| drone.stowed).count();
+        let score = (selected.len(), stowed_selected, controller.stowed);
+        let replace = best
+            .as_ref()
+            .is_none_or(|(count, stowed, controller_stowed, _, _)| {
+                score > (*count, *stowed, *controller_stowed)
+            });
+        if replace {
+            best = Some((
+                selected.len(),
+                stowed_selected,
+                controller.stowed,
+                controller.code.clone(),
+                selected
+                    .into_iter()
+                    .map(|drone| drone.code.clone())
+                    .collect(),
+            ));
+        }
+    }
+
+    if let Some((_, stowed_selected, _, controller, selected_drones)) = best {
+        return Ok(ScanTourFleetAvailability {
+            controllers: vec![controller],
+            drones: selected_drones,
+            stowed_selected,
+        });
+    }
+
+    // If there is no usable controller yet, only controller-free drones can be
+    // paired safely with a newly printed controller. A drone still adopted by
+    // some other controller is not counted toward the manufacturing deficit.
+    let mut free_drones = drones
         .into_iter()
-        .map(|handle| handle.id().as_str().to_owned())
-        .filter(|code| !claimed.contains(code))
+        .filter(|drone| drone.controller.is_none())
         .collect::<Vec<_>>();
-    let mut drones = drone_handles
-        .into_iter()
-        .map(|handle| handle.id().as_str().to_owned())
-        .filter(|code| !claimed.contains(code))
-        .collect::<Vec<_>>();
-    controllers.sort();
-    drones.sort();
-    Ok((controllers, drones))
+    free_drones.sort_by(|left, right| {
+        right
+            .stowed
+            .cmp(&left.stowed)
+            .then_with(|| left.code.cmp(&right.code))
+    });
+    free_drones.truncate(required_drones);
+    let stowed_selected = free_drones.iter().filter(|drone| drone.stowed).count();
+    Ok(ScanTourFleetAvailability {
+        controllers: Vec::new(),
+        drones: free_drones.into_iter().map(|drone| drone.code).collect(),
+        stowed_selected,
+    })
+}
+
+fn ensure_scan_tour_stow_capacity(
+    context: &mut WorkflowContext,
+    checkpoint: &ScanTourCheckpoint,
+    vessel: &Device,
+    availability: &ScanTourFleetAvailability,
+) -> Result<bool, String> {
+    let Some(capacity) = vessel.stow_capacity else {
+        return Ok(true);
+    };
+    let required_fleet_slots = 1_i64.saturating_add(SCAN_TOUR_SURVEY_DRONES.max(0));
+    let stowed_selected = i64::try_from(availability.stowed_selected)
+        .map_err(|_| "survey fleet slot requirement overflowed".to_owned())?;
+    let additional_slots = required_fleet_slots.saturating_sub(stowed_selected);
+    let used = vessel.effective_stow_used();
+    if used.saturating_add(additional_slots) <= capacity {
+        return Ok(true);
+    }
+
+    context
+        .advance_to("waiting_for_survey_fleet_capacity", checkpoint)
+        .map_err(string_error)?;
+    context
+        .emit_activity(format!(
+            "survey vessel {} has stow capacity {capacity}, currently uses {used}, and needs {additional_slots} free slot(s) for the selected/replacement survey fleet; waiting instead of manufacturing redundant devices",
+            vessel.key.id.as_str()
+        ))
+        .map_err(string_error)?;
+    context.mark_waiting().map_err(string_error)?;
+    Ok(false)
 }
 
 fn reserve_scan_tour_fleet(
@@ -10836,15 +11742,33 @@ async fn ensure_scan_tour_fleet_capacity(
         .snapshot()
         .await
         .map_err(string_error)?;
+    if vessel_snapshot.travel.is_some() || vessel_snapshot.location.is_none() {
+        context
+            .advance_to("waiting_for_operational_worker", checkpoint)
+            .map_err(string_error)?;
+        context
+            .emit_activity("assigned regional workers are still in transit or lack an authoritative vessel location")
+            .map_err(string_error)?;
+        context.mark_waiting().map_err(string_error)?;
+        return Ok(false);
+    }
     let staging_location = vessel_snapshot
         .location
         .as_ref()
         .map(|location| location.id.as_str().to_owned())
         .ok_or_else(|| format!("survey vessel {vessel} has no current staging location"))?;
 
-    let (controllers, drones) =
-        available_scan_tour_fleet(context, client, &staging_location).await?;
-    if reserve_scan_tour_fleet(context, checkpoint, &controllers, &drones)? {
+    let availability =
+        available_scan_tour_fleet(context, client, &staging_location, &vessel_snapshot).await?;
+    if !ensure_scan_tour_stow_capacity(context, checkpoint, &vessel_snapshot, &availability)? {
+        return Ok(false);
+    }
+    if reserve_scan_tour_fleet(
+        context,
+        checkpoint,
+        &availability.controllers,
+        &availability.drones,
+    )? {
         context
             .emit_activity(format!(
                 "reserved an exclusive survey fleet at {staging_location}: controller {}, drones {}",
@@ -10857,16 +11781,25 @@ async fn ensure_scan_tour_fleet_capacity(
 
     // A parallel shard may have won the claim race between discovery and
     // reservation. Refresh the claim-aware view before deciding what to print.
-    let (controllers, drones) =
-        available_scan_tour_fleet(context, client, &staging_location).await?;
-    if reserve_scan_tour_fleet(context, checkpoint, &controllers, &drones)? {
+    let availability =
+        available_scan_tour_fleet(context, client, &staging_location, &vessel_snapshot).await?;
+    if !ensure_scan_tour_stow_capacity(context, checkpoint, &vessel_snapshot, &availability)? {
+        return Ok(false);
+    }
+    if reserve_scan_tour_fleet(
+        context,
+        checkpoint,
+        &availability.controllers,
+        &availability.drones,
+    )? {
         return Ok(true);
     }
 
     // Only unclaimed devices count toward this tour. Parallel catalogue shards
     // therefore manufacture independent fleets instead of racing to claim the
     // same idle controller/drones after the preflight succeeds.
-    let requests = scan_tour_fleet_print_requests(controllers.len(), drones.len());
+    let requests =
+        scan_tour_fleet_print_requests(availability.controllers.len(), availability.drones.len());
     if requests.is_empty() {
         context
             .advance_to("waiting_for_survey_fleet_claim", checkpoint)
@@ -10933,9 +11866,17 @@ async fn ensure_scan_tour_fleet_capacity(
     }
 
     if print_location.eq_ignore_ascii_case(&staging_location) {
-        let (controllers, drones) =
-            available_scan_tour_fleet(context, client, &staging_location).await?;
-        if reserve_scan_tour_fleet(context, checkpoint, &controllers, &drones)? {
+        let availability =
+            available_scan_tour_fleet(context, client, &staging_location, &vessel_snapshot).await?;
+        if !ensure_scan_tour_stow_capacity(context, checkpoint, &vessel_snapshot, &availability)? {
+            return Ok(false);
+        }
+        if reserve_scan_tour_fleet(
+            context,
+            checkpoint,
+            &availability.controllers,
+            &availability.drones,
+        )? {
             return Ok(true);
         }
         context
@@ -11043,11 +11984,65 @@ async fn tagged_device_codes_for_requests(
     Ok(selected)
 }
 
+fn scan_tour_worker_wait_reason(state: WorkerState) -> Option<&'static str> {
+    match state {
+        WorkerState::Operational => None,
+        WorkerState::InTransit => Some("assigned regional workers are still in transit"),
+        WorkerState::Busy
+        | WorkerState::WrongRegion
+        | WorkerState::MissingVessel
+        | WorkerState::UnknownLocation
+        | WorkerState::LocationMismatch
+        | WorkerState::Unavailable => {
+            Some("assigned regional worker has no authoritative stationary vessel location")
+        }
+    }
+}
+
+async fn survey_worker_state(
+    client: &Client,
+    replicant_code: &str,
+    vessel_code: &str,
+) -> Result<WorkerState, String> {
+    let replicant = client
+        .replicants()
+        .get_owned(replicant_code)
+        .await
+        .map_err(string_error)?
+        .snapshot()
+        .await
+        .map_err(string_error)?;
+    let vessel = client
+        .devices()
+        .get(vessel_code)
+        .await
+        .map_err(string_error)?
+        .snapshot()
+        .await
+        .map_err(string_error)?;
+    if vessel
+        .relationships
+        .hosting_replicant
+        .as_ref()
+        .is_none_or(|hosted| hosted.id.as_str() != replicant_code)
+    {
+        return Ok(WorkerState::MissingVessel);
+    }
+    Ok(classify_regional_worker(
+        &replicant,
+        Some(&vessel),
+        None,
+        None,
+        None,
+        false,
+    ))
+}
+
 async fn resolve_survey_assignment(
     client: &Client,
     pinned_replicant: Option<&str>,
     pinned_vessel: Option<&str>,
-) -> Result<(String, String), String> {
+) -> Result<Option<(String, String)>, String> {
     if let Some(vessel_code) = pinned_vessel.filter(|value| !value.trim().is_empty()) {
         let handle = client
             .devices()
@@ -11078,12 +12073,13 @@ async fn resolve_survey_assignment(
                 "racing vessel {vessel_code} hosts {hosted}, not requested replicant {expected}"
             ));
         }
-        client
-            .replicants()
-            .get_owned(&hosted)
+        return survey_worker_state(client, &hosted, vessel_code)
             .await
-            .map_err(string_error)?;
-        return Ok((hosted, vessel_code.to_owned()));
+            .map(|state| {
+                state
+                    .is_operational()
+                    .then(|| (hosted, vessel_code.to_owned()))
+            });
     }
 
     let handles = client
@@ -11105,17 +12101,17 @@ async fn resolve_survey_assignment(
         {
             continue;
         }
-        client
-            .replicants()
-            .get_owned(hosted.id.as_str())
-            .await
-            .map_err(string_error)?;
-        return Ok((
-            hosted.id.as_str().to_owned(),
-            handle.id().as_str().to_owned(),
-        ));
+        if survey_worker_state(client, hosted.id.as_str(), handle.id().as_str())
+            .await?
+            .is_operational()
+        {
+            return Ok(Some((
+                hosted.id.as_str().to_owned(),
+                handle.id().as_str().to_owned(),
+            )));
+        }
     }
-    Err("no owned racing vessel hosting an eligible replicant is available".to_owned())
+    Ok(None)
 }
 
 async fn resolve_controller(
@@ -11444,6 +12440,46 @@ async fn resolve_home(client: &Client, pinned: Option<&str>) -> Result<String, S
         }
     }
     Err("no owned autofactory location is available for staging".to_owned())
+}
+
+async fn resolve_scan_tour_home(client: &Client, center: &str) -> Result<String, String> {
+    let handles = client
+        .devices()
+        .find()
+        .owned()
+        .of_type(DeviceType::Autofactory)
+        .collect()
+        .await
+        .map_err(string_error)?;
+    let mut locations = Vec::new();
+    for handle in handles {
+        let snapshot = handle.snapshot().await.map_err(string_error)?;
+        let Some(location) = snapshot.location.as_ref() else {
+            continue;
+        };
+        locations.push(location.id.as_str().to_owned());
+    }
+    scan_tour_factory_home(center, &locations)
+        .ok_or_else(|| "no owned autofactory location is available for staging".to_owned())
+}
+
+fn scan_tour_factory_home(center: &str, locations: &[String]) -> Option<String> {
+    let mut local_factories = BTreeMap::<String, usize>::new();
+    for location in locations {
+        if designation_in_system(location, center) {
+            *local_factories.entry(location.clone()).or_default() += 1;
+        }
+    }
+    if let Some((location, _)) = local_factories.into_iter().max_by(
+        |(left_location, left_count), (right_location, right_count)| {
+            left_count
+                .cmp(right_count)
+                .then_with(|| right_location.cmp(left_location))
+        },
+    ) {
+        return Some(location);
+    }
+    locations.first().cloned()
 }
 
 async fn wait_controller_completion(
@@ -12615,7 +13651,6 @@ async fn resolve_location_system(client: &Client, location: &str) -> Result<Stri
 fn designation_in_system(location: &str, system: &str) -> bool {
     location == system || location.starts_with(&format!("{system}-"))
 }
-
 async fn tagged_devices(client: &Client, tag: &str) -> Result<Vec<(String, String)>, String> {
     let handles = client
         .devices()
@@ -12819,6 +13854,452 @@ mod tests {
 
     use super::*;
     use crate::failure::ClassifiedError;
+
+    fn provision_fixture(tag: &str) -> ReplicantProvisionCheckpoint {
+        ReplicantProvisionCheckpoint {
+            tag: Some(tag.to_owned()),
+            manufacturing: Some(new_provision_manufacturing(tag, "racing_vessel")),
+            ..ReplicantProvisionCheckpoint::default()
+        }
+    }
+
+    #[test]
+    fn provision_legacy_checkpoint_initializes_durable_intents_without_losing_tag() {
+        let mut checkpoint: ReplicantProvisionCheckpoint =
+            serde_json::from_value(serde_json::json!({
+                "tag": "dir-p:legacy",
+                "matrix": null,
+                "cradle": null,
+                "stowed": false,
+                "new_replicant": null
+            }))
+            .expect("legacy checkpoint");
+        assert!(checkpoint.manufacturing.is_none());
+        checkpoint.manufacturing = Some(new_provision_manufacturing(
+            checkpoint.tag.as_deref().expect("tag"),
+            "racing_vessel",
+        ));
+        assert_eq!(checkpoint.tag.as_deref(), Some("dir-p:legacy"));
+        assert_eq!(
+            provision_pending_roles(&checkpoint),
+            vec![ProvisionPrintRole::Matrix, ProvisionPrintRole::Cradle]
+        );
+    }
+
+    #[test]
+    fn provision_full_workflow_ids_prevent_short_prefix_tag_collisions() {
+        let left = "b6342fb5-0000-4000-8000-000000000001"
+            .parse::<WorkflowId>()
+            .expect("left workflow id");
+        let right = "b6342fb5-0000-4000-8000-000000000002"
+            .parse::<WorkflowId>()
+            .expect("right workflow id");
+        let left_tag = provision_workflow_tag(left);
+        let right_tag = provision_workflow_tag(right);
+        assert_ne!(left_tag, right_tag);
+        let intents = new_provision_manufacturing(&left_tag, "racing_vessel");
+        assert!(left_tag.len() <= 32);
+        assert!(intents.matrix.job_tag.len() <= 32);
+        assert!(intents.cradle.job_tag.len() <= 32);
+    }
+
+    #[test]
+    fn provision_legacy_checkpoint_retains_already_adopted_output() {
+        let mut checkpoint: ReplicantProvisionCheckpoint =
+            serde_json::from_value(serde_json::json!({
+                "tag": "dir-p:legacy-partial",
+                "matrix": "M-EXISTING",
+                "cradle": null,
+                "stowed": false,
+                "new_replicant": null
+            }))
+            .expect("legacy checkpoint");
+        checkpoint.manufacturing = Some(new_provision_manufacturing(
+            checkpoint.tag.as_deref().expect("tag"),
+            "racing_vessel",
+        ));
+        assert_eq!(checkpoint.matrix.as_deref(), Some("M-EXISTING"));
+        assert_eq!(
+            provision_pending_roles(&checkpoint),
+            vec![ProvisionPrintRole::Cradle]
+        );
+    }
+
+    fn provision_device(code: &str, device_type: &str, tag: &str) -> ProvisionTaggedDevice {
+        ProvisionTaggedDevice {
+            code: code.to_owned(),
+            device_type: device_type.to_owned(),
+            tags: vec![tag.to_owned()],
+        }
+    }
+
+    fn provision_status(jobs: &[(&str, &str, &str)]) -> SystemPrintingStatus {
+        let mut factories = BTreeMap::<String, FactoryPrintStatus>::new();
+        for (factory_code, device_type, tag) in jobs {
+            let factory = factories
+                .entry((*factory_code).to_owned())
+                .or_insert_with(|| FactoryPrintStatus {
+                    code: (*factory_code).to_owned(),
+                    ..FactoryPrintStatus::default()
+                });
+            factory
+                .queued
+                .push(replicant_printing::managed::FactoryPrintJobStatus {
+                    device_type: (*device_type).to_owned(),
+                    quantity: 1,
+                    tags: vec![(*tag).to_owned()],
+                    matches_filter: true,
+                    ..replicant_printing::managed::FactoryPrintJobStatus::default()
+                });
+        }
+        SystemPrintingStatus {
+            factories: factories.into_values().collect(),
+            ..SystemPrintingStatus::default()
+        }
+    }
+
+    #[test]
+    fn provision_first_queue_pass_records_one_submission_per_output() {
+        let tag = "dir-p:first";
+        let mut checkpoint = provision_fixture(tag);
+        let roles = provision_pending_roles(&checkpoint);
+        let requests = provision_tracked_requests(&checkpoint, &roles).expect("requests");
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].device_type, "empty_replicant_matrix");
+        assert_eq!(requests[0].quantity, 1);
+        assert_eq!(requests[1].device_type, "racing_vessel");
+        assert_eq!(requests[1].quantity, 1);
+
+        for (request_index, request) in requests.iter().enumerate() {
+            let assignment = TrackedPrintAssignment {
+                request_index,
+                factory_code: "F-1".into(),
+                device_type: request.device_type.clone(),
+                quantity: request.quantity,
+                flatpack: request.flatpack,
+            };
+            let tags = apply_provision_print_update(
+                &mut checkpoint,
+                &roles,
+                tag,
+                TrackedPrintUpdate::Preparing(assignment.clone()),
+            )
+            .expect("persist preparing")
+            .expect("submission tags");
+            assert!(tags.iter().any(|candidate| candidate == tag));
+            apply_provision_print_update(
+                &mut checkpoint,
+                &roles,
+                tag,
+                TrackedPrintUpdate::OperationRecorded {
+                    assignment,
+                    operation_id: format!("op-{request_index}"),
+                },
+            )
+            .expect("persist operation");
+        }
+
+        let manufacturing = checkpoint.manufacturing.as_ref().expect("manufacturing");
+        assert_eq!(manufacturing.matrix.operation_id.as_deref(), Some("op-0"));
+        assert_eq!(manufacturing.cradle.operation_id.as_deref(), Some("op-1"));
+        assert!(provision_pending_roles(&checkpoint).is_empty());
+    }
+
+    #[tokio::test]
+    async fn provision_first_queue_pass_sends_exactly_two_enqueue_requests() {
+        let server = MockServer::start().await;
+        let factory_code = "PROVISION-FIRST-F";
+        Mock::given(method("GET"))
+            .and(path(format!("/v1/devices/{factory_code}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "device_code": factory_code,
+                "device_type": "autofactory",
+                "location": "PROVISION-HOME",
+                "status": "idle",
+                "queue_size": 4,
+                "print_queue": [],
+                "available_commands": ["enqueue_print"]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!("/v1/devices/{factory_code}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status": "printing"
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let client = test_client_at(&server).await;
+        client
+            .devices()
+            .get(factory_code)
+            .await
+            .expect("seed Autofactory");
+        let tag = "dir-p:first-boundary";
+        let mut checkpoint = provision_fixture(tag);
+        let roles = provision_pending_roles(&checkpoint);
+        let requests = provision_tracked_requests(&checkpoint, &roles).expect("requests");
+        let blueprints = [
+            (
+                "empty_replicant_matrix".to_owned(),
+                replicant_printing::Blueprint {
+                    device_type: "empty_replicant_matrix".to_owned(),
+                    print_time_seconds: 10.0,
+                    features: Vec::new(),
+                    components: BTreeMap::new(),
+                },
+            ),
+            (
+                "racing_vessel".to_owned(),
+                replicant_printing::Blueprint {
+                    device_type: "racing_vessel".to_owned(),
+                    print_time_seconds: 20.0,
+                    features: Vec::new(),
+                    components: BTreeMap::new(),
+                },
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let report = queue_tracked_prints_once(
+            &client,
+            &requests,
+            &QueueOptions::at("PROVISION-HOME"),
+            &blueprints,
+            |update| apply_provision_print_update(&mut checkpoint, &roles, tag, update),
+        )
+        .await
+        .expect("queue both provisioning outputs");
+
+        assert_eq!(report.submissions.len(), 2);
+        assert!(provision_pending_roles(&checkpoint).is_empty());
+        server.verify().await;
+        client.close().await.expect("close client");
+    }
+    #[test]
+    fn provision_restart_adopts_both_queued_prints_without_duplicates() {
+        let tag = "dir-p:restart";
+        let mut checkpoint = provision_fixture(tag);
+        let report = reconcile_provision_evidence(
+            &mut checkpoint,
+            tag,
+            &[],
+            &provision_status(&[
+                ("F-1", "empty_replicant_matrix", tag),
+                ("F-1", "racing_vessel", tag),
+            ]),
+        )
+        .expect("reconcile");
+        assert_eq!(report.in_flight, 2);
+        assert!(provision_pending_roles(&checkpoint).is_empty());
+    }
+
+    #[test]
+    fn provision_accepted_operations_block_resubmission_without_devices() {
+        let mut checkpoint = provision_fixture("dir-p:accepted");
+        let manufacturing = checkpoint.manufacturing.as_mut().expect("manufacturing");
+        manufacturing.matrix.factory_code = Some("F-1".into());
+        manufacturing.matrix.submission_started = true;
+        manufacturing.matrix.operation_id = Some("op-matrix".into());
+        manufacturing.cradle.factory_code = Some("F-1".into());
+        manufacturing.cradle.submission_started = true;
+        manufacturing.cradle.operation_id = Some("op-vessel".into());
+        assert!(apply_provision_operation_status(
+            &mut manufacturing.matrix,
+            OperationStatus::Accepted,
+            false
+        ));
+        assert!(apply_provision_operation_status(
+            &mut manufacturing.cradle,
+            OperationStatus::AwaitingEvidence,
+            false
+        ));
+        assert!(manufacturing.matrix.accepted);
+        assert!(manufacturing.cradle.accepted);
+        assert!(provision_pending_roles(&checkpoint).is_empty());
+    }
+
+    #[test]
+    fn provision_only_definitive_rejection_reopens_print_deficit() {
+        for status in [
+            OperationStatus::Cancelled,
+            OperationStatus::Failed,
+            OperationStatus::Ambiguous,
+            OperationStatus::Submitted,
+            OperationStatus::ReconciliationRequired,
+        ] {
+            let mut print = new_provision_manufacturing("dir-p:status", "racing_vessel").matrix;
+            print.factory_code = Some("F-1".into());
+            print.submission_started = true;
+            print.operation_id = Some("op-matrix".into());
+            assert!(!apply_provision_operation_status(&mut print, status, false));
+            assert!(print.submission_started, "{status:?}");
+            assert_eq!(
+                print.operation_id.as_deref(),
+                Some("op-matrix"),
+                "{status:?}"
+            );
+        }
+
+        let mut rejected = new_provision_manufacturing("dir-p:rejected", "racing_vessel").matrix;
+        rejected.factory_code = Some("F-1".into());
+        rejected.submission_started = true;
+        rejected.operation_id = Some("op-rejected".into());
+        assert!(apply_provision_operation_status(
+            &mut rejected,
+            OperationStatus::Rejected,
+            false
+        ));
+        assert!(!rejected.submission_started);
+        assert!(rejected.operation_id.is_none());
+    }
+
+    #[test]
+    fn provision_partial_completion_waits_only_for_other_output() {
+        let tag = "dir-p:partial";
+        let mut checkpoint = provision_fixture(tag);
+        let report = reconcile_provision_evidence(
+            &mut checkpoint,
+            tag,
+            &[provision_device("M-1", "empty_replicant_matrix", tag)],
+            &provision_status(&[("F-1", "racing_vessel", tag)]),
+        )
+        .expect("reconcile");
+        assert_eq!(checkpoint.matrix.as_deref(), Some("M-1"));
+        assert!(checkpoint.cradle.is_none());
+        assert_eq!(report.completed, 1);
+        assert_eq!(report.in_flight, 1);
+        assert!(provision_pending_roles(&checkpoint).is_empty());
+    }
+
+    #[test]
+    fn provision_completed_outputs_are_adopted_and_ready_to_advance() {
+        let tag = "dir-p:complete";
+        let mut checkpoint = provision_fixture(tag);
+        let report = reconcile_provision_evidence(
+            &mut checkpoint,
+            tag,
+            &[
+                provision_device("M-1", "empty_replicant_matrix", tag),
+                provision_device("V-1", "racing_vessel", tag),
+            ],
+            &SystemPrintingStatus::default(),
+        )
+        .expect("reconcile");
+        assert_eq!(report.completed, 2);
+        assert_eq!(checkpoint.matrix.as_deref(), Some("M-1"));
+        assert_eq!(checkpoint.cradle.as_deref(), Some("V-1"));
+    }
+
+    #[test]
+    fn provision_duplicate_outputs_adopt_lexicographically_first_without_printing() {
+        let tag = "dir-p:duplicate";
+        let mut checkpoint = provision_fixture(tag);
+        let report = reconcile_provision_evidence(
+            &mut checkpoint,
+            tag,
+            &[
+                provision_device("M-9", "empty_replicant_matrix", tag),
+                provision_device("M-1", "empty_replicant_matrix", tag),
+                provision_device("V-8", "racing_vessel", tag),
+                provision_device("V-2", "racing_vessel", tag),
+            ],
+            &SystemPrintingStatus::default(),
+        )
+        .expect("reconcile");
+        assert_eq!(checkpoint.matrix.as_deref(), Some("M-1"));
+        assert_eq!(checkpoint.cradle.as_deref(), Some("V-2"));
+        assert_eq!(report.duplicate_outputs, 2);
+        assert!(provision_pending_roles(&checkpoint).is_empty());
+    }
+
+    #[test]
+    fn provision_cancelled_workflow_retains_accepted_print_intents() {
+        let mut checkpoint = provision_fixture("dir-p:cancelled");
+        let manufacturing = checkpoint.manufacturing.as_mut().expect("manufacturing");
+        manufacturing.matrix.submission_started = true;
+        manufacturing.matrix.accepted = true;
+        manufacturing.matrix.operation_id = Some("op-matrix".into());
+        manufacturing.cradle.submission_started = true;
+        manufacturing.cradle.accepted = true;
+        manufacturing.cradle.operation_id = Some("op-vessel".into());
+        let json = serde_json::to_value(&checkpoint).expect("serialize terminal checkpoint");
+        let mut recovered: ReplicantProvisionCheckpoint =
+            serde_json::from_value(json).expect("recover terminal checkpoint");
+        let report = reconcile_provision_evidence(
+            &mut recovered,
+            "dir-p:cancelled",
+            &[],
+            &provision_status(&[
+                ("F-1", "empty_replicant_matrix", "dir-p:cancelled"),
+                ("F-1", "racing_vessel", "dir-p:cancelled"),
+            ]),
+        )
+        .expect("reconcile accepted orphan work");
+
+        assert_eq!(report.in_flight, 2);
+        assert!(provision_pending_roles(&recovered).is_empty());
+        assert_eq!(
+            recovered
+                .manufacturing
+                .as_ref()
+                .expect("manufacturing")
+                .matrix
+                .operation_id
+                .as_deref(),
+            Some("op-matrix")
+        );
+    }
+
+    #[test]
+    fn provision_workflows_do_not_adopt_foreign_tagged_outputs() {
+        let own_tag = "dir-p:own";
+        let mut checkpoint = provision_fixture(own_tag);
+        let report = reconcile_provision_evidence(
+            &mut checkpoint,
+            own_tag,
+            &[
+                provision_device("M-FOREIGN", "empty_replicant_matrix", "dir-p:other"),
+                provision_device("V-FOREIGN", "racing_vessel", "dir-p:other"),
+                provision_device("M-OWN", "empty_replicant_matrix", own_tag),
+            ],
+            &SystemPrintingStatus::default(),
+        )
+        .expect("reconcile");
+        assert_eq!(checkpoint.matrix.as_deref(), Some("M-OWN"));
+        assert!(checkpoint.cradle.is_none());
+        assert_eq!(report.completed, 1);
+        assert_eq!(
+            provision_pending_roles(&checkpoint),
+            vec![ProvisionPrintRole::Cradle]
+        );
+    }
+
+    #[test]
+    fn provision_pre_operation_crash_is_ambiguous_and_never_resubmitted() {
+        let mut checkpoint = provision_fixture("dir-p:crash");
+        {
+            let manufacturing = checkpoint.manufacturing.as_mut().expect("manufacturing");
+            manufacturing.matrix.factory_code = Some("F-1".into());
+            manufacturing.matrix.submission_started = true;
+        }
+        let json = serde_json::to_value(&checkpoint).expect("persist preparing checkpoint");
+        let recovered: ReplicantProvisionCheckpoint =
+            serde_json::from_value(json).expect("recover preparing checkpoint");
+        assert_eq!(
+            provision_pending_roles(&recovered),
+            vec![ProvisionPrintRole::Cradle]
+        );
+        let matrix = &recovered
+            .manufacturing
+            .as_ref()
+            .expect("manufacturing")
+            .matrix;
+        assert!(!matrix.accepted);
+        assert!(matrix.operation_id.is_none());
+    }
 
     struct FixtureEventItemExecutor {
         calls: std::sync::atomic::AtomicUsize,
@@ -13726,6 +15207,97 @@ mod tests {
         );
 
         assert!(scan_tour_fleet_print_requests(1, 3).is_empty());
+    }
+
+    #[test]
+    fn scan_tour_factory_home_prefers_the_center_system() {
+        let locations = vec![
+            "SCEPTURUM-BELT-1".to_owned(),
+            "PHASYRIS-BELT-2".to_owned(),
+            "PHASYRIS-BELT-1".to_owned(),
+            "PHASYRIS-BELT-1".to_owned(),
+        ];
+
+        assert_eq!(
+            scan_tour_factory_home("PHASYRIS", &locations).as_deref(),
+            Some("PHASYRIS-BELT-1")
+        );
+    }
+
+    #[test]
+    fn scan_tour_reuses_complete_fleet_already_stowed_in_vessel() {
+        let controller = ScanTourFleetDeviceCandidate {
+            code: "CONTROLLER".to_owned(),
+            stowed: true,
+            controller: None,
+            // The live collection projection can omit the controller-side
+            // reverse relationship even while each drone points at it.
+            controlled_devices: BTreeSet::new(),
+        };
+        let drones = ["D1", "D2", "D3"]
+            .into_iter()
+            .map(|code| ScanTourFleetDeviceCandidate {
+                code: code.to_owned(),
+                stowed: true,
+                controller: Some("CONTROLLER".to_owned()),
+                controlled_devices: BTreeSet::new(),
+            })
+            .collect();
+
+        let availability = select_scan_tour_fleet_availability(vec![controller], drones)
+            .expect("select stowed survey fleet");
+
+        assert_eq!(availability.controllers, vec!["CONTROLLER".to_owned()]);
+        assert_eq!(
+            availability.drones,
+            vec!["D1".to_owned(), "D2".to_owned(), "D3".to_owned()]
+        );
+        assert_eq!(availability.stowed_selected, 4);
+        assert!(
+            scan_tour_fleet_print_requests(
+                availability.controllers.len(),
+                availability.drones.len(),
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn scan_tour_counts_partial_stowed_fleet_before_printing() {
+        let controller = ScanTourFleetDeviceCandidate {
+            code: "CONTROLLER".to_owned(),
+            stowed: true,
+            controller: None,
+            controlled_devices: BTreeSet::new(),
+        };
+        let drones = vec![
+            ScanTourFleetDeviceCandidate {
+                code: "D1".to_owned(),
+                stowed: true,
+                controller: Some("CONTROLLER".to_owned()),
+                controlled_devices: BTreeSet::new(),
+            },
+            ScanTourFleetDeviceCandidate {
+                code: "D2".to_owned(),
+                stowed: true,
+                controller: Some("CONTROLLER".to_owned()),
+                controlled_devices: BTreeSet::new(),
+            },
+        ];
+
+        let availability = select_scan_tour_fleet_availability(vec![controller], drones)
+            .expect("select partial stowed survey fleet");
+
+        assert_eq!(availability.controllers, vec!["CONTROLLER".to_owned()]);
+        assert_eq!(availability.drones, vec!["D1".to_owned(), "D2".to_owned()]);
+        assert_eq!(availability.stowed_selected, 3);
+        assert_eq!(
+            scan_tour_fleet_print_requests(
+                availability.controllers.len(),
+                availability.drones.len(),
+            ),
+            vec![PrintRequest::new("survey_drone", 1)]
+        );
     }
 
     #[test]
@@ -15031,7 +16603,11 @@ mod tests {
             specs
                 .iter()
                 .all(|spec| spec.requirements_json[0]["capabilities"]
-                    == serde_json::json!(["census", "system_scan"]))
+                    == serde_json::json!([
+                        "census",
+                        "system_scan",
+                        OPERATIONAL_REGIONAL_WORKER_CAPABILITY
+                    ]))
         );
         assert!(
             specs
@@ -15079,10 +16655,24 @@ mod tests {
         assert!(!belt_worker_candidate(&candidate(&[])));
         assert!(!belt_worker_candidate(&candidate(&["census"])));
         assert!(!belt_worker_candidate(&candidate(&["system_scan"])));
-        assert!(belt_worker_candidate(&candidate(&[
+        assert!(!belt_worker_candidate(&candidate(&[
             "census",
             "system_scan"
         ])));
+        assert!(belt_worker_candidate(&candidate(&[
+            "census",
+            "system_scan",
+            OPERATIONAL_REGIONAL_WORKER_CAPABILITY
+        ])));
+    }
+
+    #[test]
+    fn scan_tour_waits_while_assigned_worker_is_in_transit() {
+        assert_eq!(
+            scan_tour_worker_wait_reason(WorkerState::InTransit),
+            Some("assigned regional workers are still in transit")
+        );
+        assert_eq!(scan_tour_worker_wait_reason(WorkerState::Operational), None);
     }
 
     #[test]
@@ -15771,7 +17361,7 @@ mod tests {
             (
                 replicant_provision_workflow_kind(),
                 serde_json::json!({"region":"alpha","home":"HOME","source_replicant":"REP"}),
-                serde_json::json!({"tag":null,"matrix":null,"cradle":null,"stowed":false,"new_replicant":null}),
+                serde_json::json!({"tag":null,"manufacturing":null,"matrix":null,"cradle":null,"stowed":false,"new_replicant":null}),
                 1,
             ),
             (
@@ -16879,6 +18469,7 @@ mod tests {
             system_status: None,
             active_directive: None,
             travel: None,
+            runtime: Default::default(),
             access: AccessScope::Owned,
         }
     }

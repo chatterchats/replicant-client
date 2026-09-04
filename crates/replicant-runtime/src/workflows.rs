@@ -3486,7 +3486,13 @@ fn allocation_candidate_belongs_to_region(
         .and_then(|location| location.region.as_deref())
         .map(crate::canonical_region);
     match &candidate.resource {
-        ResourceKey::Replicant(code) => workers.contains(code),
+        ResourceKey::Replicant(code) => {
+            workers.contains(code)
+                && physical_region.as_deref() == Some(requested_region)
+                && candidate.capabilities.iter().any(|capability| {
+                    capability == crate::worker_state::OPERATIONAL_REGIONAL_WORKER_CAPABILITY
+                })
+        }
         ResourceKey::Device(code) | ResourceKey::Autofactory(code) => {
             physical_region.as_deref().map_or_else(
                 || regional_devices.contains(code),

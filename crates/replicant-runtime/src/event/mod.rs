@@ -13,6 +13,7 @@ use crate::{
     config::ManagedClientConfig,
     failure::{FailureClass, classified_error},
     start_managed_client,
+    worker_state::OPERATIONAL_REGIONAL_WORKER_CAPABILITY,
 };
 use replicant_client::{Client, Replicant, Star, SyncDomain, raw};
 use replicant_event_planner::{
@@ -22,7 +23,7 @@ use replicant_event_planner::{
 };
 use replicant_workflow::{
     AllocationSet, RequirementScope, ResourceKey, ResourceRequirement, WorkItemSpec, WorkflowId,
-    WorkflowKind, WorkflowRepository,
+    WorkflowKind, WorkflowRepository, WorkflowTarget,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -695,6 +696,35 @@ pub(crate) fn event_mission_target_system(plan_file: &Path) -> AnyResult<String>
     Ok(system_from_location(&mission.event.location))
 }
 
+/// Returns the exact structured workflow target retained by one event mission.
+pub(crate) fn event_mission_workflow_target(plan_file: &Path) -> AnyResult<WorkflowTarget> {
+    let mission = load_plan(plan_file)?;
+    Ok(WorkflowTarget::Event {
+        event_id: mission.event.designation.clone(),
+        system: system_from_location(&mission.event.location),
+        location: mission.event.location.clone(),
+    })
+}
+
+/// Returns every exact event target retained by an archived regional campaign.
+pub(crate) fn event_campaign_workflow_targets(
+    archive: &EventCampaignArchive,
+) -> AnyResult<Vec<WorkflowTarget>> {
+    let mut targets = BTreeMap::<String, WorkflowTarget>::new();
+    for mission_json in archive.mission_json.values() {
+        let mission: EventMissionPlan = serde_json::from_str(mission_json)?;
+        targets.insert(
+            mission.event.designation.clone(),
+            WorkflowTarget::Event {
+                event_id: mission.event.designation.clone(),
+                system: system_from_location(&mission.event.location),
+                location: mission.event.location.clone(),
+            },
+        );
+    }
+    Ok(targets.into_values().collect())
+}
+
 /// Persisted routing/planning identity needed by durable event preflight.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct EventMissionPreflight {
@@ -853,7 +883,7 @@ fn event_stage_requirements(
     let mut requirements = vec![ResourceRequirement {
         key: "worker".into(),
         kind: "replicant".into(),
-        capabilities: Vec::new(),
+        capabilities: vec![OPERATIONAL_REGIONAL_WORKER_CAPABILITY.into()],
         scope: RequirementScope::Region(region.to_owned()),
         count: 1,
         quantity: 1,
