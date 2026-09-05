@@ -184,10 +184,11 @@ export function InspectorShell({
               entityIdCopied ? "Entity ID copied" : `Copy ${summary.entity.id}`
             }
             onClick={() => {
-              if (!navigator.clipboard) return;
               void navigator.clipboard
                 .writeText(summary.entity.id)
-                .then(() => setCopiedEntityId(summary.entity.id))
+                .then(() => {
+                  setCopiedEntityId(summary.entity.id);
+                })
                 .catch(() => undefined);
             }}
           >
@@ -220,9 +221,9 @@ export function InspectorShell({
                   aria-label="Inspector history"
                   value={navigation.position}
                   title={`${String(navigation.position + 1)} of ${String(navigation.total)}`}
-                  onChange={(event) =>
-                    navigation.onJump(Number(event.target.value))
-                  }
+                  onChange={(event) => {
+                    navigation.onJump(Number(event.target.value));
+                  }}
                 >
                   {navigation.entries.map((entry) => (
                     <option key={entry.index} value={entry.index}>

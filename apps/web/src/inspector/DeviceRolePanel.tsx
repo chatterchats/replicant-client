@@ -182,6 +182,8 @@ function controllerTitle(type: string) {
   return "Controller summary";
 }
 
+// Exported for focused role-classification tests; the component remains the runtime surface.
+// eslint-disable-next-line react-refresh/only-export-components
 export function deviceRoleProfile(
   device: DeviceSummary,
   detail?: DeviceInspectorSummary,
@@ -265,6 +267,7 @@ export function deviceRoleProfile(
   }
 
   if (type === "mining_drone") {
+    const belt = runtimeText(detail?.runtime.mining, "belt");
     return {
       title: "Mining drone summary",
       fields: [
@@ -274,13 +277,8 @@ export function deviceRoleProfile(
         },
         {
           label: "Belt",
-          value: runtimeText(detail?.runtime.mining, "belt"),
-          relation: runtimeText(detail?.runtime.mining, "belt")
-            ? {
-                kind: "location",
-                id: runtimeText(detail?.runtime.mining, "belt")!,
-              }
-            : null,
+          value: belt,
+          relation: belt ? { kind: "location", id: belt } : null,
         },
         {
           label: "Density",
@@ -581,27 +579,30 @@ export function DeviceRolePanel({
     <section className="inspector-section inspector-role-panel">
       <h3>{profile.title}</h3>
       <dl className="inspector-role-facts">
-        {fields.map((field) => (
-          <div key={field.label}>
-            <dt>{field.label}</dt>
-            <dd>
-              {field.relation ? (
-                <button
-                  type="button"
-                  className="inspector-inline-link"
-                  disabled={!onNavigate}
-                  onClick={() =>
-                    onNavigate?.(field.relation!.kind, field.relation!.id)
-                  }
-                >
-                  {display(field.value)}
-                </button>
-              ) : (
-                display(field.value)
-              )}
-            </dd>
-          </div>
-        ))}
+        {fields.map((field) => {
+          const relation = field.relation;
+          return (
+            <div key={field.label}>
+              <dt>{field.label}</dt>
+              <dd>
+                {relation ? (
+                  <button
+                    type="button"
+                    className="inspector-inline-link"
+                    disabled={!onNavigate}
+                    onClick={() => {
+                      onNavigate?.(relation.kind, relation.id);
+                    }}
+                  >
+                    {display(field.value)}
+                  </button>
+                ) : (
+                  display(field.value)
+                )}
+              </dd>
+            </div>
+          );
+        })}
       </dl>
     </section>
   );

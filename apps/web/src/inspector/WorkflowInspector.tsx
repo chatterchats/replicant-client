@@ -54,7 +54,10 @@ export function WorkflowInspector({
               <button
                 type="button"
                 disabled={!onNavigate}
-                onClick={() => onNavigate?.("workflow", detail.parent_id!)}
+                onClick={() => {
+                  if (detail.parent_id)
+                    onNavigate?.("workflow", detail.parent_id);
+                }}
               >
                 <strong>Parent workflow</strong>
                 <small>{detail.parent_id}</small>

@@ -80,7 +80,10 @@ export function SystemInspector({
               <button
                 type="button"
                 disabled={!onNavigate}
-                onClick={() => onNavigate?.("location", detail.entry_point!)}
+                onClick={() => {
+                  if (detail.entry_point)
+                    onNavigate?.("location", detail.entry_point);
+                }}
               >
                 <strong>Entry point</strong>
                 <small>{detail.entry_point}</small>

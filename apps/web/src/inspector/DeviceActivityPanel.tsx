@@ -308,17 +308,14 @@ function PrintQueue({ jobs }: { jobs: Record<string, unknown>[] }) {
       <ol className="inspector-job-list">
         {jobs.map((job, index) => {
           const progress = number(job.progress_percent);
+          const deviceType = text(job.device_type);
+          const quantity = number(job.quantity);
+          const status = text(job.status);
           return (
-            <li key={`${String(job.device_type ?? "job")}:${String(index)}`}>
-              <strong>
-                {text(job.device_type) ?? `Job ${String(index + 1)}`}
-              </strong>
-              {number(job.quantity) !== null ? (
-                <span>× {number(job.quantity)}</span>
-              ) : null}
-              {text(job.status) ? (
-                <small>{humanize(text(job.status)!)}</small>
-              ) : null}
+            <li key={`${deviceType ?? "job"}:${String(index)}`}>
+              <strong>{deviceType ?? `Job ${String(index + 1)}`}</strong>
+              {quantity !== null ? <span>× {quantity}</span> : null}
+              {status ? <small>{humanize(status)}</small> : null}
               {progress !== null ? (
                 <div className="inspector-job-progress">
                   <progress

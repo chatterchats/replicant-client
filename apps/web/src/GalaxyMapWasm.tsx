@@ -5,16 +5,34 @@ import type { GalaxySceneSnapshot, GalaxyStar } from "./protocol";
 import { recordWebEvent } from "./telemetry";
 
 const CAMERA_KEY = "replicant.galaxy.camera";
-type RendererModule =
-  typeof import("./wasm/galaxy_renderer/galaxy_renderer.js");
+
+interface RendererModule {
+  default: () => unknown | Promise<unknown>;
+  GalaxyRenderer: new (canvas: HTMLCanvasElement) => Renderer;
+}
+
 let rendererModule: Promise<RendererModule> | undefined;
 
-function loadRenderer() {
+function isRendererModule(value: unknown): value is RendererModule {
+  if (typeof value !== "object" || value === null) return false;
+  const module = value as Record<string, unknown>;
+  return (
+    typeof module.default === "function" &&
+    typeof module.GalaxyRenderer === "function"
+  );
+}
+
+function loadRenderer(): Promise<RendererModule> {
   return (rendererModule ??=
-    import("./wasm/galaxy_renderer/galaxy_renderer.js").then(async (module) => {
-      await module.default();
-      return module;
-    }));
+    import("./wasm/galaxy_renderer/galaxy_renderer.js").then(
+      async (module: unknown) => {
+        if (!isRendererModule(module)) {
+          throw new Error("galaxy renderer module has an unexpected shape");
+        }
+        await module.default();
+        return module;
+      },
+    ));
 }
 
 interface Camera {
@@ -148,7 +166,7 @@ export function GalaxyMapWasm({
         const canvas = canvasRef.current;
         if (!canvas) return;
         if (controller.signal.aborted) return;
-        const renderer = new GalaxyRenderer(canvas) as Renderer;
+        const renderer = new GalaxyRenderer(canvas);
         rendererRef.current = renderer;
         const camera = savedCamera();
         renderer.set_camera(

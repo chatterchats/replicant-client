@@ -510,25 +510,25 @@ function historyLabel(
 }
 
 export function Inspector(props: InspectorProps) {
+  const { entity, entities, onSelectEntity } = props;
   const [history, setHistory] = useState<{
     entries: SelectedEntity[];
     index: number;
   }>(() => ({
-    entries: [props.entity],
+    entries: [entity],
     index: 0,
   }));
 
   useEffect(() => {
     setHistory((current) => {
-      if (sameEntity(current.entries[current.index], props.entity))
-        return current;
+      if (sameEntity(current.entries[current.index], entity)) return current;
       const entries = [
         ...current.entries.slice(0, current.index + 1),
-        props.entity,
+        entity,
       ].slice(-50);
       return { entries, index: entries.length - 1 };
     });
-  }, [props.entity.kind, props.entity.id]);
+  }, [entity]);
 
   const selectFromInspector = (entity: SelectedEntity) => {
     setHistory((current) => {
@@ -539,7 +539,7 @@ export function Inspector(props: InspectorProps) {
       ].slice(-50);
       return { entries, index: entries.length - 1 };
     });
-    props.onSelectEntity(entity);
+    onSelectEntity(entity);
   };
 
   const selectHistoryIndex = useCallback(
@@ -553,9 +553,9 @@ export function Inspector(props: InspectorProps) {
       const entity = history.entries[index];
       if (!entity) return;
       setHistory((current) => ({ ...current, index }));
-      props.onSelectEntity(entity);
+      onSelectEntity(entity);
     },
-    [history.entries, history.index, props.onSelectEntity],
+    [history.entries, history.index, onSelectEntity],
   );
 
   const goBack = () => {
@@ -590,16 +590,13 @@ export function Inspector(props: InspectorProps) {
   const navigation: InspectorNavigationControls = {
     canGoBack: history.index > 0,
     canGoForward: history.index < history.entries.length - 1,
-    backLabel: historyLabel(history.entries[history.index - 1], props.entities),
-    forwardLabel: historyLabel(
-      history.entries[history.index + 1],
-      props.entities,
-    ),
+    backLabel: historyLabel(history.entries[history.index - 1], entities),
+    forwardLabel: historyLabel(history.entries[history.index + 1], entities),
     position: history.index,
     total: history.entries.length,
     entries: history.entries.map((entry, index) => ({
       index,
-      label: historyLabel(entry, props.entities) ?? `${entry.kind} ${entry.id}`,
+      label: historyLabel(entry, entities) ?? `${entry.kind} ${entry.id}`,
     })),
     onBack: goBack,
     onForward: goForward,

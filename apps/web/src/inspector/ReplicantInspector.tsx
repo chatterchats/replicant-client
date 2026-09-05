@@ -42,7 +42,9 @@ export function ReplicantInspector({
               <li>
                 <button
                   type="button"
-                  onClick={() => onNavigate("system", detail.system!)}
+                  onClick={() => {
+                    if (detail.system) onNavigate("system", detail.system);
+                  }}
                 >
                   <strong>System</strong>
                   <small>{detail.system}</small>
@@ -53,7 +55,10 @@ export function ReplicantInspector({
               <li>
                 <button
                   type="button"
-                  onClick={() => onNavigate("location", detail.location!)}
+                  onClick={() => {
+                    if (detail.location)
+                      onNavigate("location", detail.location);
+                  }}
                 >
                   <strong>Location</strong>
                   <small>{detail.location}</small>
@@ -64,12 +69,11 @@ export function ReplicantInspector({
               <li>
                 <button
                   type="button"
-                  onClick={() =>
-                    onNavigate(
-                      detail.hosted_device!.kind,
-                      detail.hosted_device!.id,
-                    )
-                  }
+                  onClick={() => {
+                    const hostedDevice = detail.hosted_device;
+                    if (hostedDevice)
+                      onNavigate(hostedDevice.kind, hostedDevice.id);
+                  }}
                 >
                   <strong>Hosted vessel</strong>
                   <small>{detail.hosted_device.id}</small>
@@ -80,7 +84,10 @@ export function ReplicantInspector({
               <li>
                 <button
                   type="button"
-                  onClick={() => onNavigate("workflow", detail.workflow_id!)}
+                  onClick={() => {
+                    if (detail.workflow_id)
+                      onNavigate("workflow", detail.workflow_id);
+                  }}
                 >
                   <strong>Active workflow</strong>
                   <small>{detail.workflow_id}</small>

@@ -397,12 +397,12 @@ export function InventoryContent({
                       <td>
                         <button
                           className="entity-link"
-                          onClick={() =>
+                          onClick={() => {
                             onSelectEntity({
                               kind: "resource",
                               id: row.resource,
-                            })
-                          }
+                            });
+                          }}
                         >
                           <strong>{row.resource}</strong>
                         </button>

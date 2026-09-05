@@ -391,19 +391,19 @@ export interface DeviceRuntimeInspectorSummary {
   created_at: string | null;
   short_description: string | null;
   description: string | null;
-  printing: unknown | null;
-  mining: unknown | null;
-  prospect: unknown | null;
-  repair: unknown | null;
-  scan: unknown | null;
-  waiting_for: unknown | null;
+  printing: unknown;
+  mining: unknown;
+  prospect: unknown;
+  repair: unknown;
+  scan: unknown;
+  waiting_for: unknown;
   print_queue: Record<string, unknown>[];
   queue_size: number | null;
   taxi_mode: string | null;
   tracking_site_id: number | null;
   beacon_only: boolean | null;
   welcome_message: string | null;
-  repair_paid_pct: unknown | null;
+  repair_paid_pct: unknown;
 }
 
 export interface DeviceInspectorSummary {

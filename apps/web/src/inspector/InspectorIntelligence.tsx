@@ -60,6 +60,8 @@ function targetApplies(entity: SelectedEntity, target: WorkflowTargetSummary) {
   return false;
 }
 
+// Exported for Inspector composition and focused association tests.
+// eslint-disable-next-line react-refresh/only-export-components
 export function associatedWorkflowIds(
   entity: SelectedEntity,
   snapshot: EntityInspectorSnapshot | undefined,
@@ -184,7 +186,9 @@ function WorkflowOwnershipContext({
               <button
                 type="button"
                 className="inspector-context-link"
-                onClick={() => onNavigate("workflow", target.workflow_id)}
+                onClick={() => {
+                  onNavigate("workflow", target.workflow_id);
+                }}
               >
                 <strong>{workflow?.kind ?? target.workflow_id}</strong>
                 <small>
@@ -236,7 +240,9 @@ function ReservationContext({
               <button
                 type="button"
                 className="inspector-context-link"
-                onClick={() => onNavigate("workflow", reservation.workflow_id)}
+                onClick={() => {
+                  onNavigate("workflow", reservation.workflow_id);
+                }}
               >
                 <strong>{reservation.requirement_key}</strong>
                 <small>
@@ -277,7 +283,9 @@ function AutomationContext({
               <button
                 type="button"
                 className="inspector-context-link"
-                onClick={() => onNavigate("workflow", requirement.workflow_id)}
+                onClick={() => {
+                  onNavigate("workflow", requirement.workflow_id);
+                }}
               >
                 <strong>{requirement.name}</strong>
                 <small>
@@ -297,7 +305,9 @@ function AutomationContext({
               <button
                 type="button"
                 className="inspector-context-link"
-                onClick={() => onNavigate("workflow", workflow.id)}
+                onClick={() => {
+                  onNavigate("workflow", workflow.id);
+                }}
               >
                 <strong>{workflow.kind}</strong>
                 <small>
@@ -436,7 +446,9 @@ function DirectorContext({
                       key={workflowId(id)}
                       type="button"
                       className="subtle-link"
-                      onClick={() => onNavigate("workflow", workflowId(id))}
+                      onClick={() => {
+                        onNavigate("workflow", workflowId(id));
+                      }}
                     >
                       {workflowId(id)}
                     </button>
@@ -464,7 +476,9 @@ function DirectorContext({
                       key={workflowId(id)}
                       type="button"
                       className="subtle-link"
-                      onClick={() => onNavigate("workflow", workflowId(id))}
+                      onClick={() => {
+                        onNavigate("workflow", workflowId(id));
+                      }}
                     >
                       {workflowId(id)}
                     </button>
@@ -497,7 +511,8 @@ function componentSize(
   const visited = new Set([start]);
   const queue = [start];
   while (queue.length) {
-    const current = queue.shift()!;
+    const current = queue.shift();
+    if (current === undefined) break;
     for (const neighbor of adjacency.get(current) ?? []) {
       if (!visited.has(neighbor)) {
         visited.add(neighbor);
@@ -557,7 +572,7 @@ function ConnectivityContext({
           { label: "Direct mesh neighbors", value: neighbors.length },
           {
             label: "Mesh component",
-            value: component ? `${component} systems` : "Not connected",
+            value: component ? `${String(component)} systems` : "Not connected",
           },
         ]}
       />
@@ -568,7 +583,9 @@ function ConnectivityContext({
               <button
                 type="button"
                 className="inspector-context-link"
-                onClick={() => onNavigate("device", relay.entity.id)}
+                onClick={() => {
+                  onNavigate("device", relay.entity.id);
+                }}
               >
                 <strong>{relay.device_type ?? relay.entity.id}</strong>
                 <small>
@@ -588,7 +605,9 @@ function ConnectivityContext({
                 key={neighbor}
                 type="button"
                 className="subtle-link"
-                onClick={() => onNavigate("system", neighbor)}
+                onClick={() => {
+                  onNavigate("system", neighbor);
+                }}
               >
                 {neighbor}
               </button>
@@ -605,7 +624,9 @@ function ConnectivityContext({
                 <button
                   type="button"
                   className="inspector-context-link"
-                  onClick={() => onNavigate("workflow", expansion.workflow.id)}
+                  onClick={() => {
+                    onNavigate("workflow", expansion.workflow.id);
+                  }}
                 >
                   <strong>{expansion.workflow.kind}</strong>
                   <small>
@@ -688,9 +709,9 @@ function InventoryContext({
                   <button
                     type="button"
                     className="inspector-context-link"
-                    onClick={() =>
-                      onNavigate("workflow", reservation.workflow_id)
-                    }
+                    onClick={() => {
+                      onNavigate("workflow", reservation.workflow_id);
+                    }}
                   >
                     <strong>
                       {reservation.quantity.toLocaleString()} reserved
@@ -720,9 +741,9 @@ function InventoryContext({
                       type="button"
                       className="inspector-context-link"
                       disabled={!target}
-                      onClick={() =>
-                        target && onNavigate(target.kind, target.id)
-                      }
+                      onClick={() => {
+                        if (target) onNavigate(target.kind, target.id);
+                      }}
                     >
                       <strong>
                         {item.location ?? item.system ?? item.owner}
@@ -798,7 +819,9 @@ function InventoryContext({
             <button
               type="button"
               className="inspector-context-link"
-              onClick={() => onNavigate("resource", resource)}
+              onClick={() => {
+                onNavigate("resource", resource);
+              }}
             >
               <strong>{resource}</strong>
               <small>{quantity.toLocaleString()} units</small>

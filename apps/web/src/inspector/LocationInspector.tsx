@@ -169,7 +169,9 @@ export function LocationInspector({
                 <button
                   type="button"
                   disabled={!onNavigate}
-                  onClick={() => onNavigate?.("system", detail.system!)}
+                  onClick={() => {
+                    if (detail.system) onNavigate?.("system", detail.system);
+                  }}
                 >
                   <strong>System</strong>
                   <small>{detail.system}</small>
@@ -181,7 +183,9 @@ export function LocationInspector({
                 <button
                   type="button"
                   disabled={!onNavigate}
-                  onClick={() => onNavigate?.("location", detail.parent!)}
+                  onClick={() => {
+                    if (detail.parent) onNavigate?.("location", detail.parent);
+                  }}
                 >
                   <strong>Parent location</strong>
                   <small>{detail.parent}</small>

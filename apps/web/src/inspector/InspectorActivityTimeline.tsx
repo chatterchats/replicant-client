@@ -105,6 +105,7 @@ function Timeline({
   return (
     <ol className="inspector-timeline">
       {items.map((item) => {
+        const workflowId = item.workflowId;
         const content = (
           <>
             <span className="inspector-timeline-meta">
@@ -119,11 +120,13 @@ function Timeline({
         );
         return (
           <li key={item.id} className={`inspector-timeline-item ${item.level}`}>
-            {item.workflowId ? (
+            {workflowId ? (
               <button
                 type="button"
                 className="inspector-timeline-link"
-                onClick={() => onNavigate("workflow", item.workflowId!)}
+                onClick={() => {
+                  onNavigate("workflow", workflowId);
+                }}
               >
                 {content}
               </button>
@@ -139,14 +142,15 @@ function Timeline({
 
 function EntityTimeline({
   entity,
+  filter,
   workflowActivity,
   onNavigate,
 }: {
   entity: SelectedEntity;
+  filter: NonNullable<ReturnType<typeof activityFilter>>;
   workflowActivity: WorkflowActivity[];
   onNavigate: (kind: string, id: string) => void;
 }) {
-  const filter = activityFilter(entity)!;
   const queryKey = `inspector:activity:${entity.kind}:${entity.id}`;
   const history = useDomainQuery({
     slice: "activity",
@@ -194,6 +198,7 @@ export function InspectorActivityTimeline({
     return (
       <EntityTimeline
         entity={entity}
+        filter={filter}
         workflowActivity={workflowActivity}
         onNavigate={onNavigate}
       />
