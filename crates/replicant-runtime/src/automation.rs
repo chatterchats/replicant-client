@@ -12556,9 +12556,8 @@ fn select_scan_tour_fleet_availability(
     preferred_replicant: Option<&str>,
 ) -> Result<ScanTourFleetAvailability, String> {
     let assigned_to_preferred = |candidate: &ScanTourFleetDeviceCandidate| {
-        preferred_replicant.is_some_and(|replicant| {
-            candidate.assigned_replicant.as_deref() == Some(replicant)
-        })
+        preferred_replicant
+            .is_some_and(|replicant| candidate.assigned_replicant.as_deref() == Some(replicant))
     };
     controllers.sort_by(|left, right| {
         right
@@ -16481,11 +16480,7 @@ mod tests {
             stowed: false,
             assigned_replicant: Some("R-1".to_owned()),
             controller: None,
-            controlled_devices: BTreeSet::from([
-                "D1".to_owned(),
-                "D2".to_owned(),
-                "D3".to_owned(),
-            ]),
+            controlled_devices: BTreeSet::from(["D1".to_owned(), "D2".to_owned(), "D3".to_owned()]),
         };
         let drones = ["D1", "D2", "D3"]
             .into_iter()
@@ -16498,8 +16493,9 @@ mod tests {
             })
             .collect();
 
-        let availability = select_scan_tour_fleet_availability(vec![controller], drones, Some("R-1"))
-            .expect("select adopted survey fleet");
+        let availability =
+            select_scan_tour_fleet_availability(vec![controller], drones, Some("R-1"))
+                .expect("select adopted survey fleet");
 
         assert_eq!(availability.controllers, vec!["CONTROLLER".to_owned()]);
         assert_eq!(
@@ -16551,13 +16547,15 @@ mod tests {
             ("Z-D3", "Z-MATCH", "R-TARGET"),
         ]
         .into_iter()
-        .map(|(code, controller, replicant)| ScanTourFleetDeviceCandidate {
-            code: code.to_owned(),
-            stowed: false,
-            assigned_replicant: Some(replicant.to_owned()),
-            controller: Some(controller.to_owned()),
-            controlled_devices: BTreeSet::new(),
-        })
+        .map(
+            |(code, controller, replicant)| ScanTourFleetDeviceCandidate {
+                code: code.to_owned(),
+                stowed: false,
+                assigned_replicant: Some(replicant.to_owned()),
+                controller: Some(controller.to_owned()),
+                controlled_devices: BTreeSet::new(),
+            },
+        )
         .collect();
 
         let availability =
