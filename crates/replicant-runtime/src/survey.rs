@@ -259,6 +259,18 @@ fn device_attached_to(device: &Device) -> Option<&str> {
         .map(|value| value.id.as_str())
 }
 
+fn effective_survey_carrier<'a>(
+    attached_to: Option<&'a str>,
+    stowed_in: Option<&str>,
+    required_vessel: &str,
+) -> Option<&'a str> {
+    if stowed_in == Some(required_vessel) {
+        None
+    } else {
+        attached_to
+    }
+}
+
 fn device_controller(device: &Device) -> Option<&str> {
     device
         .relationships
@@ -3918,8 +3930,24 @@ async fn detach_survey_fleet_from_carriers(
         let device = refresh_device_snapshot(client, code).await?;
         ensure_device_replicant(&device, code, &config.replicant)?;
 
-        if device_stowed_in(&device) != Some(config.vessel.as_str())
-            && let Some(location) = device_location(&device)
+        let stowed_in = device_stowed_in(&device);
+        let attached_to = device_attached_to(&device);
+        if stowed_in == Some(config.vessel.as_str()) {
+            if let Some(carrier) = attached_to {
+                warn!(
+                    target: "replicant_client::explore",
+                    event = "survey.stale_attachment_ignored",
+                    device = code,
+                    carrier,
+                    vessel = %config.vessel,
+                    star = target,
+                    "survey-fleet device is stowed in the required vessel; ignoring a contradictory carrier attachment"
+                );
+            }
+            continue;
+        }
+
+        if let Some(location) = device_location(&device)
             && !designation_in_star(location, target)
         {
             return Err(app_error(
@@ -3930,7 +3958,9 @@ async fn detach_survey_fleet_from_carriers(
             ));
         }
 
-        if let Some(carrier) = device_attached_to(&device) {
+        if let Some(carrier) =
+            effective_survey_carrier(attached_to, stowed_in, config.vessel.as_str())
+        {
             by_carrier
                 .entry(carrier.to_owned())
                 .or_default()
@@ -4035,7 +4065,11 @@ async fn detach_survey_fleet_from_carriers(
 
     for code in std::iter::once(controller).chain(plan.drones.iter().map(String::as_str)) {
         let device = refresh_device_snapshot(client, code).await?;
-        if let Some(carrier) = device_attached_to(&device) {
+        if let Some(carrier) = effective_survey_carrier(
+            device_attached_to(&device),
+            device_stowed_in(&device),
+            config.vessel.as_str(),
+        ) {
             return Err(app_error(
                 io::ErrorKind::InvalidData,
                 format!(
@@ -4128,7 +4162,10 @@ async fn run_survey(
     let started = Instant::now();
     let mut last_history_check = Instant::now();
     let mut last_capacity_check = Instant::now();
+    let mut pending_completion_proof = None;
+    let mut last_completion_reconcile = Instant::now();
     const HISTORY_CHECK_INTERVAL: Duration = Duration::from_secs(30);
+    const COMPLETION_RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
 
     loop {
         if started.elapsed() >= config.survey_timeout {
@@ -4144,13 +4181,18 @@ async fn run_survey(
                 );
                 return Ok(SurveyRunOutcome::MaintenanceRequired);
             }
-            return Err(app_error(
-                io::ErrorKind::TimedOut,
+            let message = if let Some(proof) = pending_completion_proof {
+                format!(
+                    "survey at {target} observed {proof:?}, but authoritative planet/moon state did not reconcile within {:?}; the plan remains resumable",
+                    config.survey_timeout
+                )
+            } else {
                 format!(
                     "survey at {target} exceeded {:?}; fleet capacity remains above the maintenance threshold and the plan remains resumable",
                     config.survey_timeout
-                ),
-            ));
+                )
+            };
+            return Err(app_error(io::ErrorKind::TimedOut, message));
         }
 
         // History and maintenance deadlines advance independently of the live
@@ -4161,7 +4203,13 @@ async fn run_survey(
         let until_capacity = config
             .maintenance_check_interval
             .saturating_sub(last_capacity_check.elapsed());
-        let wait_for = until_timeout.min(until_history).min(until_capacity);
+        let until_completion = pending_completion_proof.map_or(until_timeout, |_| {
+            COMPLETION_RECONCILE_INTERVAL.saturating_sub(last_completion_reconcile.elapsed())
+        });
+        let wait_for = until_timeout
+            .min(until_history)
+            .min(until_capacity)
+            .min(until_completion);
 
         match tokio::time::timeout(wait_for, watch.next()).await {
             Ok(Ok(event)) => {
@@ -4194,13 +4242,34 @@ async fn run_survey(
                         elapsed_ms = started.elapsed().as_millis() as u64,
                         "survey completion has event evidence; reconciling planet and moon completeness"
                     );
-                    confirm_survey_completion(client, config, target, proof).await?;
-                    return Ok(SurveyRunOutcome::Completed);
+                    match confirm_survey_completion(client, config, target, proof).await? {
+                        SurveyCompletionReconciliation::Confirmed => {
+                            return Ok(SurveyRunOutcome::Completed);
+                        }
+                        SurveyCompletionReconciliation::Pending => {
+                            pending_completion_proof = Some(proof);
+                            last_completion_reconcile = Instant::now();
+                        }
+                    }
                 }
             }
             Ok(Err(error)) => return Err(error.into()),
             Err(_) => {
                 let mut logged_wait = false;
+
+                if let Some(proof) = pending_completion_proof
+                    && last_completion_reconcile.elapsed() >= COMPLETION_RECONCILE_INTERVAL
+                {
+                    last_completion_reconcile = Instant::now();
+                    match confirm_survey_completion(client, config, target, proof).await? {
+                        SurveyCompletionReconciliation::Confirmed => {
+                            return Ok(SurveyRunOutcome::Completed);
+                        }
+                        SurveyCompletionReconciliation::Pending => {
+                            logged_wait = true;
+                        }
+                    }
+                }
 
                 if last_history_check.elapsed() >= HISTORY_CHECK_INTERVAL {
                     last_history_check = Instant::now();
@@ -4224,8 +4293,15 @@ async fn run_survey(
                                 elapsed_ms = started.elapsed().as_millis() as u64,
                                 "found missed survey completion in local durable event history"
                             );
-                            confirm_survey_completion(client, config, target, proof).await?;
-                            return Ok(SurveyRunOutcome::Completed);
+                            match confirm_survey_completion(client, config, target, proof).await? {
+                                SurveyCompletionReconciliation::Confirmed => {
+                                    return Ok(SurveyRunOutcome::Completed);
+                                }
+                                SurveyCompletionReconciliation::Pending => {
+                                    pending_completion_proof = Some(proof);
+                                    last_completion_reconcile = Instant::now();
+                                }
+                            }
                         }
                         Ok(None) => {}
                         Err(history_error) => {
@@ -4921,6 +4997,25 @@ enum SurveyCompletionProof {
     DirectiveCompleted,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SurveyCompletionReconciliation {
+    Confirmed,
+    Pending,
+}
+
+fn classify_survey_completion_reconciliation(
+    check: &CurrentSystemSurveyCheck,
+    proof: SurveyCompletionProof,
+) -> SurveyCompletionReconciliation {
+    match check.complete {
+        Some(true) => SurveyCompletionReconciliation::Confirmed,
+        None if proof == SurveyCompletionProof::TerminalDigest => {
+            SurveyCompletionReconciliation::Confirmed
+        }
+        Some(false) | None => SurveyCompletionReconciliation::Pending,
+    }
+}
+
 fn survey_completion_proof(
     event: &Event,
     controller: &str,
@@ -4954,8 +5049,9 @@ async fn confirm_survey_completion(
     config: &Config,
     target: &str,
     proof: SurveyCompletionProof,
-) -> AnyResult<()> {
+) -> AnyResult<SurveyCompletionReconciliation> {
     let check = inspect_current_system_surveys(client, config, target).await?;
+    let reconciliation = classify_survey_completion_reconciliation(&check, proof);
     info!(
         target: "replicant_client::explore",
         event = "survey.completion_reconciled",
@@ -4967,32 +5063,39 @@ async fn confirm_survey_completion(
         moons_scanned = check.moons_scanned,
         moons_total_estimated = check.moons_total_estimated,
         proof = ?proof,
+        reconciliation = ?reconciliation,
         "authoritatively reconciled planet and moon survey completeness"
     );
-    match check.complete {
-        Some(true) => Ok(()),
-        Some(false) => Err(app_error(
-            io::ErrorKind::Other,
-            format!(
-                "survey completion evidence for {target} conflicts with authoritative planet/moon state"
-            ),
-        )),
-        None if proof == SurveyCompletionProof::TerminalDigest => {
-            info!(
-                target: "replicant_client::explore",
-                event = "survey.completion_terminal_digest_fallback",
-                star = target,
-                "accepting terminal survey digest because the live location response omitted aggregate planet/moon counters"
-            );
-            Ok(())
-        }
-        None => Err(app_error(
-            io::ErrorKind::Other,
-            format!(
-                "survey completion evidence for {target} needs a complete planet/moon reconciliation"
-            ),
-        )),
+
+    if reconciliation == SurveyCompletionReconciliation::Confirmed
+        && check.complete.is_none()
+        && proof == SurveyCompletionProof::TerminalDigest
+    {
+        info!(
+            target: "replicant_client::explore",
+            event = "survey.completion_terminal_digest_fallback",
+            star = target,
+            "accepting terminal survey digest because the live location response omitted aggregate planet/moon counters"
+        );
     }
+
+    if reconciliation == SurveyCompletionReconciliation::Pending {
+        debug!(
+            target: "replicant_client::explore",
+            event = "survey.completion_reconciliation_pending",
+            star = target,
+            complete = check.complete,
+            planets_total = check.planets_total,
+            planets_scanned = check.planets_scanned,
+            moons_total = check.moons_total,
+            moons_scanned = check.moons_scanned,
+            moons_total_estimated = check.moons_total_estimated,
+            proof = ?proof,
+            "survey completion evidence arrived before aggregate planet/moon state caught up; waiting for reconciliation"
+        );
+    }
+
+    Ok(reconciliation)
 }
 
 fn event_has_location_context(event: &Event) -> bool {
@@ -6141,6 +6244,80 @@ mod tests {
             Some(false)
         );
         assert_eq!(aggregate_survey_counts_complete(Some(true), None), None);
+    }
+
+    #[test]
+    fn directive_completion_waits_for_aggregate_projection_catch_up() {
+        let pending = CurrentSystemSurveyCheck {
+            complete: None,
+            planets_total: None,
+            planets_scanned: None,
+            moons_total: None,
+            moons_scanned: None,
+            moons_total_estimated: None,
+        };
+        assert_eq!(
+            classify_survey_completion_reconciliation(
+                &pending,
+                SurveyCompletionProof::DirectiveCompleted,
+            ),
+            SurveyCompletionReconciliation::Pending
+        );
+        assert_eq!(
+            classify_survey_completion_reconciliation(
+                &pending,
+                SurveyCompletionProof::TerminalDigest,
+            ),
+            SurveyCompletionReconciliation::Confirmed
+        );
+
+        let incomplete = CurrentSystemSurveyCheck {
+            complete: Some(false),
+            planets_total: Some(2),
+            planets_scanned: Some(1),
+            moons_total: Some(3),
+            moons_scanned: Some(3),
+            moons_total_estimated: Some(false),
+        };
+        assert_eq!(
+            classify_survey_completion_reconciliation(
+                &incomplete,
+                SurveyCompletionProof::DirectiveCompleted,
+            ),
+            SurveyCompletionReconciliation::Pending
+        );
+
+        let complete = CurrentSystemSurveyCheck {
+            complete: Some(true),
+            planets_total: Some(2),
+            planets_scanned: Some(2),
+            moons_total: Some(3),
+            moons_scanned: Some(3),
+            moons_total_estimated: Some(false),
+        };
+        assert_eq!(
+            classify_survey_completion_reconciliation(
+                &complete,
+                SurveyCompletionProof::DirectiveCompleted,
+            ),
+            SurveyCompletionReconciliation::Confirmed
+        );
+    }
+
+    #[test]
+    fn required_vessel_stow_overrides_stale_carrier_attachment() {
+        assert_eq!(
+            effective_survey_carrier(Some("OLD-CARRIER"), Some("VESSEL"), "VESSEL"),
+            None
+        );
+        assert_eq!(
+            effective_survey_carrier(Some("LOCAL-CARRIER"), None, "VESSEL"),
+            Some("LOCAL-CARRIER")
+        );
+        assert_eq!(
+            effective_survey_carrier(Some("OTHER-CARRIER"), Some("OTHER-VESSEL"), "VESSEL",),
+            Some("OTHER-CARRIER")
+        );
     }
 
     #[test]
