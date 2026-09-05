@@ -90,7 +90,7 @@ jobs:
             echo "No build domains affected."
           else
             printf 'Selected Make targets: %s\n' "${targets[*]}"
-            make "${targets[@]}"
+            make -k "${targets[@]}"
           fi
 
       - name: Cache and disk usage
