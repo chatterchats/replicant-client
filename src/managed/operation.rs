@@ -167,20 +167,9 @@ enum MutationAdapter {
     },
 }
 
-/// Internal contract shared by durable managed operations and the typed raw
-/// endpoint methods.  There is intentionally no generic method/path/body
-/// escape hatch: adding a mutation requires one explicit enum variant.
-trait TypedMutationAdapter {
-    fn operation_id(&self) -> &'static str;
-    fn safety(&self) -> raw::RequestSafety;
-    fn target(&self) -> Option<(&'static str, String)>;
-    fn expects_evidence(&self) -> bool;
-    fn rate_limit_bucket(&self) -> &'static str;
-    fn durable_intent(&self) -> Result<Value>;
-    async fn submit(&self, raw: &raw::Client) -> Result<Value>;
-}
-
-impl TypedMutationAdapter for MutationAdapter {
+/// Durable managed-mutation behavior. There is intentionally no generic
+/// method/path/body escape hatch: adding a mutation requires one explicit enum variant.
+impl MutationAdapter {
     fn operation_id(&self) -> &'static str {
         match self {
             Self::AccountUpdate { .. } => "account_update",
@@ -210,10 +199,6 @@ impl TypedMutationAdapter for MutationAdapter {
             Self::ReplicantTravel { .. } => "replicant_travel",
             Self::ReplicantCancelTravel { .. } => "replicant_cancel_travel",
         }
-    }
-
-    fn safety(&self) -> raw::RequestSafety {
-        raw::RequestSafety::Mutating
     }
 
     fn target(&self) -> Option<(&'static str, String)> {
@@ -270,10 +255,6 @@ impl TypedMutationAdapter for MutationAdapter {
             }
             _ => false,
         }
-    }
-
-    fn rate_limit_bucket(&self) -> &'static str {
-        self.operation_id()
     }
 
     fn durable_intent(&self) -> Result<Value> {
@@ -2378,7 +2359,6 @@ async fn create_with_id(
     supplied_id: Option<OperationId>,
 ) -> Result<Operation> {
     client.ensure_open()?;
-    debug_assert!(matches!(adapter.safety(), raw::RequestSafety::Mutating));
     let total_started = Instant::now();
     let id = supplied_id.unwrap_or_else(|| OperationId::new(Uuid::new_v4().to_string()));
     let operation_kind = adapter.operation_id();
@@ -2401,7 +2381,7 @@ async fn create_with_id(
     intent_object.insert("evidence".into(), operation_evidence(&adapter));
     intent_object.insert(
         "rate_limit_bucket".into(),
-        Value::String(adapter.rate_limit_bucket().to_owned()),
+        Value::String(operation_kind.to_owned()),
     );
     let target = adapter.target();
     let (target_realm, target_kind, target_id): (Option<String>, Option<&str>, Option<String>) =
@@ -3230,7 +3210,7 @@ mod tests {
         let mut intent = adapter.durable_intent().expect("sanitize intent");
         intent["expects_evidence"] = Value::Bool(adapter.expects_evidence());
         intent["evidence"] = operation_evidence(&adapter);
-        intent["rate_limit_bucket"] = Value::String(adapter.rate_limit_bucket().into());
+        intent["rate_limit_bucket"] = Value::String(adapter.operation_id().into());
         client
             .managed_state()
             .record_operation(

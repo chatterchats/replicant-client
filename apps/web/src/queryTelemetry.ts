@@ -17,7 +17,6 @@ export interface QueryTelemetryFields {
    */
   query?: string;
   bytes_received?: number;
-  elapsed_ms?: number;
 }
 
 export interface QueryTelemetrySummary {
@@ -171,42 +170,6 @@ export function recordQueryEvent(
       break;
   }
   emitLifecycleEvent(kind);
-}
-
-export function recordQueryRequest(query?: string): void {
-  recordQueryEvent("request", { query });
-}
-
-export function recordQuerySuccess(
-  query?: string,
-  bytesReceived?: number,
-  elapsedMs?: number,
-): void {
-  recordQueryEvent("request_success", {
-    query,
-    bytes_received: bytesReceived,
-    elapsed_ms: elapsedMs,
-  });
-}
-
-export function recordQueryJoined(query?: string): void {
-  recordQueryEvent("joined_request", { query });
-}
-
-export function recordQueryCacheHit(query?: string): void {
-  recordQueryEvent("cache_hit", { query });
-}
-
-export function recordQueryInvalidationCoalesced(query?: string): void {
-  recordQueryEvent("coalesced_invalidation", { query });
-}
-
-export function recordQueryCancellation(query?: string): void {
-  recordQueryEvent("cancelled_request", { query });
-}
-
-export function recordQueryStaleDiscarded(query?: string): void {
-  recordQueryEvent("stale_discarded", { query });
 }
 
 export function queryTelemetrySummary(): QueryTelemetrySummary {

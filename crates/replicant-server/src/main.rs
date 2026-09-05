@@ -11,7 +11,6 @@ use std::{
 
 use replicant_runtime::{
     config::ManagedClientConfig,
-    config::RuntimeConfig,
     empire_telemetry::EmpireTelemetryService,
     mission_stock::reconcile_legacy_mission_tags,
     start_managed_client,
@@ -145,7 +144,6 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     }
     let state = AppState::new_with_telemetry(
         client.clone(),
-        RuntimeConfig::new(&config.profile),
         repository,
         config.clone(),
         Some(telemetry.workflow_sink()),

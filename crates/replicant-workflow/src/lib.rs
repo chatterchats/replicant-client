@@ -36,8 +36,8 @@ pub use model::{
 pub use registry::{RegistryError, WorkflowFactory, WorkflowMigration, WorkflowRegistry};
 pub use repository::{CreateOrReuseWorkflow, RepositoryError, WorkflowRepository};
 pub use supervisor::{
-    BoxWorkflowFuture, ControlRequest, SupervisorError, WorkflowContext, WorkflowExecutor,
-    WorkflowSupervisor, WorkflowWaitError,
+    BoxWorkflowFuture, ControlRequest, WorkflowContext, WorkflowExecutor, WorkflowSupervisor,
+    WorkflowWaitError,
 };
 pub use target::{WorkflowTarget, WorkflowTargetRecord};
 pub use telemetry::{WorkflowTelemetrySample, WorkflowTelemetrySink};

@@ -10,7 +10,7 @@ import { LeaderboardsContent } from "./LeaderboardsPage";
 import { filterInboxMessages, MessagesContent } from "./MessagesPage";
 import { NetworkContent } from "./NetworkPage";
 import { ReportsContent } from "./ReportsPage";
-import { ReputationContent, StandingContent } from "./StandingPage";
+import { ReputationContent } from "./StandingPage";
 import type {
   BobnetSnapshot,
   LeaderboardsSnapshot,
@@ -246,30 +246,6 @@ describe("Intelligence pages", () => {
     expect(html).toContain("Operator");
     expect(html).toContain("RELAY-1");
     expect(html).toContain("not a social graph");
-  });
-
-  it("renders XP, achievements, and reputation", () => {
-    const data: StandingSnapshot = {
-      metadata,
-      experience_points_total: 42,
-      civilisation_points: null,
-      achievements: [
-        {
-          key: "first-flight",
-          title: "First flight",
-          description: null,
-          category: "travel",
-          xp_reward: 5,
-          achieved_at: null,
-        },
-      ],
-      reputation: [],
-    };
-    const html = renderToStaticMarkup(
-      <StandingContent {...common} data={data} />,
-    );
-    expect(html).toContain("First flight");
-    expect(html).toContain("Not exposed");
   });
 
   it("sorts the species reputation page highest to lowest", () => {

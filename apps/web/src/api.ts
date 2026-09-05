@@ -60,7 +60,7 @@ import {
   resourceTimingFields,
   type ResourceTimingFields,
 } from "./resourceTiming";
-import { recordQueryRequest, recordQuerySuccess } from "./queryTelemetry";
+import { recordQueryEvent } from "./queryTelemetry";
 
 export function daemonUrl(path: string, origin?: string): string {
   const configuredOrigin = (
@@ -280,11 +280,10 @@ function recordDaemonResponse(
     fields,
   );
   if (response.ok) {
-    recordQuerySuccess(
-      normalizeDaemonRoute(path),
-      typeof fields.bytes === "number" ? fields.bytes : undefined,
-      completed - started,
-    );
+    recordQueryEvent("request_success", {
+      bytes_received:
+        typeof fields.bytes === "number" ? fields.bytes : undefined,
+    });
   }
 }
 
@@ -374,7 +373,7 @@ async function get(path: string, signal?: AbortSignal): Promise<unknown> {
   const started = performance.now();
   let response: Response | undefined;
   let headersAt = started;
-  recordQueryRequest(normalizeDaemonRoute(path));
+  recordQueryEvent("request", { query: normalizeDaemonRoute(path) });
   let recorded = false;
   try {
     response = await fetch(daemonUrl(path), {
@@ -448,7 +447,7 @@ async function send(
   let response: Response | undefined;
   let headersAt = started;
   let recorded = false;
-  recordQueryRequest(normalizeDaemonRoute(path));
+  recordQueryEvent("request", { query: normalizeDaemonRoute(path) });
   try {
     response = await fetch(daemonUrl(path), {
       method,

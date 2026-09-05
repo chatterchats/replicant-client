@@ -79,11 +79,6 @@ pub struct OperationKind(pub String);
 #[serde(transparent)]
 pub struct EntityId(pub String);
 
-/// Stable identifier for a saved or running query.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct QueryId(pub String);
-
 /// Kind of normalized entity addressable by the local application.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -2939,25 +2934,11 @@ pub struct WorkflowDetail {
     pub error: Option<String>,
 }
 
-/// Filter for a workflow list request.
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-pub struct WorkflowListRequest {
-    /// Optional lifecycle state filter.
-    pub status: Option<WorkflowStatus>,
-}
-
 /// Workflow list response.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct WorkflowListResponse {
     /// Matching workflows.
     pub workflows: Vec<WorkflowSummary>,
-}
-
-/// Workflow detail request.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct WorkflowDetailRequest {
-    /// Requested workflow identifier.
-    pub workflow_id: WorkflowId,
 }
 
 /// Request to start a registered workflow.
@@ -3049,13 +3030,6 @@ pub struct FiniteExecutionHistoryResponse {
 pub struct StartWorkflowResponse {
     /// Newly created workflow.
     pub workflow: WorkflowSummary,
-}
-
-/// Request targeting an existing workflow for pause, resume, or cancellation.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct WorkflowControlRequest {
-    /// Target workflow identifier.
-    pub workflow_id: WorkflowId,
 }
 
 /// Response after a workflow control request is accepted.

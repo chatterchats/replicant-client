@@ -516,14 +516,6 @@ impl WorkflowContext {
     }
 }
 
-/// Workflow supervision failures.
-#[derive(Debug, thiserror::Error)]
-pub enum SupervisorError {
-    /// Workflow persistence failed.
-    #[error(transparent)]
-    Repository(#[from] RepositoryError),
-}
-
 /// Failures while awaiting managed state.
 #[derive(Debug, thiserror::Error)]
 pub enum WorkflowWaitError {
@@ -599,7 +591,7 @@ impl WorkflowSupervisor {
     }
 
     /// Reconciles stale durable state once, reaps tasks, and starts runnable instances.
-    pub async fn tick(&self) -> Result<(), SupervisorError> {
+    pub async fn tick(&self) -> Result<(), RepositoryError> {
         let _tick = self.tick_lock.lock().await;
         let instances = if !self.startup_reconciled.load(Ordering::Acquire) {
             let reclaimed_items = self
@@ -681,11 +673,11 @@ impl WorkflowSupervisor {
     /// The executor future is dropped after the paused state is persisted. Any
     /// already-submitted managed operation remains durable, but the workflow
     /// cannot issue another command until it is resumed.
-    pub fn pause(&self, id: WorkflowId) -> Result<(), SupervisorError> {
+    pub fn pause(&self, id: WorkflowId) -> Result<(), RepositoryError> {
         self.pause_instance(self.read(id)?)
     }
 
-    fn pause_instance(&self, instance: WorkflowInstance) -> Result<(), SupervisorError> {
+    fn pause_instance(&self, instance: WorkflowInstance) -> Result<(), RepositoryError> {
         let id = instance.id;
         tracing::info!(
             workflow_id = %id,
@@ -704,11 +696,11 @@ impl WorkflowSupervisor {
     }
 
     /// Durably resumes a paused workflow through reconciliation.
-    pub fn resume(&self, id: WorkflowId) -> Result<(), SupervisorError> {
+    pub fn resume(&self, id: WorkflowId) -> Result<(), RepositoryError> {
         self.resume_instance(self.read(id)?)
     }
 
-    fn resume_instance(&self, instance: WorkflowInstance) -> Result<(), SupervisorError> {
+    fn resume_instance(&self, instance: WorkflowInstance) -> Result<(), RepositoryError> {
         let id = instance.id;
         tracing::info!(
             workflow_id = %id,
@@ -727,11 +719,11 @@ impl WorkflowSupervisor {
     /// Already-submitted managed operations remain durable and are reconciled
     /// from authoritative state, but a cancelled workflow cannot retain local
     /// scheduling ownership after its terminal state is persisted.
-    pub fn cancel(&self, id: WorkflowId) -> Result<(), SupervisorError> {
+    pub fn cancel(&self, id: WorkflowId) -> Result<(), RepositoryError> {
         self.cancel_instance(self.read(id)?)
     }
 
-    fn cancel_instance(&self, instance: WorkflowInstance) -> Result<(), SupervisorError> {
+    fn cancel_instance(&self, instance: WorkflowInstance) -> Result<(), RepositoryError> {
         let id = instance.id;
         tracing::info!(
             workflow_id = %id,
@@ -756,7 +748,7 @@ impl WorkflowSupervisor {
     }
 
     /// Durably pauses every eligible workflow and requests cooperative stops.
-    pub fn pause_all(&self) -> Result<usize, SupervisorError> {
+    pub fn pause_all(&self) -> Result<usize, RepositoryError> {
         let mut paused = 0;
         for instance in self.repository.list_active()? {
             if instance.status.can_transition_to(WorkflowStatus::Paused)
@@ -770,7 +762,7 @@ impl WorkflowSupervisor {
     }
 
     /// Durably resumes every paused workflow through reconciliation.
-    pub fn resume_all(&self) -> Result<usize, SupervisorError> {
+    pub fn resume_all(&self) -> Result<usize, RepositoryError> {
         let mut resumed = 0;
         for instance in self.repository.list_active()? {
             if instance.status == WorkflowStatus::Paused {
@@ -782,7 +774,7 @@ impl WorkflowSupervisor {
     }
 
     /// Durably cancels the selected workflows, or every eligible workflow when empty.
-    pub fn cancel_selected(&self, ids: &[WorkflowId]) -> Result<usize, SupervisorError> {
+    pub fn cancel_selected(&self, ids: &[WorkflowId]) -> Result<usize, RepositoryError> {
         let instances = self.repository.list_active()?;
         let mut cancelled = 0;
         for instance in instances {
@@ -826,7 +818,7 @@ impl WorkflowSupervisor {
         )
     }
 
-    fn start(&self, instance: WorkflowInstance) -> Result<(), SupervisorError> {
+    fn start(&self, instance: WorkflowInstance) -> Result<(), RepositoryError> {
         let instance = match self.registry.migration(&instance) {
             Ok(Some((target_version, migration))) => {
                 let migrated =
@@ -855,7 +847,7 @@ impl WorkflowSupervisor {
             Ok(instance) => instance,
             Err(error) => {
                 self.clear_start(id)?;
-                return Err(error.into());
+                return Err(error);
             }
         };
         let mut executor = match self.registry.resolve(&instance) {
@@ -969,7 +961,7 @@ impl WorkflowSupervisor {
         &self,
         instance: WorkflowInstance,
         error: String,
-    ) -> Result<(), SupervisorError> {
+    ) -> Result<(), RepositoryError> {
         tracing::error!(
             workflow_id = %instance.id,
             kind = %instance.kind,
@@ -989,7 +981,7 @@ impl WorkflowSupervisor {
         Ok(())
     }
 
-    async fn reap_finished(&self) -> Result<(), SupervisorError> {
+    async fn reap_finished(&self) -> Result<(), RepositoryError> {
         let finished = {
             let mut executors = self.executors();
             let ids = executors

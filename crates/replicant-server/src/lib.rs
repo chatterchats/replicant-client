@@ -90,7 +90,6 @@ use replicant_protocol::{
     WorkflowSummary, WorkflowTargetSummary,
 };
 use replicant_runtime::{
-    ApplicationContext,
     automation::{
         AutomationResetIntent, AutomationResetTarget, ControllerWorkflowCheckpoint,
         ExplorationIntent, ExplorationWorkflowCheckpoint, ScanIntent, ScanTourCheckpoint,
@@ -98,8 +97,7 @@ use replicant_runtime::{
     },
     bootstrap::BootstrapMission,
     catalogue::{CatalogueError, OperationCatalogue},
-    config::{self, RuntimeConfig},
-    director_reconcile_event_names,
+    config, director_reconcile_event_names,
     event::{discovered_events, normalize_event},
     galaxy_scene::galaxy_scene as build_galaxy_scene,
     intelligence::{account_profile, leaderboard, leaderboard_index, standing},
@@ -122,11 +120,10 @@ use replicant_runtime::{
 use replicant_workflow::{
     AutomationPolicy, AutomationTrigger, FiniteExecution as StoredFiniteExecution,
     FiniteExecutionClass, FiniteExecutionStatus as StoredFiniteExecutionStatus, NewTrigger,
-    RepositoryError, ResourceKey, ResourceReservation, SupervisorError, TriggerCondition,
-    TriggerId, TriggerState, TriggerTarget, TriggerTargetClass, WorkItemStatus, WorkflowId,
-    WorkflowInstance, WorkflowKind, WorkflowRepository, WorkflowStatus,
-    WorkflowSummary as StoredWorkflowSummary, WorkflowSupervisor, WorkflowTarget,
-    WorkflowTargetRecord, WorkflowTelemetrySink,
+    RepositoryError, ResourceKey, ResourceReservation, TriggerCondition, TriggerId, TriggerState,
+    TriggerTarget, TriggerTargetClass, WorkItemStatus, WorkflowId, WorkflowInstance, WorkflowKind,
+    WorkflowRepository, WorkflowStatus, WorkflowSummary as StoredWorkflowSummary,
+    WorkflowSupervisor, WorkflowTarget, WorkflowTargetRecord, WorkflowTelemetrySink,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -364,7 +361,7 @@ pub enum ConfigError {
 
 /// Shared daemon services. HTTP handlers never construct managed clients.
 pub struct AppState {
-    context: ApplicationContext,
+    client: Client,
     repository: Arc<WorkflowRepository>,
     supervisor: WorkflowSupervisor,
     catalogue: OperationCatalogue,
@@ -397,17 +394,15 @@ impl AppState {
     /// Builds daemon state around one managed client and one runtime repository.
     pub fn new(
         client: Client,
-        runtime_config: RuntimeConfig,
         repository: Arc<WorkflowRepository>,
         daemon: DaemonConfig,
     ) -> Result<Arc<Self>, CatalogueError> {
-        Self::new_with_telemetry(client, runtime_config, repository, daemon, None, None)
+        Self::new_with_telemetry(client, repository, daemon, None, None)
     }
 
     /// Builds daemon state with optional workflow/runtime observability sinks.
     pub fn new_with_telemetry(
         client: Client,
-        runtime_config: RuntimeConfig,
         repository: Arc<WorkflowRepository>,
         daemon: DaemonConfig,
         workflow_telemetry: Option<Arc<dyn WorkflowTelemetrySink>>,
@@ -427,7 +422,7 @@ impl AppState {
         }
         let revision = client.state().revision().unwrap_or_default();
         Ok(Arc::new(Self {
-            context: ApplicationContext::new(client, runtime_config),
+            client,
             repository,
             supervisor,
             catalogue,
@@ -451,7 +446,7 @@ impl AppState {
     /// Returns the daemon's single managed client.
     #[must_use]
     pub fn client(&self) -> &Client {
-        self.context.client()
+        &self.client
     }
 
     fn record_runtime_telemetry(
@@ -7650,7 +7645,7 @@ async fn reset_automation(
     let affected_workflows = state
         .supervisor
         .cancel_selected(&cancelled_workflows)
-        .map_err(supervisor_error)?;
+        .map_err(ApiError::repository)?;
 
     // The reset workflow must be allowed to run even if the operator had
     // previously paused normal automation. Automatic launches remain disabled.
@@ -7721,7 +7716,7 @@ async fn control_automation(
                 .repository
                 .set_automation_policy(policy)
                 .map_err(ApiError::repository)?;
-            state.supervisor.pause_all().map_err(supervisor_error)?
+            state.supervisor.pause_all().map_err(ApiError::repository)?
         }
         AutomationControlAction::ResumeAll => {
             policy.workflows_paused = false;
@@ -7729,7 +7724,10 @@ async fn control_automation(
                 .repository
                 .set_automation_policy(policy)
                 .map_err(ApiError::repository)?;
-            state.supervisor.resume_all().map_err(supervisor_error)?
+            state
+                .supervisor
+                .resume_all()
+                .map_err(ApiError::repository)?
         }
         AutomationControlAction::Cancel => {
             let ids = request
@@ -7740,7 +7738,7 @@ async fn control_automation(
             state
                 .supervisor
                 .cancel_selected(&ids)
-                .map_err(supervisor_error)?
+                .map_err(ApiError::repository)?
         }
     };
     policy = state
@@ -7793,7 +7791,7 @@ async fn control_workflow(
         Control::Resume => state.supervisor.resume(id),
         Control::Cancel => state.supervisor.cancel(id),
     }
-    .map_err(supervisor_error)?;
+    .map_err(ApiError::repository)?;
     let instance = state
         .repository
         .read(id)
@@ -7802,12 +7800,6 @@ async fn control_workflow(
     Ok(Json(Versioned::current(WorkflowControlResponse {
         workflow: summary(&instance),
     })))
-}
-
-fn supervisor_error(error: SupervisorError) -> ApiError {
-    match error {
-        SupervisorError::Repository(error) => ApiError::repository(error),
-    }
 }
 
 async fn workflow_activity(
@@ -8765,13 +8757,8 @@ mod tests {
             .await
             .expect("start test client");
         let repository = Arc::new(WorkflowRepository::open_in_memory().expect("runtime database"));
-        let state = AppState::new(
-            client.clone(),
-            RuntimeConfig::new("test"),
-            repository,
-            test_daemon_config(),
-        )
-        .expect("app state");
+        let state =
+            AppState::new(client.clone(), repository, test_daemon_config()).expect("app state");
         (router(state.clone()), client, state)
     }
 
@@ -8920,13 +8907,8 @@ mod tests {
             .await
             .expect("start managed client");
         let repository = Arc::new(WorkflowRepository::open_in_memory().expect("runtime database"));
-        let state = AppState::new(
-            client.clone(),
-            RuntimeConfig::new("test"),
-            repository,
-            test_daemon_config(),
-        )
-        .expect("app state");
+        let state =
+            AppState::new(client.clone(), repository, test_daemon_config()).expect("app state");
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let trigger_task = tokio::spawn(run_trigger_engine(state.clone(), shutdown_rx.clone()));
         let director_task = tokio::spawn(run_director(state.clone(), shutdown_rx));
@@ -9065,13 +9047,8 @@ mod tests {
             .await
             .expect("start test client");
         let repository = Arc::new(WorkflowRepository::open_in_memory().expect("runtime database"));
-        let state = AppState::new(
-            client.clone(),
-            RuntimeConfig::new("test"),
-            repository,
-            test_daemon_config(),
-        )
-        .expect("app state");
+        let state =
+            AppState::new(client.clone(), repository, test_daemon_config()).expect("app state");
         (router(state), client)
     }
 
@@ -10427,7 +10404,6 @@ mod tests {
             .expect("start first client");
         let first_state = AppState::new(
             first_client.clone(),
-            RuntimeConfig::new("test"),
             Arc::new(WorkflowRepository::open_in_memory().expect("runtime database")),
             test_daemon_config(),
         )
@@ -10461,7 +10437,6 @@ mod tests {
             .expect("restart client");
         let second_state = AppState::new(
             second_client.clone(),
-            RuntimeConfig::new("test"),
             Arc::new(WorkflowRepository::open_in_memory().expect("runtime database")),
             test_daemon_config(),
         )
@@ -11966,13 +11941,8 @@ mod tests {
         let (_, client, state) = test_app().await;
         let mut config = state.daemon.clone();
         config.token = Some("secret".to_owned());
-        let guarded = AppState::new(
-            client.clone(),
-            RuntimeConfig::new("test"),
-            state.repository.clone(),
-            config,
-        )
-        .expect("guarded state");
+        let guarded =
+            AppState::new(client.clone(), state.repository.clone(), config).expect("guarded state");
         let app = router(guarded);
 
         let unauthorized = app

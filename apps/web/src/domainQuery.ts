@@ -17,61 +17,6 @@ export interface DomainQueryResult<T> {
   refresh: () => Promise<void>;
 }
 
-interface RequestRunOptions {
-  queueIfActive?: boolean;
-}
-interface RequestGate {
-  run: (options?: RequestRunOptions) => Promise<void>;
-  abort: () => void;
-}
-const AUTO_INVALIDATION_DELAY_MS = 1_500;
-
-export function createRequestGate<T>(
-  fetcher: (signal: AbortSignal) => Promise<T>,
-  onStart: () => void,
-  onSuccess: (value: T) => void,
-  onError: (error: unknown) => void,
-): RequestGate {
-  let active: Promise<void> | undefined;
-  let controller: AbortController | undefined;
-  let queued = false;
-  let disposed = false;
-  const run = (options: RequestRunOptions = {}): Promise<void> => {
-    if (disposed) return Promise.resolve();
-    if (active) {
-      if (options.queueIfActive ?? true) queued = true;
-      return active;
-    }
-    controller = new AbortController();
-    const current = controller;
-    onStart();
-    active = fetcher(current.signal)
-      .then((value) => {
-        if (!current.signal.aborted) onSuccess(value);
-      })
-      .catch((error: unknown) => {
-        if (!current.signal.aborted) onError(error);
-      })
-      .finally(() => {
-        active = undefined;
-        controller = undefined;
-        if (queued && !disposed) {
-          queued = false;
-          void run();
-        }
-      });
-    return active;
-  };
-  return {
-    run,
-    abort() {
-      disposed = true;
-      queued = false;
-      controller?.abort();
-    },
-  };
-}
-
 export function domainInvalidationKey(
   slice: DomainSlice | readonly DomainSlice[] | undefined,
   invalidated: Partial<Record<DomainSlice, number>>,
