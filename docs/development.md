@@ -56,11 +56,11 @@ independently runnable domains:
 
 | Target | Covers |
 | --- | --- |
-| `make ci-core` | Core Rust workspace (excluding the Tauri package), feature matrix, rustdoc, and MSRV |
+| `make ci-core` | Core Rust format, feature matrix, all-feature Clippy/tests, rustdoc, and MSRV |
 | `make ci-policy` | Contract/persistence/authority policy gates and repository utility tests |
 | `make ci-galaxy` | Galaxy renderer format, Clippy, rustdoc, and WASM build |
 | `make ci-web` | Web format, lint, tests, typecheck, and production bundle |
-| `make ci-desktop` | Desktop formatting, Tauri Rust checks/lint/tests/docs, and sidecar-script tests |
+| `make ci-desktop` | Desktop formatting, Tauri Clippy/tests/docs, and sidecar-script tests |
 | `make ci-docs` | Documentation crawler tests |
 
 The Tauri package remains a Cargo workspace member, but core CI excludes it and
@@ -78,15 +78,23 @@ make check-all-features
 make feature-checks
 ```
 
+`feature-checks` covers the configurations that differ from the primary
+all-feature CI configuration. `check-all-features`, `rust-check-all`, and
+`rust-build` remain available as explicit developer targets, but `ci-core`
+does not repeat those standalone passes because all-feature Clippy and tests
+already compile that configuration. Desktop CI follows the same rule and does
+not run a separate `desktop-rust-check` before Clippy/tests.
+
 Use the narrowest target that proves a change while iterating, then run the
 applicable domain CI target. Run `make ci` before a release or whenever a change
 crosses multiple domains.
 
 ## GitHub Actions change selection
 
-The self-hosted GitHub workflow first runs `scripts/ci_changed.py` against the
-push's base and head commits. It classifies changed paths by dependency impact,
-then starts only the affected domain jobs. Examples:
+The self-hosted GitHub workflow resolves the most recent successful run of the
+same workflow on the current branch, then runs `scripts/ci_changed.py` against
+that validated commit and the current `HEAD`. It classifies changed paths by
+dependency impact. Examples:
 
 - `apps/web/**` runs web CI but not core Rust or desktop CI;
 - `crates/galaxy-renderer/**` runs both Galaxy and web CI because the generated
@@ -98,20 +106,24 @@ then starts only the affected domain jobs. Examples:
 - build-orchestration files such as `Makefile`, `rust-toolchain.toml`, the
   workflow itself, or the classifier force every domain to run.
 
-A documentation-only push that does not affect a build domain completes with
-only change detection and the final summary job. Manual `workflow_dispatch`
-always runs every domain. If the push base cannot be resolved (for example, an
-initial or rewritten history boundary), the classifier deliberately falls back
-to all domains rather than risk skipping a necessary gate.
+All affected domains execute in one `Selective CI` job and one Make invocation.
+That matches the single self-hosted runner: there is no useful job-level
+parallelism to gain, while one checkout lets Make deduplicate shared
+prerequisites such as dependency bootstrap and Galaxy WASM generation.
 
-The workflow does not cancel an in-flight run when a newer push arrives. Change
-selection compares each push to its immediate predecessor; cancelling the older
-run could otherwise let a later docs-only push skip code changes that never
-finished validation.
+A documentation-only push that does not affect a build domain completes after
+change detection with no build target. Manual `workflow_dispatch` always runs
+every domain. If the successful-run lookup or Git history cannot be resolved,
+the classifier deliberately falls back to all domains rather than risk
+skipping a necessary gate.
 
-`CI Summary` is always emitted and treats selected-job failures as failures while
-accepting intentionally skipped domains. Use that stable status for branch
-protection if GitHub is used as a required CI surface.
+The workflow cancels an in-flight older run when a newer push arrives. This is
+safe because the replacement run compares the newest `HEAD` to the last
+successful validation baseline, so it sees the union of every still-unvalidated
+change rather than only the immediately preceding commit.
+
+`Selective CI` is the stable job status to use for branch protection if GitHub
+is used as a required CI surface.
 
 ## Generated Galaxy WASM
 

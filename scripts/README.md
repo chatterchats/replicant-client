@@ -40,7 +40,7 @@ aliases the client exposes.
 | `reference_snapshot.py` | Locates versioned snapshots under `reference/replicant-space-*` and resolves the highest semantic version. Imported by the gates; rarely run directly. |
 | `repo_zip.py` | Creates maximum-compression ZIPs of the Git working tree and, optionally, local logs and databases. Invoked by `make zip` or `make zip-all`. |
 | `manage_token.py` | Creates/rotates `REPLICANTD_TOKEN` in the ignored `.env`; invoked by `make token` / `make token-rotate`. |
-| `ci_changed.py` | Classifies a Git diff into core/policy/Galaxy/web/desktop/docs/Docker CI domains for the self-hosted GitHub workflow. |
+| `ci_changed.py` | Resolves the last successful GitHub validation baseline and classifies the cumulative diff into core/policy/Galaxy/web/desktop/docs/Docker CI domains. |
 
 `test_repo_zip.py`, `test_manage_token.py`, and `test_ci_changed.py` are composed
 by `make utility-tests` and therefore by `make ci-policy` / full `make ci`.

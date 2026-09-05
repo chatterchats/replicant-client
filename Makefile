@@ -179,7 +179,7 @@ msrv-check: msrv-bootstrap
 
 ci: ci-core ci-policy ci-galaxy ci-web ci-desktop ci-docs
 
-ci-core: rust-fmt-check rust-build rust-lint rust-test rust-check-all feature-checks rust-doc msrv-check
+ci-core: rust-fmt-check feature-checks rust-lint rust-test rust-doc msrv-check
 ci-policy: policy-checks utility-tests
 ci-galaxy: galaxy-check
 ci-web: web-check
@@ -233,7 +233,7 @@ check-native-tls:
 check-all-features:
 	$(CARGO) check --locked -p replicant-client --all-targets --all-features
 
-feature-checks: check-default check-raw check-events check-native-tls check-all-features
+feature-checks: check-default check-raw check-events check-native-tls
 
 # -----------------------------------------------------------------------------
 # Galaxy renderer
@@ -321,7 +321,7 @@ desktop-rust-doc: desktop-prepare
 desktop-script-test: desktop-deps
 	$(NPM) --prefix $(DESKTOP_DIR) run check
 
-desktop-check: desktop-fmt-check desktop-rust-fmt-check desktop-rust-check desktop-rust-lint desktop-rust-test desktop-rust-doc desktop-script-test
+desktop-check: desktop-fmt-check desktop-rust-fmt-check desktop-rust-lint desktop-rust-test desktop-rust-doc desktop-script-test
 
 desktop-sidecar:
 	$(NODE) $(DESKTOP_DIR)/scripts/prepare-sidecar.mjs --release

@@ -75,9 +75,10 @@ make ci
 
 `make ci` composes six independently runnable domains: `ci-core`, `ci-policy`,
 `ci-galaxy`, `ci-web`, `ci-desktop`, and `ci-docs`. The self-hosted GitHub
-workflow uses the same domain targets and runs only those affected by the pushed
-paths; manual workflow dispatch always runs every domain. The aggregate local
-gate remains the authoritative way to prove the whole checkout.
+workflow classifies all changes since the last successful validation, then runs
+the affected domain targets together in one Make invocation; manual workflow
+dispatch always runs every domain. The aggregate local gate remains the
+authoritative way to prove the whole checkout.
 
 Iterate with the narrowest target that proves your change, then run the
 applicable domain target. Before a release or a cross-domain change, run

@@ -4,12 +4,18 @@
 from __future__ import annotations
 
 import argparse
+import json
+import os
 from pathlib import Path
 import subprocess
 from typing import Iterable
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote, urlencode
+from urllib.request import Request, urlopen
 
 
 GROUPS = ("core", "policy", "galaxy", "web", "desktop", "docs", "docker")
+GITHUB_API_VERSION = "2022-11-28"
 
 # Changes to build orchestration or the classifier itself can invalidate every
 # domain assumption, so they deliberately force a complete run.
@@ -164,6 +170,69 @@ def changed_paths(base: str, head: str) -> list[str]:
     return parse_name_status(completed.stdout)
 
 
+def successful_run_sha(payload: object) -> str:
+    """Return the newest usable head SHA from a workflow-runs API response."""
+
+    if not isinstance(payload, dict):
+        raise ValueError("GitHub Actions history response is not an object")
+    runs = payload.get("workflow_runs")
+    if not isinstance(runs, list):
+        raise ValueError("GitHub Actions history response has no workflow_runs list")
+
+    for run in runs:
+        if not isinstance(run, dict):
+            continue
+        sha = run.get("head_sha")
+        if isinstance(sha, str) and sha:
+            return sha
+
+    raise ValueError("no successful workflow run with a head SHA was found")
+
+
+def latest_successful_sha(
+    repository: str,
+    workflow: str,
+    branch: str,
+    token: str | None = None,
+) -> str:
+    """Resolve the newest successful workflow head SHA for *branch*."""
+
+    if "/" not in repository:
+        raise ValueError(f"invalid GitHub repository: {repository!r}")
+    if not workflow:
+        raise ValueError("workflow is required")
+    if not branch:
+        raise ValueError("branch is required")
+
+    query = urlencode(
+        {
+            "branch": branch,
+            "status": "success",
+            "per_page": "50",
+        }
+    )
+    url = (
+        f"https://api.github.com/repos/{quote(repository, safe='/')}/actions/"
+        f"workflows/{quote(workflow, safe='')}/runs?{query}"
+    )
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "replicant-client-ci",
+        "X-GitHub-Api-Version": GITHUB_API_VERSION,
+    }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    request = Request(url, headers=headers)
+    try:
+        with urlopen(request, timeout=15) as response:
+            payload = json.load(response)
+    except (HTTPError, URLError, OSError, ValueError) as exc:
+        raise ValueError(f"GitHub Actions history lookup failed: {exc}") from exc
+
+    return successful_run_sha(payload)
+
+
 def write_github_output(path: Path, result: dict[str, bool]) -> None:
     with path.open("a", encoding="utf-8") as handle:
         for group in GROUPS:
@@ -172,9 +241,19 @@ def write_github_output(path: Path, result: dict[str, bool]) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--base", help="base commit for git diff")
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument("--base", help="base commit for git diff")
+    source.add_argument(
+        "--last-successful",
+        action="store_true",
+        help="diff from the newest successful GitHub Actions run on the selected branch",
+    )
+    source.add_argument("--all", action="store_true", help="mark every CI domain affected")
+
     parser.add_argument("--head", default="HEAD", help="head commit for git diff")
-    parser.add_argument("--all", action="store_true", help="mark every CI domain affected")
+    parser.add_argument("--repository", help="GitHub repository in owner/name form")
+    parser.add_argument("--workflow", help="GitHub Actions workflow file name or ID")
+    parser.add_argument("--branch", help="GitHub branch used to resolve successful runs")
     parser.add_argument(
         "--github-output",
         type=Path,
@@ -185,19 +264,56 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    base: str | None = args.base
+
     if args.all:
         paths: list[str] = []
         result = {group: True for group in GROUPS}
     else:
-        if not args.base:
-            raise SystemExit("--base is required unless --all is used")
-        try:
-            paths = changed_paths(args.base, args.head)
-            result = classify_paths(paths)
-        except ValueError as exc:
-            print(f"CI change detection cannot classify this push ({exc}); running all domains")
-            paths = []
-            result = {group: True for group in GROUPS}
+        if args.last_successful:
+            missing = [
+                name
+                for name, value in (
+                    ("--repository", args.repository),
+                    ("--workflow", args.workflow),
+                    ("--branch", args.branch),
+                )
+                if not value
+            ]
+            if missing:
+                raise SystemExit(
+                    "--last-successful requires " + ", ".join(missing)
+                )
+            try:
+                base = latest_successful_sha(
+                    args.repository,
+                    args.workflow,
+                    args.branch,
+                    os.environ.get("GITHUB_TOKEN"),
+                )
+                print(f"Last successful CI baseline: {base}")
+            except ValueError as exc:
+                print(
+                    "CI change detection cannot resolve the last successful "
+                    f"validation ({exc}); running all domains"
+                )
+                paths = []
+                result = {group: True for group in GROUPS}
+                base = None
+
+        if base is not None:
+            try:
+                paths = changed_paths(base, args.head)
+                result = classify_paths(paths)
+            except ValueError as exc:
+                print(
+                    f"CI change detection cannot classify this push ({exc}); "
+                    "running all domains"
+                )
+                paths = []
+                result = {group: True for group in GROUPS}
+        elif not args.last_successful:
+            raise SystemExit("--base, --last-successful, or --all is required")
 
     if paths:
         print("Changed paths:")

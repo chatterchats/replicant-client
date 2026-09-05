@@ -111,7 +111,7 @@ make policy-checks
 make ci           # authoritative full repository gate
 ```
 
-Domain CI targets mirror the conditional self-hosted Actions jobs:
+Domain CI targets are composed by the conditional self-hosted Actions job:
 
 ```sh
 make ci-core
@@ -125,7 +125,8 @@ make ci-docs
 Feature combinations are first-class Make targets: `check-default`,
 `check-raw`, `check-events`, `check-native-tls`, `check-all-features`, and
 `feature-checks`. `make msrv-check` separately proves the root client against
-its declared MSRV.
+its declared MSRV. CI intentionally avoids standalone build/check passes when
+Clippy/tests already compile the same all-feature configuration.
 
 Cargo aliases remain available for narrow work, but Make owns cross-component
 ordering. See `docs/development.md` for the build graph, dependency stamps, and
@@ -133,8 +134,9 @@ GitHub path-classification rules.
 
 **Cost discipline.** Do not run full `make ci` to validate a one-line change.
 Iterate with the narrowest leaf/domain target that proves the change. The
-GitHub mirror applies the same rule automatically: it classifies changed paths
-and runs only affected domains, while manual workflow dispatch runs all of them.
+GitHub mirror applies the same rule automatically: it classifies changed paths,
+runs the affected domains together in one Make invocation, and lets a newer run
+replace an older in-flight run without losing unvalidated changes.
 
 ---
 

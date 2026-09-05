@@ -96,6 +96,24 @@ class CiChangedTests(unittest.TestCase):
         result = self.classify("docs/design-notes.md")
         self.assertFalse(any(result.values()))
 
+    def test_successful_run_sha_uses_newest_usable_sha(self) -> None:
+        payload = {
+            "workflow_runs": [
+                {"head_sha": ""},
+                {"head_sha": "abc123"},
+                {"head_sha": "older"},
+            ]
+        }
+        self.assertEqual(ci_changed.successful_run_sha(payload), "abc123")
+
+    def test_successful_run_sha_rejects_missing_history(self) -> None:
+        with self.assertRaisesRegex(ValueError, "workflow_runs"):
+            ci_changed.successful_run_sha({})
+
+    def test_successful_run_sha_rejects_history_without_sha(self) -> None:
+        with self.assertRaisesRegex(ValueError, "no successful workflow run"):
+            ci_changed.successful_run_sha({"workflow_runs": [{"head_sha": ""}]})
+
 
 if __name__ == "__main__":
     unittest.main()
