@@ -267,14 +267,26 @@ pub struct AutomationResetTarget {
 pub struct AutomationResetIntent {
     /// Complete deterministic reset target set.
     pub targets: Vec<AutomationResetTarget>,
+    /// Workflows cancelled by the reset request whose transient custody must be recovered.
+    #[serde(default)]
+    pub cancelled_workflows: Vec<WorkflowId>,
 }
 
 /// Restart-safe cleanup state for one returned Replicant.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
 pub struct AutomationResetReplicantCheckpoint {
-    /// Hosted vessel observed after the Replicant reached home.
+    /// Hosted vessel locked for this Replicant once reset recovery begins.
     #[serde(default)]
     pub vessel: Option<String>,
+    /// Unresolved transient devices inherited from cancelled/failed workflows.
+    #[serde(default)]
+    pub recovery_devices: Option<Vec<String>>,
+    /// Survey controllers whose fleet withdraw has already been requested.
+    #[serde(default)]
+    pub withdrawn_controllers: BTreeSet<String>,
+    /// Transient devices authoritatively recovered into the hosted vessel.
+    #[serde(default)]
+    pub recovered_devices: BTreeSet<String>,
     /// Non-matrix devices captured from the vessel before any unload mutation.
     #[serde(default)]
     pub unload_devices: Option<Vec<String>>,
@@ -2780,6 +2792,9 @@ async fn reset_wait_once(
                     "travel.arrived".to_owned(),
                     "travel.cancelled".to_owned(),
                     "device.deployed".to_owned(),
+                    "device.stowed".to_owned(),
+                    "device.recalled".to_owned(),
+                    "device.withdrawn".to_owned(),
                 ])
                 .polling_every(poll_interval),
             |_client, signal| async move {
@@ -2800,18 +2815,12 @@ async fn reset_wait_once(
     ))
 }
 
-fn reset_claim_replicants(
-    context: &WorkflowContext,
-    targets: &[AutomationResetTarget],
-) -> Result<bool, String> {
-    for target in targets {
-        match context.acquire_claim(ResourceKey::Replicant(target.replicant.clone())) {
-            Ok(_) => {}
-            Err(RepositoryError::ClaimConflict { .. }) => return Ok(false),
-            Err(error) => return Err(string_error(error)),
-        }
+fn reset_claim_replicant(context: &WorkflowContext, code: &str) -> Result<bool, String> {
+    match context.acquire_claim(ResourceKey::Replicant(code.to_owned())) {
+        Ok(_) => Ok(true),
+        Err(RepositoryError::ClaimConflict { .. }) => Ok(false),
+        Err(error) => Err(string_error(error)),
     }
-    Ok(true)
 }
 
 fn reset_claim_device(context: &WorkflowContext, code: &str) -> Result<bool, String> {
@@ -2820,6 +2829,429 @@ fn reset_claim_device(context: &WorkflowContext, code: &str) -> Result<bool, Str
         Err(RepositoryError::ClaimConflict { .. }) => Ok(false),
         Err(error) => Err(string_error(error)),
     }
+}
+
+fn reset_device_has_command(device: &Device, command: &str) -> bool {
+    device
+        .available_commands
+        .iter()
+        .any(|value| value.as_str() == command)
+}
+
+fn reset_device_in_transit(device: &Device) -> bool {
+    device.is_traveling()
+        || device.status.as_ref().is_some_and(|status| {
+            matches!(
+                status.as_str().to_ascii_lowercase().as_str(),
+                "travelling" | "traveling" | "returning" | "recalling"
+            )
+        })
+}
+
+fn reset_cancelled_workflow_ids(
+    context: &WorkflowContext,
+    intent: &AutomationResetIntent,
+) -> Result<BTreeSet<WorkflowId>, String> {
+    if !intent.cancelled_workflows.is_empty() {
+        return Ok(intent.cancelled_workflows.iter().copied().collect());
+    }
+
+    // Backward-compatible recovery for a reset created before the workflow-id
+    // cohort was persisted in its config. The reset request cancels workflows
+    // immediately before creating automation.reset, so only terminal rows
+    // updated in this narrow window belong to that reset.
+    let reset = context
+        .repository()
+        .read(context.id())
+        .map_err(string_error)?
+        .ok_or_else(|| format!("automation reset workflow {} disappeared", context.id()))?;
+    Ok(context
+        .repository()
+        .list()
+        .map_err(string_error)?
+        .into_iter()
+        .filter(|workflow| workflow.status == WorkflowStatus::Cancelled)
+        .filter(|workflow| {
+            workflow.updated_at <= reset.created_at
+                && reset.created_at.saturating_sub(workflow.updated_at) <= 60_000
+        })
+        .map(|workflow| workflow.id)
+        .collect())
+}
+
+fn reset_transient_placement_subjects(
+    snapshot: &WorkflowPlacementIntentSnapshot,
+    workflow_ids: &BTreeSet<WorkflowId>,
+) -> (BTreeSet<String>, BTreeSet<String>) {
+    let mut devices = BTreeSet::new();
+    let mut tags = BTreeSet::new();
+    for evidence in snapshot
+        .terminal_residuals
+        .iter()
+        .chain(snapshot.failed_transient.iter())
+        .filter(|evidence| workflow_ids.contains(&evidence.workflow_id))
+    {
+        match &evidence.intent.subject {
+            WorkflowPlacementIntentSubject::Device(code) => {
+                devices.insert(code.trim().to_ascii_uppercase());
+            }
+            WorkflowPlacementIntentSubject::DeviceTag(tag) => {
+                tags.insert(tag.clone());
+            }
+        }
+    }
+    (devices, tags)
+}
+
+async fn reset_capture_recovery_devices(
+    context: &WorkflowContext,
+    client: &Client,
+    intent: &AutomationResetIntent,
+    replicant_code: &str,
+    vessel_code: &str,
+) -> Result<Vec<String>, String> {
+    let placement = context
+        .workflow_registry()
+        .placement_intent_snapshot(context.repository(), Some(context.id()))
+        .map_err(string_error)?;
+    let cancelled = reset_cancelled_workflow_ids(context, intent)?;
+    let (mut residual_codes, residual_tags) =
+        reset_transient_placement_subjects(&placement, &cancelled);
+
+    let handles = client
+        .devices()
+        .find()
+        .owned()
+        .assigned_to(replicant_client::ReplicantKey::live(replicant_code.into()))
+        .collect()
+        .await
+        .map_err(string_error)?;
+    let mut assigned = BTreeMap::new();
+    for handle in handles {
+        let snapshot = handle.snapshot().await.map_err(string_error)?;
+        assigned.insert(snapshot.key.id.as_str().to_ascii_uppercase(), snapshot);
+    }
+
+    if !residual_tags.is_empty() {
+        for (code, device) in &assigned {
+            if device.tags.iter().any(|tag| residual_tags.contains(tag)) {
+                residual_codes.insert(code.clone());
+            }
+        }
+    }
+
+    // scan.system projects the controller as residual custody, while the
+    // adopted drones are represented by the controller relationship itself.
+    // Expand only survey controllers here: mining/transport controllers may
+    // own intentionally persistent infrastructure that reset must not uproot.
+    let survey_controllers = residual_codes
+        .iter()
+        .filter_map(|code| {
+            assigned.get(code).and_then(|device| {
+                device
+                    .device_type
+                    .as_ref()
+                    .is_some_and(|kind| kind.as_str() == "ami_survey_controller")
+                    .then_some(device)
+            })
+        })
+        .collect::<Vec<_>>();
+    for controller in survey_controllers {
+        for child in &controller.relationships.controlled_devices {
+            residual_codes.insert(child.id.as_str().to_ascii_uppercase());
+        }
+    }
+
+    let mut recovery = residual_codes
+        .into_iter()
+        .filter(|code| !code.eq_ignore_ascii_case(vessel_code))
+        .filter(|code| {
+            assigned
+                .get(code)
+                .is_some_and(|device| !reset_excludes_device_type(device.device_type.as_ref()))
+        })
+        .collect::<Vec<_>>();
+    recovery.sort_by_key(|code| {
+        assigned
+            .get(code)
+            .and_then(|device| device.device_type.as_ref())
+            .is_some_and(|kind| kind.as_str() == "ami_survey_controller")
+    });
+    recovery.dedup();
+    Ok(recovery)
+}
+
+async fn reset_recover_transient_devices(
+    context: &mut WorkflowContext,
+    client: &Client,
+    intent: &AutomationResetIntent,
+    target: &AutomationResetTarget,
+    vessel_code: &str,
+    checkpoint: &mut AutomationResetCheckpoint,
+) -> Result<bool, String> {
+    let replicant_key = target.replicant.to_ascii_uppercase();
+    if let Some(expected_vessel) = checkpoint
+        .replicants
+        .get(&replicant_key)
+        .and_then(|progress| progress.vessel.as_deref())
+        && !expected_vessel.eq_ignore_ascii_case(vessel_code)
+    {
+        return Err(format!(
+            "automation reset observed {} move from hosted vessel {} to {} during recovery",
+            target.replicant, expected_vessel, vessel_code
+        ));
+    }
+
+    let capture_needed = checkpoint
+        .replicants
+        .get(&replicant_key)
+        .is_none_or(|progress| progress.recovery_devices.is_none());
+    if capture_needed {
+        let devices =
+            reset_capture_recovery_devices(context, client, intent, &target.replicant, vessel_code)
+                .await?;
+        let progress = checkpoint
+            .replicants
+            .entry(replicant_key.clone())
+            .or_default();
+        progress.vessel = Some(vessel_code.to_ascii_uppercase());
+        progress.recovery_devices = Some(devices);
+        context
+            .persist_checkpoint(checkpoint)
+            .map_err(string_error)?;
+    }
+
+    let recovery_devices = checkpoint
+        .replicants
+        .get(&replicant_key)
+        .and_then(|progress| progress.recovery_devices.clone())
+        .unwrap_or_default();
+    if recovery_devices.is_empty() {
+        return Ok(true);
+    }
+
+    let vessel = client
+        .devices()
+        .get(vessel_code)
+        .await
+        .map_err(string_error)?
+        .snapshot()
+        .await
+        .map_err(string_error)?;
+    if reset_device_in_transit(&vessel) {
+        return Ok(false);
+    }
+    let vessel_location = vessel
+        .location
+        .as_ref()
+        .map(|location| location.id.as_str().to_owned())
+        .ok_or_else(|| {
+            format!(
+                "automation reset cannot recover transient devices for {} because vessel {} has no location",
+                target.replicant, vessel_code
+            )
+        })?;
+
+    // Ask active survey controllers to withdraw their adopted fleet first.
+    // Individual recall below remains the authoritative fallback after the
+    // managed projection has had a chance to observe that withdraw.
+    let mut withdraw_started = false;
+    for device_code in &recovery_devices {
+        let already_withdrawn = checkpoint
+            .replicants
+            .get(&replicant_key)
+            .is_some_and(|progress| progress.withdrawn_controllers.contains(device_code));
+        if already_withdrawn {
+            continue;
+        }
+        let handle = client
+            .devices()
+            .get(device_code)
+            .await
+            .map_err(string_error)?;
+        let device = handle.snapshot().await.map_err(string_error)?;
+        let is_survey_controller = device
+            .device_type
+            .as_ref()
+            .is_some_and(|kind| kind.as_str() == "ami_survey_controller");
+        let directive_active = device
+            .active_directive
+            .as_ref()
+            .and_then(|directive| directive.status.as_deref())
+            .is_some_and(|status| !status.eq_ignore_ascii_case("inactive"));
+        if is_survey_controller
+            && directive_active
+            && !device.relationships.controlled_devices.is_empty()
+            && reset_device_has_command(&device, "withdraw")
+        {
+            if !reset_claim_device(context, device_code)? {
+                return Ok(false);
+            }
+            let operation = handle
+                .command_with_id(
+                    reset_operation_id(context.id(), "withdraw", device_code),
+                    replicant_client::raw::devices::DeviceCommand::Withdraw,
+                )
+                .await
+                .map_err(string_error)?;
+            let status = operation.status().await.map_err(string_error)?;
+            if matches!(
+                status,
+                OperationStatus::Cancelled | OperationStatus::Rejected | OperationStatus::Failed
+            ) {
+                tracing::warn!(
+                    workflow_id = %context.id(),
+                    controller = %device_code,
+                    operation_id = %operation.id(),
+                    ?status,
+                    "survey fleet withdraw did not complete; automation reset will fall back to direct device recall"
+                );
+            } else {
+                withdraw_started = true;
+            }
+        }
+        checkpoint
+            .replicants
+            .entry(replicant_key.clone())
+            .or_default()
+            .withdrawn_controllers
+            .insert(device_code.clone());
+        context
+            .persist_checkpoint(checkpoint)
+            .map_err(string_error)?;
+    }
+    if withdraw_started {
+        return Ok(false);
+    }
+
+    for device_code in recovery_devices {
+        if checkpoint
+            .replicants
+            .get(&replicant_key)
+            .is_some_and(|progress| progress.recovered_devices.contains(&device_code))
+        {
+            continue;
+        }
+        if !reset_claim_device(context, &device_code)? {
+            return Ok(false);
+        }
+        let handle = client
+            .devices()
+            .get(&device_code)
+            .await
+            .map_err(string_error)?;
+        let device = handle.snapshot().await.map_err(string_error)?;
+        if device.access != AccessScope::Owned {
+            return Err(format!(
+                "automation reset cannot recover non-owned transient device {device_code}"
+            ));
+        }
+        if device
+            .relationships
+            .stowed_in
+            .as_ref()
+            .is_some_and(|parent| parent.id.as_str().eq_ignore_ascii_case(vessel_code))
+        {
+            checkpoint
+                .replicants
+                .entry(replicant_key.clone())
+                .or_default()
+                .recovered_devices
+                .insert(device_code.clone());
+            context
+                .persist_checkpoint(checkpoint)
+                .map_err(string_error)?;
+            continue;
+        }
+        if reset_device_in_transit(&device) {
+            return Ok(false);
+        }
+
+        let location = device
+            .location
+            .as_ref()
+            .map(|value| value.id.as_str().to_owned())
+            .ok_or_else(|| {
+                format!(
+                    "automation reset cannot locate transient device {device_code} for {}",
+                    target.replicant
+                )
+            })?;
+        if !designation_in_system(&location, &system_designation(&vessel_location)) {
+            return Err(format!(
+                "automation reset cannot recover transient device {device_code}: it is at {location}, outside vessel {vessel_code}'s current system at {vessel_location}"
+            ));
+        }
+
+        if !location.eq_ignore_ascii_case(&vessel_location) {
+            if !reset_device_has_command(&device, "recall") {
+                return Err(format!(
+                    "automation reset cannot recover transient device {device_code} at {location}: it does not advertise recall"
+                ));
+            }
+            let operation = handle
+                .command_with_id(
+                    reset_operation_id(context.id(), "recall", &device_code),
+                    replicant_client::raw::devices::DeviceCommand::Recall,
+                )
+                .await
+                .map_err(string_error)?;
+            let status = operation.status().await.map_err(string_error)?;
+            if matches!(
+                status,
+                OperationStatus::Cancelled | OperationStatus::Rejected | OperationStatus::Failed
+            ) {
+                return Err(format!(
+                    "automation reset could not recall transient device {device_code}: operation {} ended as {:?}",
+                    operation.id(),
+                    status
+                ));
+            }
+            return Ok(false);
+        }
+
+        if !reset_device_has_command(&device, "stow") {
+            return Err(format!(
+                "automation reset recovered transient device {device_code} to {vessel_location}, but it does not advertise stow"
+            ));
+        }
+        let operation = handle
+            .command_with_id(
+                reset_operation_id(context.id(), "stow", &device_code),
+                replicant_client::raw::devices::DeviceCommand::Stow {
+                    target: Some(vessel_code.to_owned()),
+                },
+            )
+            .await
+            .map_err(string_error)?;
+        await_success(&operation).await?;
+        let device = handle
+            .refresh()
+            .await
+            .map_err(string_error)?
+            .snapshot()
+            .await
+            .map_err(string_error)?;
+        if !device
+            .relationships
+            .stowed_in
+            .as_ref()
+            .is_some_and(|parent| parent.id.as_str().eq_ignore_ascii_case(vessel_code))
+        {
+            return Ok(false);
+        }
+        checkpoint
+            .replicants
+            .entry(replicant_key.clone())
+            .or_default()
+            .recovered_devices
+            .insert(device_code);
+        context
+            .persist_checkpoint(checkpoint)
+            .map_err(string_error)?;
+    }
+
+    Ok(true)
 }
 
 async fn reset_capture_unload_devices(
@@ -3075,24 +3507,9 @@ impl WorkflowExecutor for AutomationResetWorkflow {
                 context.checkpoint().map_err(string_error)?;
 
             loop {
-                if !reset_claim_replicants(context, &intent.targets)? {
-                    context
-                        .advance_to("waiting for cancelled automation claims", &checkpoint)
-                        .map_err(string_error)?;
-                    if !reset_wait_once(
-                        context,
-                        "waiting for cancelled automation claims to release",
-                        Duration::from_secs(5),
-                    )
-                    .await?
-                    {
-                        return Ok(());
-                    }
-                    continue;
-                }
-
                 let mut all_complete = true;
                 let mut wait_for_claim = false;
+                let mut wait_for_recovery = false;
                 for target in &intent.targets {
                     let replicant_key = target.replicant.to_ascii_uppercase();
                     if checkpoint
@@ -3103,6 +3520,18 @@ impl WorkflowExecutor for AutomationResetWorkflow {
                         continue;
                     }
                     all_complete = false;
+
+                    if !reset_claim_replicant(context, &target.replicant)? {
+                        wait_for_claim = true;
+                        context
+                            .advance_to(
+                                format!("waiting for {} resource claim", target.replicant),
+                                &checkpoint,
+                            )
+                            .map_err(string_error)?;
+                        continue;
+                    }
+
                     let handle = client
                         .replicants()
                         .get_owned(&target.replicant)
@@ -3156,9 +3585,38 @@ impl WorkflowExecutor for AutomationResetWorkflow {
                     }
 
                     let current_location = vessel.location.as_ref().or(snapshot.location.as_ref());
-                    let at_home = current_location.is_some_and(|location| {
-                        designation_in_system(location.id.as_str(), &target.home_system)
-                    });
+                    let Some(current_location) = current_location else {
+                        context
+                            .advance_to(
+                                format!("waiting for {} location", target.replicant),
+                                &checkpoint,
+                            )
+                            .map_err(string_error)?;
+                        continue;
+                    };
+                    let at_home =
+                        designation_in_system(current_location.id.as_str(), &target.home_system);
+
+                    context
+                        .advance_to(
+                            format!("recovering {} transient devices", target.replicant),
+                            &checkpoint,
+                        )
+                        .map_err(string_error)?;
+                    if !reset_recover_transient_devices(
+                        context,
+                        &client,
+                        &intent,
+                        target,
+                        &vessel_code,
+                        &mut checkpoint,
+                    )
+                    .await?
+                    {
+                        wait_for_recovery = true;
+                        continue;
+                    }
+
                     if at_home {
                         context
                             .advance_to(
@@ -3180,15 +3638,6 @@ impl WorkflowExecutor for AutomationResetWorkflow {
                         continue;
                     }
 
-                    if current_location.is_none() {
-                        context
-                            .advance_to(
-                                format!("waiting for {} location", target.replicant),
-                                &checkpoint,
-                            )
-                            .map_err(string_error)?;
-                        continue;
-                    }
                     context
                         .advance_to(format!("recalling {} home", target.replicant), &checkpoint)
                         .map_err(string_error)?;
@@ -3240,15 +3689,21 @@ impl WorkflowExecutor for AutomationResetWorkflow {
                         .map_err(string_error);
                 }
 
-                let description = if wait_for_claim {
-                    "waiting for device claims to release during automation reset"
+                let (description, interval) = if wait_for_claim {
+                    (
+                        "waiting for resource claims to release during automation reset",
+                        Duration::from_secs(5),
+                    )
+                } else if wait_for_recovery {
+                    (
+                        "waiting for transient automation devices to return to their vessels",
+                        Duration::from_secs(15),
+                    )
                 } else {
-                    "waiting for Replicants to finish travel or arrive home"
-                };
-                let interval = if wait_for_claim {
-                    Duration::from_secs(5)
-                } else {
-                    Duration::from_secs(30)
+                    (
+                        "waiting for Replicants to finish travel or arrive home",
+                        Duration::from_secs(30),
+                    )
                 };
                 if !reset_wait_once(context, description, interval).await? {
                     return Ok(());
@@ -14499,10 +14954,49 @@ mod tests {
                 replicant: "R-1".to_owned(),
                 home_system: "SCEPTURUM".to_owned(),
             }],
+            cancelled_workflows: Vec::new(),
         });
         assert_eq!(workflow.kind, automation_reset_workflow_kind());
         assert_eq!(workflow.schema_version, SCHEMA_VERSION);
         assert_eq!(workflow.current_step.as_deref(), Some("queued"));
+    }
+
+    #[test]
+    fn automation_reset_recovers_only_the_cancelled_workflow_cohort() {
+        let selected = WorkflowId::new();
+        let unrelated = WorkflowId::new();
+        let evidence = |workflow_id, subject| replicant_workflow::WorkflowPlacementIntentEvidence {
+            workflow_id,
+            workflow_kind: WorkflowKind::new("scan.tour").expect("kind"),
+            workflow_status: WorkflowStatus::Cancelled,
+            intent: WorkflowPlacementIntent {
+                subject,
+                relation: WorkflowPlacementIntentRelation::Staged,
+                work_item_id: None,
+                expected_location: None,
+            },
+        };
+        let snapshot = WorkflowPlacementIntentSnapshot {
+            terminal_residuals: vec![
+                evidence(
+                    selected,
+                    WorkflowPlacementIntentSubject::Device(" drone-1 ".into()),
+                ),
+                evidence(
+                    selected,
+                    WorkflowPlacementIntentSubject::DeviceTag("scan:one".into()),
+                ),
+                evidence(
+                    unrelated,
+                    WorkflowPlacementIntentSubject::Device("DRONE-OLD".into()),
+                ),
+            ],
+            ..WorkflowPlacementIntentSnapshot::default()
+        };
+        let selected = BTreeSet::from([selected]);
+        let (devices, tags) = reset_transient_placement_subjects(&snapshot, &selected);
+        assert_eq!(devices, BTreeSet::from(["DRONE-1".to_owned()]));
+        assert_eq!(tags, BTreeSet::from(["scan:one".to_owned()]));
     }
 
     fn provision_fixture(tag: &str) -> ReplicantProvisionCheckpoint {

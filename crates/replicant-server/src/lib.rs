@@ -7634,9 +7634,17 @@ async fn reset_automation(
         .set_automation_policy(policy)
         .map_err(ApiError::repository)?;
 
+    let cancelled_workflows = state
+        .repository
+        .list_active()
+        .map_err(ApiError::repository)?
+        .into_iter()
+        .filter(|workflow| !workflow.status.is_terminal())
+        .map(|workflow| workflow.id)
+        .collect::<Vec<_>>();
     let affected_workflows = state
         .supervisor
-        .cancel_selected(&[])
+        .cancel_selected(&cancelled_workflows)
         .map_err(supervisor_error)?;
 
     // The reset workflow must be allowed to run even if the operator had
@@ -7651,6 +7659,7 @@ async fn reset_automation(
         .repository
         .create(new_automation_reset_workflow(AutomationResetIntent {
             targets,
+            cancelled_workflows,
         }))
         .map_err(ApiError::repository)?;
 

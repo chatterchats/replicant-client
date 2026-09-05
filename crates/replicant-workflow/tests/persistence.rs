@@ -543,6 +543,12 @@ async fn startup_reconciles_terminal_and_missing_claim_owners() {
             },
         )
         .expect("complete owner");
+    assert!(
+        repository
+            .claims(terminal.id)
+            .expect("terminal claims released immediately")
+            .is_empty()
+    );
     repository
         .update(
             paused.id,

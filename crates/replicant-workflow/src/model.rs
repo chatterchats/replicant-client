@@ -329,7 +329,7 @@ pub enum WorkflowStatus {
     Succeeded,
     /// Stopped after an unrecoverable error.
     Failed,
-    /// Cooperatively cancelled.
+    /// Cancelled after the in-process executor was stopped and claims released.
     Cancelled,
 }
 /// A structural description of a durable service capability requested or

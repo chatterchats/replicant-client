@@ -721,10 +721,12 @@ impl WorkflowSupervisor {
         Ok(())
     }
 
-    /// Durably requests cooperative cancellation.
+    /// Durably cancels a workflow, stops any in-process executor, and releases
+    /// every exclusive claim immediately.
     ///
-    /// Claims remain held until a running executor reaches its safe boundary;
-    /// a workflow without an executor releases them immediately.
+    /// Already-submitted managed operations remain durable and are reconciled
+    /// from authoritative state, but a cancelled workflow cannot retain local
+    /// scheduling ownership after its terminal state is persisted.
     pub fn cancel(&self, id: WorkflowId) -> Result<(), SupervisorError> {
         self.cancel_instance(self.read(id)?)
     }
@@ -736,15 +738,20 @@ impl WorkflowSupervisor {
             kind = %instance.kind,
             "workflow cancellation requested"
         );
-        self.transition(instance, WorkflowStatus::Cancelled)?;
         let executors = self.executors();
         if let Some(control) = executors.controls.get(&id) {
             control.send_replace(ControlRequest::Cancel);
         }
-        if !executors.controls.contains_key(&id) {
-            drop(executors);
-            self.repository.release_claims(id)?;
+        if let Some(task) = executors.tasks.get(&id) {
+            task.abort();
         }
+        drop(executors);
+
+        // Request executor cancellation before publishing the terminal state.
+        // The terminal repository transition releases all claims in the same
+        // transaction, so an active row keeps its claims if persistence fails.
+        self.transition(instance, WorkflowStatus::Cancelled)?;
+        self.repository.release_claims(id)?;
         Ok(())
     }
 

@@ -2796,17 +2796,7 @@ impl WorkflowRepository {
                 params![id.to_string(), now],
             )?;
             transaction.execute(
-                "DELETE FROM workflow_resource_claims
-                 WHERE workflow_id = ?1
-                   AND EXISTS (
-                     SELECT 1 FROM workflow_resource_allocations allocation
-                     JOIN workflow_work_items item ON item.id = allocation.item_id
-                     WHERE item.workflow_id = ?1
-                       AND allocation.state = 'active'
-                       AND allocation.resource_namespace =
-                           workflow_resource_claims.resource_namespace
-                       AND allocation.resource_key = workflow_resource_claims.resource_key
-                   )",
+                "DELETE FROM workflow_resource_claims WHERE workflow_id = ?1",
                 [id.to_string()],
             )?;
             transaction.execute(

@@ -449,7 +449,7 @@ async fn pause_all_survives_restart_and_blocks_executor_start() {
 }
 
 #[tokio::test]
-async fn cancels_cooperatively() {
+async fn cancellation_aborts_executor_and_releases_claims_immediately() {
     let repository = Arc::new(WorkflowRepository::open_in_memory().expect("open repository"));
     let (id, harness, _, supervisor) = setup(repository.clone(), false);
     repository
@@ -458,8 +458,13 @@ async fn cancels_cooperatively() {
     supervisor.tick().await.expect("start workflow");
     reach_step(&harness).await;
     supervisor.cancel(id).expect("request cancellation");
-    assert_eq!(repository.claims(id).expect("read claims").len(), 1);
-    harness.proceed.add_permits(1);
+
+    assert_eq!(
+        repository.read(id).expect("workflow").unwrap().status,
+        WorkflowStatus::Cancelled
+    );
+    assert!(repository.claims(id).expect("read claims").is_empty());
+
     while supervisor.has_executor(id) {
         tokio::task::yield_now().await;
         supervisor.tick().await.expect("reap cancelled executor");
