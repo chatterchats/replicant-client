@@ -2303,6 +2303,22 @@ async fn targeted_device_row(
             locations.insert(destination.id.to_string());
         }
     }
+    if let Some(directive) = device.active_directive.as_ref() {
+        for key in ["collect", "deliver"] {
+            if let Some(location) = directive.details.get(key).and_then(Value::as_str) {
+                locations.insert(location.to_owned());
+            }
+            if let Some(location) = directive
+                .details
+                .get("configuration")
+                .and_then(Value::as_object)
+                .and_then(|configuration| configuration.get(key))
+                .and_then(Value::as_str)
+            {
+                locations.insert(location.to_owned());
+            }
+        }
+    }
     for location in locations {
         if let Some(system) = targeted_location_system(state, &location).await? {
             location_systems.insert(location, Some(system));
@@ -2412,6 +2428,22 @@ async fn targeted_location_system(
     Ok(observations
         .last()
         .and_then(|observation| observation.value.system.clone())
+        .or_else(|| {
+            state
+                .client()
+                .galaxy()
+                .catalogue()
+                .into_iter()
+                .filter_map(|star| {
+                    let system = star.key.id.to_string();
+                    (location == system
+                        || location
+                            .strip_prefix(&system)
+                            .is_some_and(|suffix| suffix.starts_with('-')))
+                    .then_some(system)
+                })
+                .max_by_key(String::len)
+        })
         .or_else(|| {
             location
                 .split_once('-')
