@@ -7,7 +7,7 @@ import { recordWebEvent } from "./telemetry";
 const CAMERA_KEY = "replicant.galaxy.camera";
 
 interface RendererModule {
-  default: () => unknown | Promise<unknown>;
+  default: () => unknown;
   GalaxyRenderer: new (canvas: HTMLCanvasElement) => Renderer;
 }
 

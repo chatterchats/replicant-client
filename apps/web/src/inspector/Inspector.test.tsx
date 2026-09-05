@@ -10,6 +10,15 @@ import { DeviceLogButton } from "../DeviceLogPanel";
 import type { DescriptorCatalog } from "../protocol";
 import { Inspector, InspectorView } from "./Inspector";
 
+vi.mock("../daemon", () => ({
+  useDaemonState: () => ({
+    connection: "connected",
+    revision: 1,
+    error: null,
+    invalidated: {},
+  }),
+}));
+
 const descriptors: DescriptorCatalog = {
   reports: [],
   actions: [],

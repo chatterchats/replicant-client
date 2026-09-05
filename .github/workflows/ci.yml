@@ -19,6 +19,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_TARGET_DIR: /home/chats/.cache/replicant-ci/target
+  CARGO_TARGET_MAX_GIB: 75
   PIP_CACHE_DIR: /home/chats/.cache/replicant-ci/pip
   npm_config_cache: /home/chats/.cache/replicant-ci/npm
 
@@ -93,9 +94,31 @@ jobs:
             make -k "${targets[@]}"
           fi
 
-      - name: Cache and disk usage
+      - name: Cache maintenance and disk usage
         if: always()
+        shell: bash
         run: |
-          du -sh "$CARGO_TARGET_DIR" 2>/dev/null || true
+          if [[ -d "$CARGO_TARGET_DIR" ]]; then
+            target_kib=$(du -sk "$CARGO_TARGET_DIR" | awk '{print $1}')
+            threshold_kib=$(( ${{ env.CARGO_TARGET_MAX_GIB }} * 1024 * 1024 ))
+
+            target_gib=$(awk -v kib="$target_kib" \
+              'BEGIN { printf "%.1f", kib / 1024 / 1024 }')
+
+            echo "Cargo target cache: ${target_gib} GiB"
+
+            if (( target_kib >= threshold_kib )); then
+              echo "Cargo target cache is >= 75 GiB; cleaning it."
+              cargo clean --target-dir "$CARGO_TARGET_DIR"
+
+              echo "Cargo target cache after cleanup:"
+              du -sh "$CARGO_TARGET_DIR" 2>/dev/null || true
+            else
+              echo "Cargo target cache is below 75 GiB; retaining it."
+            fi
+          else
+            echo "Cargo target cache does not exist."
+          fi
+
           du -sh "$HOME/.cargo/registry" 2>/dev/null || true
           df -h .

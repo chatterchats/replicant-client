@@ -10,6 +10,7 @@ import {
   ParameterField,
   validateParameters,
 } from "./AutomationsPage";
+import { sharedQueryCache } from "./queryCache";
 import type { ParameterDescriptor, WorkflowDescriptor } from "./protocol";
 
 vi.mock("./daemon", () => ({
@@ -46,6 +47,7 @@ function parameter(
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  sharedQueryCache.clear();
   vi.useRealTimers();
 });
 
