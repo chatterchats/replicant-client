@@ -3193,6 +3193,29 @@ h1 {
   border-color: var(--accent);
   color: var(--accent);
 }
+.director-reset {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.85rem 1rem;
+  border: 1px solid rgba(207, 102, 121, 0.38);
+  border-radius: 12px;
+  background: rgba(207, 102, 121, 0.055);
+}
+.director-reset strong {
+  color: var(--danger);
+}
+.director-reset p {
+  max-width: 76ch;
+  margin: 0.2rem 0 0;
+  color: var(--muted);
+}
+.director-reset button.danger {
+  flex: 0 0 auto;
+  border-color: rgba(207, 102, 121, 0.55);
+  color: var(--danger);
+}
 .director-metrics {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -3368,6 +3391,13 @@ h1 {
 @media (max-width: 800px) {
   .director-toolbar {
     flex-direction: column;
+  }
+  .director-reset {
+    align-items: stretch;
+    flex-direction: column;
+  }
+  .director-reset button.danger {
+    width: 100%;
   }
   .director-mode {
     justify-content: start;

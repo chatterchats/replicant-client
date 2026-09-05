@@ -142,6 +142,14 @@ export interface AutomationControlResponse {
   affected_workflows: number;
 }
 
+export interface AutomationResetResponse {
+  automation: AutomationStatus;
+  director_mode: DirectorMode;
+  affected_workflows: number;
+  reset_workflow: WorkflowSummary;
+  replicants: number;
+}
+
 export type DirectorMode = "off" | "advisory" | "automatic";
 export type DirectorGoalKind =
   | "establish_regions"
@@ -4968,6 +4976,24 @@ export function parseAutomationControlResponse(
         item.affected_workflows,
         "affected workflow count",
       ),
+    };
+  });
+}
+
+export function parseAutomationResetResponse(
+  value: unknown,
+): Versioned<AutomationResetResponse> {
+  return envelope(value, (payload) => {
+    const item = record(payload, "automation reset response");
+    return {
+      automation: automation(item.automation),
+      director_mode: oneOf(item.director_mode, directorModes, "Director mode"),
+      affected_workflows: number(
+        item.affected_workflows,
+        "affected workflow count",
+      ),
+      reset_workflow: workflow(item.reset_workflow),
+      replicants: number(item.replicants, "reset Replicant count"),
     };
   });
 }

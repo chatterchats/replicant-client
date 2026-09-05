@@ -17,7 +17,8 @@ use crate::bootstrap::{
 };
 use replicant_client::{
     Client, Device, DeviceHandle, DeviceType, MiningDirective, Operation, OperationId,
-    OperationStatus, SurveyDirective, domain::AccessScope,
+    OperationStatus, SurveyDirective,
+    domain::{AccessScope, TravelState},
 };
 #[cfg(test)]
 use replicant_printing::managed::TrackedPrintAssignment;
@@ -218,6 +219,12 @@ pub fn region_establish_workflow_kind() -> WorkflowKind {
     WorkflowKind::new("region.establish").expect("valid workflow kind")
 }
 
+/// Stable internal workflow used by the destructive automation reset command.
+#[must_use]
+pub fn automation_reset_workflow_kind() -> WorkflowKind {
+    WorkflowKind::new("automation.reset").expect("static workflow kind is valid")
+}
+
 /// Registers intent-native application workflows.
 pub fn register(registry: &mut WorkflowRegistry) -> Result<(), RegistryError> {
     registry.register(Arc::new(ScanSystemWorkflowFactory::new()))?;
@@ -239,10 +246,55 @@ pub fn register(registry: &mut WorkflowRegistry) -> Result<(), RegistryError> {
     registry.register(Arc::new(EventCampaignWorkflowFactory::new()))?;
     registry.register(Arc::new(ObservatoryWorkflowFactory::new()))?;
     registry.register(Arc::new(ReplicantProvisionWorkflowFactory::new()))?;
+    registry.register(Arc::new(AutomationResetWorkflowFactory::new()))?;
     registry.register(Arc::new(
         crate::asteroid_diversion::AsteroidDiversionWorkflowFactory::new(),
     ))?;
     registry.register(Arc::new(RegionEstablishWorkflowFactory::new()))
+}
+
+/// One Replicant and the Director-assigned home system it must return to.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct AutomationResetTarget {
+    /// Owned Replicant code.
+    pub replicant: String,
+    /// Regional System Hub star used as this Replicant's home system.
+    pub home_system: String,
+}
+
+/// Fleet targets captured before an automation reset cancels existing work.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct AutomationResetIntent {
+    /// Complete deterministic reset target set.
+    pub targets: Vec<AutomationResetTarget>,
+}
+
+/// Restart-safe cleanup state for one returned Replicant.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
+pub struct AutomationResetReplicantCheckpoint {
+    /// Hosted vessel observed after the Replicant reached home.
+    #[serde(default)]
+    pub vessel: Option<String>,
+    /// Non-matrix devices captured from the vessel before any unload mutation.
+    #[serde(default)]
+    pub unload_devices: Option<Vec<String>>,
+    /// Devices whose deploy postcondition has been verified.
+    #[serde(default)]
+    pub deployed_devices: BTreeSet<String>,
+    /// Devices whose complete tag set has been cleared.
+    #[serde(default)]
+    pub cleared_devices: BTreeSet<String>,
+    /// Whether this Replicant is fully home and cleaned up.
+    #[serde(default)]
+    pub complete: bool,
+}
+
+/// Durable checkpoint for a fleet-wide automation reset.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
+pub struct AutomationResetCheckpoint {
+    /// Per-Replicant progress keyed by canonical Replicant code.
+    #[serde(default)]
+    pub replicants: BTreeMap<String, AutomationResetReplicantCheckpoint>,
 }
 
 /// Shared player intent for system/belt survey automation.
@@ -2657,11 +2709,554 @@ workflow_factory!(
     provision_placement
 );
 workflow_factory!(
+    AutomationResetWorkflowFactory,
+    AutomationResetWorkflow,
+    automation_reset_workflow_kind,
+    automation_reset_placement
+);
+workflow_factory!(
     RegionEstablishWorkflowFactory,
     RegionEstablishWorkflow,
     region_establish_workflow_kind,
     region_establish_placement
 );
+
+fn automation_reset_placement(
+    instance: &replicant_workflow::WorkflowInstance,
+    _work_items: &[WorkItem],
+) -> Result<WorkflowPlacementIntentProjection, String> {
+    let _: AutomationResetIntent = instance.config().map_err(string_error)?;
+    let _: AutomationResetCheckpoint = instance.checkpoint().map_err(string_error)?;
+    Ok(WorkflowPlacementIntentProjection {
+        coverage: WorkflowPlacementIntentCoverage::Complete,
+        intents: Vec::new(),
+        resolutions: Vec::new(),
+    })
+}
+
+fn reset_operation_id(workflow_id: WorkflowId, action: &str, subject: &str) -> OperationId {
+    let workflow = workflow_id.to_string();
+    let canonical_subject = subject.trim().to_ascii_uppercase();
+    let mut hasher = Sha256::new();
+    hasher.update(b"replicant.automation-reset.operation.v1\0");
+    for component in [workflow.as_str(), action, canonical_subject.as_str()] {
+        hasher.update((component.len() as u64).to_le_bytes());
+        hasher.update(component.as_bytes());
+    }
+    let digest = hasher.finalize();
+    let hex = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    OperationId::new(format!("automation-reset:{hex}"))
+}
+
+fn reset_excludes_device_type(device_type: Option<&DeviceType>) -> bool {
+    device_type.is_some_and(|device_type| {
+        matches!(
+            device_type.as_str().to_ascii_lowercase().as_str(),
+            "replicant_matrix" | "empty_replicant_matrix"
+        )
+    })
+}
+
+fn reset_travel_targets_home(travel: &TravelState, home_system: &str) -> bool {
+    travel
+        .final_destination
+        .as_ref()
+        .or(travel.destination.as_ref())
+        .is_some_and(|destination| designation_in_system(destination.id.as_str(), home_system))
+}
+
+async fn reset_wait_once(
+    context: &mut WorkflowContext,
+    description: impl Into<String>,
+    poll_interval: Duration,
+) -> Result<bool, String> {
+    let outcome = context
+        .wait_until(
+            WaitIntent::state(description)
+                .for_events([
+                    "travel.arrived".to_owned(),
+                    "travel.cancelled".to_owned(),
+                    "device.deployed".to_owned(),
+                ])
+                .polling_every(poll_interval),
+            |_client, signal| async move {
+                Ok(matches!(
+                    signal,
+                    WaitSignal::History
+                        | WaitSignal::Event
+                        | WaitSignal::Poll
+                        | WaitSignal::WatcherGap
+                ))
+            },
+        )
+        .await
+        .map_err(string_error)?;
+    Ok(matches!(
+        outcome,
+        WaitOutcome::Satisfied | WaitOutcome::Deadline
+    ))
+}
+
+fn reset_claim_replicants(
+    context: &WorkflowContext,
+    targets: &[AutomationResetTarget],
+) -> Result<bool, String> {
+    for target in targets {
+        match context.acquire_claim(ResourceKey::Replicant(target.replicant.clone())) {
+            Ok(_) => {}
+            Err(RepositoryError::ClaimConflict { .. }) => return Ok(false),
+            Err(error) => return Err(string_error(error)),
+        }
+    }
+    Ok(true)
+}
+
+fn reset_claim_device(context: &WorkflowContext, code: &str) -> Result<bool, String> {
+    match context.acquire_claim(ResourceKey::Device(code.to_owned())) {
+        Ok(_) => Ok(true),
+        Err(RepositoryError::ClaimConflict { .. }) => Ok(false),
+        Err(error) => Err(string_error(error)),
+    }
+}
+
+async fn reset_capture_unload_devices(
+    client: &Client,
+    replicant_code: &str,
+    vessel_code: &str,
+) -> Result<Vec<String>, String> {
+    let vessel = client
+        .devices()
+        .get(vessel_code)
+        .await
+        .map_err(string_error)?
+        .snapshot()
+        .await
+        .map_err(string_error)?;
+    let mut devices = Vec::new();
+    for child in &vessel.relationships.stowed_devices {
+        let code = child.id.as_str();
+        let device = client
+            .devices()
+            .get(code)
+            .await
+            .map_err(string_error)?
+            .snapshot()
+            .await
+            .map_err(string_error)?;
+        let device_type = device.device_type.as_ref().ok_or_else(|| {
+            format!(
+                "automation reset cannot safely unload {code} from {replicant_code}: device type is unknown"
+            )
+        })?;
+        if reset_excludes_device_type(Some(device_type)) {
+            continue;
+        }
+        if device.access != AccessScope::Owned {
+            return Err(format!(
+                "automation reset cannot mutate non-owned stowed device {code} on {replicant_code}"
+            ));
+        }
+        devices.push(code.to_ascii_uppercase());
+    }
+    devices.sort();
+    devices.dedup();
+    Ok(devices)
+}
+
+async fn reset_unload_device(
+    context: &mut WorkflowContext,
+    client: &Client,
+    vessel_code: &str,
+    device_code: &str,
+    checkpoint: &mut AutomationResetCheckpoint,
+    replicant_key: &str,
+) -> Result<bool, String> {
+    if !reset_claim_device(context, device_code)? {
+        return Ok(false);
+    }
+    let handle = client
+        .devices()
+        .get(device_code)
+        .await
+        .map_err(string_error)?;
+    let mut device = handle.snapshot().await.map_err(string_error)?;
+    if reset_excludes_device_type(device.device_type.as_ref()) {
+        return Err(format!(
+            "automation reset refused to unload protected matrix device {device_code}"
+        ));
+    }
+
+    let progress = checkpoint
+        .replicants
+        .get(replicant_key)
+        .cloned()
+        .unwrap_or_default();
+    if !progress.deployed_devices.contains(device_code) {
+        let still_stowed = device
+            .relationships
+            .stowed_in
+            .as_ref()
+            .is_some_and(|parent| parent.id.as_str().eq_ignore_ascii_case(vessel_code));
+        if still_stowed {
+            let operation = handle
+                .command_with_id(
+                    reset_operation_id(context.id(), "deploy", device_code),
+                    replicant_client::raw::devices::DeviceCommand::Deploy,
+                )
+                .await
+                .map_err(string_error)?;
+            await_success(&operation).await?;
+            device = handle
+                .refresh()
+                .await
+                .map_err(string_error)?
+                .snapshot()
+                .await
+                .map_err(string_error)?;
+            if device
+                .relationships
+                .stowed_in
+                .as_ref()
+                .is_some_and(|parent| parent.id.as_str().eq_ignore_ascii_case(vessel_code))
+            {
+                return Err(format!(
+                    "automation reset deployed {device_code}, but it remains stowed in {vessel_code}"
+                ));
+            }
+        }
+        checkpoint
+            .replicants
+            .entry(replicant_key.to_owned())
+            .or_default()
+            .deployed_devices
+            .insert(device_code.to_owned());
+        context
+            .persist_checkpoint(checkpoint)
+            .map_err(string_error)?;
+    }
+
+    let progress = checkpoint
+        .replicants
+        .get(replicant_key)
+        .cloned()
+        .unwrap_or_default();
+    if !progress.cleared_devices.contains(device_code) {
+        if !device.tags.is_empty() {
+            let operation = handle
+                .configure_with_id(
+                    reset_operation_id(context.id(), "clear-tags", device_code),
+                    replicant_client::raw::devices::DeviceConfiguration {
+                        tags: Some(Vec::new()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map_err(string_error)?;
+            await_success(&operation).await?;
+            device = handle
+                .refresh()
+                .await
+                .map_err(string_error)?
+                .snapshot()
+                .await
+                .map_err(string_error)?;
+            if !device.tags.is_empty() {
+                return Err(format!(
+                    "automation reset cleared tags on {device_code}, but tags remain: {:?}",
+                    device.tags
+                ));
+            }
+        }
+        checkpoint
+            .replicants
+            .entry(replicant_key.to_owned())
+            .or_default()
+            .cleared_devices
+            .insert(device_code.to_owned());
+        context
+            .persist_checkpoint(checkpoint)
+            .map_err(string_error)?;
+    }
+    Ok(true)
+}
+
+async fn reset_process_home_replicant(
+    context: &mut WorkflowContext,
+    client: &Client,
+    target: &AutomationResetTarget,
+    replicant: &replicant_client::domain::Replicant,
+    checkpoint: &mut AutomationResetCheckpoint,
+) -> Result<bool, String> {
+    let replicant_key = target.replicant.to_ascii_uppercase();
+    let vessel_code = replicant
+        .hosted_device
+        .as_ref()
+        .map(|device| device.id.as_str().to_ascii_uppercase())
+        .ok_or_else(|| {
+            format!(
+                "automation reset cannot unload {} because it has no hosted vessel",
+                target.replicant
+            )
+        })?;
+
+    if let Some(expected_vessel) = checkpoint
+        .replicants
+        .get(&replicant_key)
+        .and_then(|progress| progress.vessel.as_deref())
+        && !expected_vessel.eq_ignore_ascii_case(&vessel_code)
+    {
+        return Err(format!(
+            "automation reset observed {} move from hosted vessel {} to {} after cleanup began",
+            target.replicant, expected_vessel, vessel_code
+        ));
+    }
+    let capture_needed = checkpoint
+        .replicants
+        .get(&replicant_key)
+        .is_none_or(|progress| progress.unload_devices.is_none());
+    if capture_needed {
+        let devices = reset_capture_unload_devices(client, &target.replicant, &vessel_code).await?;
+        let progress = checkpoint
+            .replicants
+            .entry(replicant_key.clone())
+            .or_default();
+        progress.vessel = Some(vessel_code.clone());
+        progress.unload_devices = Some(devices);
+        context
+            .persist_checkpoint(checkpoint)
+            .map_err(string_error)?;
+    }
+
+    let devices = checkpoint
+        .replicants
+        .get(&replicant_key)
+        .and_then(|progress| progress.unload_devices.clone())
+        .unwrap_or_default();
+    for device_code in devices {
+        if !reset_unload_device(
+            context,
+            client,
+            &vessel_code,
+            &device_code,
+            checkpoint,
+            &replicant_key,
+        )
+        .await?
+        {
+            return Ok(false);
+        }
+    }
+    let progress = checkpoint.replicants.entry(replicant_key).or_default();
+    progress.complete = true;
+    context
+        .persist_checkpoint(checkpoint)
+        .map_err(string_error)?;
+    Ok(true)
+}
+
+struct AutomationResetWorkflow;
+impl WorkflowExecutor for AutomationResetWorkflow {
+    fn execute<'a>(&'a mut self, context: &'a mut WorkflowContext) -> BoxWorkflowFuture<'a> {
+        Box::pin(async move {
+            let intent: AutomationResetIntent = context.config().map_err(string_error)?;
+            if intent.targets.is_empty() {
+                return context
+                    .mark_succeeded(Some(serde_json::json!({
+                        "replicants": 0,
+                        "unloaded_devices": 0,
+                    })))
+                    .map_err(string_error);
+            }
+            let client = managed_client(context)?;
+            let mut checkpoint: AutomationResetCheckpoint =
+                context.checkpoint().map_err(string_error)?;
+
+            loop {
+                if !reset_claim_replicants(context, &intent.targets)? {
+                    context
+                        .advance_to("waiting for cancelled automation claims", &checkpoint)
+                        .map_err(string_error)?;
+                    if !reset_wait_once(
+                        context,
+                        "waiting for cancelled automation claims to release",
+                        Duration::from_secs(5),
+                    )
+                    .await?
+                    {
+                        return Ok(());
+                    }
+                    continue;
+                }
+
+                let mut all_complete = true;
+                let mut wait_for_claim = false;
+                for target in &intent.targets {
+                    let replicant_key = target.replicant.to_ascii_uppercase();
+                    if checkpoint
+                        .replicants
+                        .get(&replicant_key)
+                        .is_some_and(|progress| progress.complete)
+                    {
+                        continue;
+                    }
+                    all_complete = false;
+                    let handle = client
+                        .replicants()
+                        .get_owned(&target.replicant)
+                        .await
+                        .map_err(string_error)?;
+                    let snapshot = handle.snapshot().await.map_err(string_error)?;
+                    let vessel_code = snapshot
+                        .hosted_device
+                        .as_ref()
+                        .map(|device| device.id.as_str().to_owned())
+                        .ok_or_else(|| {
+                            format!(
+                                "automation reset cannot return {} because it has no hosted vessel",
+                                target.replicant
+                            )
+                        })?;
+                    let vessel = client
+                        .devices()
+                        .get(&vessel_code)
+                        .await
+                        .map_err(string_error)?
+                        .snapshot()
+                        .await
+                        .map_err(string_error)?;
+                    let active_travel = snapshot.travel.as_ref().or(vessel.travel.as_ref());
+                    let status_travelling = snapshot.status.as_ref().is_some_and(|status| {
+                        matches!(
+                            status.as_str().to_ascii_lowercase().as_str(),
+                            "travelling" | "traveling"
+                        )
+                    });
+                    if let Some(travel) = active_travel {
+                        let step = if reset_travel_targets_home(travel, &target.home_system) {
+                            format!("waiting for {} to arrive home", target.replicant)
+                        } else {
+                            format!("waiting for {} to finish current travel", target.replicant)
+                        };
+                        context
+                            .advance_to(step, &checkpoint)
+                            .map_err(string_error)?;
+                        continue;
+                    }
+                    if status_travelling {
+                        context
+                            .advance_to(
+                                format!("waiting for {} current travel", target.replicant),
+                                &checkpoint,
+                            )
+                            .map_err(string_error)?;
+                        continue;
+                    }
+
+                    let current_location = vessel.location.as_ref().or(snapshot.location.as_ref());
+                    let at_home = current_location.is_some_and(|location| {
+                        designation_in_system(location.id.as_str(), &target.home_system)
+                    });
+                    if at_home {
+                        context
+                            .advance_to(
+                                format!("unloading {} at home", target.replicant),
+                                &checkpoint,
+                            )
+                            .map_err(string_error)?;
+                        if !reset_process_home_replicant(
+                            context,
+                            &client,
+                            target,
+                            &snapshot,
+                            &mut checkpoint,
+                        )
+                        .await?
+                        {
+                            wait_for_claim = true;
+                        }
+                        continue;
+                    }
+
+                    if current_location.is_none() {
+                        context
+                            .advance_to(
+                                format!("waiting for {} location", target.replicant),
+                                &checkpoint,
+                            )
+                            .map_err(string_error)?;
+                        continue;
+                    }
+                    context
+                        .advance_to(format!("recalling {} home", target.replicant), &checkpoint)
+                        .map_err(string_error)?;
+                    let operation = handle
+                        .travel()
+                        .to(target.home_system.clone())
+                        .depart_with_id(reset_operation_id(
+                            context.id(),
+                            "travel-home",
+                            &target.replicant,
+                        ))
+                        .await
+                        .map_err(string_error)?;
+                    let status = operation.status().await.map_err(string_error)?;
+                    if matches!(
+                        status,
+                        OperationStatus::Cancelled
+                            | OperationStatus::Rejected
+                            | OperationStatus::Failed
+                    ) {
+                        return Err(format!(
+                            "automation reset could not recall {} to {}: operation {} ended as {:?}",
+                            target.replicant,
+                            target.home_system,
+                            operation.id(),
+                            status
+                        ));
+                    }
+                }
+
+                if all_complete
+                    || intent.targets.iter().all(|target| {
+                        checkpoint
+                            .replicants
+                            .get(&target.replicant.to_ascii_uppercase())
+                            .is_some_and(|progress| progress.complete)
+                    })
+                {
+                    let unloaded_devices = checkpoint
+                        .replicants
+                        .values()
+                        .map(|progress| progress.cleared_devices.len())
+                        .sum::<usize>();
+                    return context
+                        .mark_succeeded(Some(serde_json::json!({
+                            "replicants": intent.targets.len(),
+                            "unloaded_devices": unloaded_devices,
+                        })))
+                        .map_err(string_error);
+                }
+
+                let description = if wait_for_claim {
+                    "waiting for device claims to release during automation reset"
+                } else {
+                    "waiting for Replicants to finish travel or arrive home"
+                };
+                let interval = if wait_for_claim {
+                    Duration::from_secs(5)
+                } else {
+                    Duration::from_secs(30)
+                };
+                if !reset_wait_once(context, description, interval).await? {
+                    return Ok(());
+                }
+            }
+        })
+    }
+}
 
 struct ScanSystemWorkflow;
 impl WorkflowExecutor for ScanSystemWorkflow {
@@ -7944,6 +8539,17 @@ impl WorkflowExecutor for ReplicantProvisionWorkflow {
                 .map_err(string_error)
         })
     }
+}
+
+/// Creates the internal durable fleet cleanup workflow for an automation reset.
+pub fn new_automation_reset_workflow(
+    intent: AutomationResetIntent,
+) -> NewWorkflow<AutomationResetIntent, AutomationResetCheckpoint> {
+    queued_workflow(
+        automation_reset_workflow_kind(),
+        intent,
+        AutomationResetCheckpoint::default(),
+    )
 }
 
 /// Creates a queued system-scan workflow.
@@ -13854,6 +14460,50 @@ mod tests {
 
     use super::*;
     use crate::failure::ClassifiedError;
+
+    #[test]
+    fn automation_reset_protects_replicant_matrices() {
+        assert!(reset_excludes_device_type(Some(&DeviceType::from(
+            "replicant_matrix",
+        ))));
+        assert!(reset_excludes_device_type(Some(&DeviceType::from(
+            "empty_replicant_matrix",
+        ))));
+        assert!(!reset_excludes_device_type(Some(&DeviceType::from(
+            "survey_drone",
+        ))));
+        assert!(!reset_excludes_device_type(None));
+    }
+
+    #[test]
+    fn automation_reset_uses_final_travel_destination_for_home_detection() {
+        let travel = TravelState {
+            destination: Some(LocationKey::live(LocationId::from("MIDPOINT"))),
+            final_destination: Some(LocationKey::live(LocationId::from("SCEPTURUM-BELT-1"))),
+            ..TravelState::default()
+        };
+        assert!(reset_travel_targets_home(&travel, "SCEPTURUM"));
+        assert!(!reset_travel_targets_home(&travel, "THYFFAWFF"));
+
+        let legacy = TravelState {
+            destination: Some(LocationKey::live(LocationId::from("THYFFAWFF-7-L4"))),
+            ..TravelState::default()
+        };
+        assert!(reset_travel_targets_home(&legacy, "THYFFAWFF"));
+    }
+
+    #[test]
+    fn automation_reset_constructor_is_internal_durable_work() {
+        let workflow = new_automation_reset_workflow(AutomationResetIntent {
+            targets: vec![AutomationResetTarget {
+                replicant: "R-1".to_owned(),
+                home_system: "SCEPTURUM".to_owned(),
+            }],
+        });
+        assert_eq!(workflow.kind, automation_reset_workflow_kind());
+        assert_eq!(workflow.schema_version, SCHEMA_VERSION);
+        assert_eq!(workflow.current_step.as_deref(), Some("queued"));
+    }
 
     fn provision_fixture(tag: &str) -> ReplicantProvisionCheckpoint {
         ReplicantProvisionCheckpoint {

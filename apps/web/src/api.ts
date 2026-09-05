@@ -5,6 +5,7 @@ import {
   parseBlueprintsResponse,
   parseBobnetResponse,
   parseAutomationControlResponse,
+  parseAutomationResetResponse,
   parseDirectorResponse,
   parseBootstrapResponse,
   parseCargoResponse,
@@ -574,6 +575,11 @@ export const daemonApi = {
         workflow_ids: workflowIds,
         confirmed,
       }),
+    ).payload;
+  },
+  async resetAutomation() {
+    return parseAutomationResetResponse(
+      await post("/api/automation/reset", { confirmed: true }),
     ).payload;
   },
   async health(signal?: AbortSignal) {

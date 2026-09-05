@@ -10,7 +10,7 @@
 use serde_json::Value;
 
 use crate::raw;
-use crate::{Client, Error, Result};
+use crate::{Client, Error, OperationId, Result};
 
 use super::operation::{self, Operation};
 
@@ -174,6 +174,28 @@ impl TravelBuilder {
             via: self.effective_via(&destination).await?,
         };
         operation::replicant_travel(&self.client, &self.replicant_code, request).await
+    }
+
+    /// Departs under a caller-supplied durable operation identity.
+    ///
+    /// This is intended for restart-safe workflows that must never submit a
+    /// second travel mutation after a process restart. Reusing an operation
+    /// identity is safe only when the complete travel intent is unchanged.
+    pub async fn depart_with_id(&self, operation_id: OperationId) -> Result<Operation> {
+        let destination = self.destination()?;
+        let request = raw::replicants::TravelRequest {
+            destination: Some(destination.clone()),
+            dry_run: None,
+            notify: self.notify(),
+            via: self.effective_via(&destination).await?,
+        };
+        operation::replicant_travel_with_id(
+            &self.client,
+            &self.replicant_code,
+            request,
+            operation_id,
+        )
+        .await
     }
 }
 

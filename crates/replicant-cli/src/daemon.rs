@@ -1,10 +1,10 @@
 use std::{env, io};
 
 use replicant_protocol::{
-    ApproveRefreshRequest, DaemonHealth, DescriptorCatalog, ErrorResponse, RefreshRunDetail,
-    RefreshRunSummary, RunOperationRequest, RunOperationResponse, StartRefreshRequest,
-    StartWorkflowRequest, StartWorkflowResponse, Versioned, WorkflowControlResponse,
-    WorkflowDetail, WorkflowListResponse,
+    ApproveRefreshRequest, AutomationResetRequest, AutomationResetResponse, DaemonHealth,
+    DescriptorCatalog, ErrorResponse, RefreshRunDetail, RefreshRunSummary, RunOperationRequest,
+    RunOperationResponse, StartRefreshRequest, StartWorkflowRequest, StartWorkflowResponse,
+    Versioned, WorkflowControlResponse, WorkflowDetail, WorkflowListResponse,
 };
 use serde::{Serialize, de::DeserializeOwned};
 
@@ -67,6 +67,13 @@ impl DaemonClient {
     ) -> crate::AnyResult<WorkflowControlResponse> {
         self.post::<(), _>(&format!("/api/workflows/{id}/{command}"), None)
             .await
+    }
+
+    pub(crate) async fn automation_reset(
+        &self,
+        request: &AutomationResetRequest,
+    ) -> crate::AnyResult<AutomationResetResponse> {
+        self.post("/api/automation/reset", Some(request)).await
     }
 
     pub(crate) async fn start_refresh(

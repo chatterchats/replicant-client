@@ -2289,6 +2289,25 @@ pub(crate) async fn replicant_travel(
     .await
 }
 
+/// Dispatches Replicant travel under a caller-supplied durable operation
+/// identity for restart-safe workflow execution.
+pub(crate) async fn replicant_travel_with_id(
+    client: &Client,
+    replicant_code: &str,
+    request: raw::replicants::TravelRequest,
+    operation_id: OperationId,
+) -> Result<Operation> {
+    create_with_id(
+        client,
+        MutationAdapter::ReplicantTravel {
+            replicant_code: replicant_code.to_owned(),
+            request,
+        },
+        Some(operation_id),
+    )
+    .await
+}
+
 pub(crate) async fn replicant_cancel_travel(
     client: &Client,
     replicant_code: &str,

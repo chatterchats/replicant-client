@@ -1,5 +1,6 @@
 use std::{env, error::Error as StdError, io};
 
+mod automation;
 mod belt_search;
 mod bootstrap;
 mod daemon;
@@ -61,6 +62,13 @@ async fn dispatch_command(command: &str, arguments: Vec<String>) -> AnyResult<()
             workflow::run_operation_cli(arguments).await
         }
         "workflow" | "workflows" => workflow::run_cli(arguments).await,
+        "automation" | "automations" => automation::run_cli(arguments).await,
+        "reset" if arguments.first().is_some_and(|value| value == "automation") => {
+            let mut arguments = arguments;
+            arguments.remove(0);
+            arguments.insert(0, "reset".to_owned());
+            automation::run_cli(arguments).await
+        }
         "refresh" | "refreshes" => refresh::run_cli(arguments).await,
         "print" | "printing" => {
             printing::run_cli(normalize_operation_flag(
@@ -140,6 +148,7 @@ async fn dispatch_help(mut arguments: Vec<String>) -> AnyResult<()> {
             workflow::run_operation_cli(arguments).await
         }
         "workflow" | "workflows" => workflow::run_cli(arguments).await,
+        "automation" | "automations" => automation::run_cli(arguments).await,
         "refresh" | "refreshes" => refresh::run_cli(arguments).await,
         "print" | "printing" => printing::run_cli(arguments).await,
         "transport" | "deliver" | "delivery" => transport::run_cli(arguments).await,
@@ -178,6 +187,7 @@ Daemon-backed commands:
   daemon      Show local replicantd health
   operation   Discover/run catalogue reports and actions
   workflow    Discover/control durable replicantd workflows
+  automation  Global automation controls and fleet reset
   refresh     Start/inspect/approve/cancel durable managed recovery
 Specialized frontends:\n  interactive Guided command builder with smart SYSTEM/LOCATION suggestions\n  survey      Survey routes (daemon-backed by default; --direct is diagnostic)\n  relay       Relay expansion (daemon-backed run; --direct is diagnostic)\n  print       Distributed Autofactory queueing, status, and clearing\n  transport   Point-to-point resource and device delivery\n  trade       Interactive player-run shop directory and trade viewer\n  belt-search Fast Replicant-only system scans for asteroid belts\n  mining      Mining-network expansion\n  ownership   Bulk device ownership reassignment by catalogue region\n  observatory Galactic Observatory prospecting and triangulation\n  event       Civilisation-event planning and execution\n  bootstrap   Regional bootstrap and landing delivery automation\n  rikers      Local Riker colony-candidate report\n\n\
 Discovery:\n  replicant-cli operation catalogue\n  replicant-cli operation help KIND\n  replicant-cli workflow catalogue\n\n\

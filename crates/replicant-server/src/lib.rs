@@ -50,20 +50,21 @@ use replicant_protocol::{
     AccountEventSummary, AccountEventsSnapshot, AccountReplicantSummary, AchievementSummary,
     ActivityLevel, ApproveRefreshRequest, AutofactoryAvailability, AutofactorySnapshot,
     AutofactorySummary, AutofactoryUtilization, AutomationControlAction, AutomationControlRequest,
-    AutomationControlResponse, AutomationStatus, AutomationTrigger as ProtocolTrigger,
-    BillCandidateSummary, BillDepartureSummary, BillExpansionSummary, BillFinderRequest,
-    BillFinderResponse, BlueprintSummary, BlueprintsSnapshot, BobnetChannelSummary,
-    BobnetMessageSummary, BobnetReplicantSummary, BobnetSnapshot, BootstrapMissionSummary,
-    BootstrapSnapshot, CargoCarrierSummary, CargoResourceSummary, CargoSnapshot,
-    CreateTriggerRequest, DaemonHealth, DescriptorCatalog, DeviceClaim, DeviceInspectorSummary,
-    DeviceLogSummary, DeviceLogsSnapshot, DeviceRuntimeInspectorSummary, DeviceSummary,
-    DevicesSnapshot, DirectorGoalControlRequest, DirectorMiningPolicyRequest, DirectorModeRequest,
-    DirectorReplicantRegionRequest, DirectorSnapshot, DirectoryReplicantDetail,
-    DirectoryReplicantDetailSnapshot, DirectoryReplicantSummary, DirectorySnapshot, DomainSlice,
-    EntityId, EntityIndexSnapshot, EntityInspectorDetail, EntityInspectorSnapshot, EntityKind,
-    EntityRef, EntitySummary, ErrorResponse, EventCriterionSummary, EventRequirementKind,
-    EventRequirementSummary, EventRewardItem, EventRewardsSummary, EventSummary, EventsSnapshot,
-    FactoryJobSummary, FiniteExecution as ProtocolFiniteExecution, FiniteExecutionHistoryResponse,
+    AutomationControlResponse, AutomationResetRequest, AutomationResetResponse, AutomationStatus,
+    AutomationTrigger as ProtocolTrigger, BillCandidateSummary, BillDepartureSummary,
+    BillExpansionSummary, BillFinderRequest, BillFinderResponse, BlueprintSummary,
+    BlueprintsSnapshot, BobnetChannelSummary, BobnetMessageSummary, BobnetReplicantSummary,
+    BobnetSnapshot, BootstrapMissionSummary, BootstrapSnapshot, CargoCarrierSummary,
+    CargoResourceSummary, CargoSnapshot, CreateTriggerRequest, DaemonHealth, DescriptorCatalog,
+    DeviceClaim, DeviceInspectorSummary, DeviceLogSummary, DeviceLogsSnapshot,
+    DeviceRuntimeInspectorSummary, DeviceSummary, DevicesSnapshot, DirectorGoalControlRequest,
+    DirectorMiningPolicyRequest, DirectorMode, DirectorModeRequest, DirectorReplicantRegionRequest,
+    DirectorSnapshot, DirectoryReplicantDetail, DirectoryReplicantDetailSnapshot,
+    DirectoryReplicantSummary, DirectorySnapshot, DomainSlice, EntityId, EntityIndexSnapshot,
+    EntityInspectorDetail, EntityInspectorSnapshot, EntityKind, EntityRef, EntitySummary,
+    ErrorResponse, EventCriterionSummary, EventRequirementKind, EventRequirementSummary,
+    EventRewardItem, EventRewardsSummary, EventSummary, EventsSnapshot, FactoryJobSummary,
+    FiniteExecution as ProtocolFiniteExecution, FiniteExecutionHistoryResponse,
     FiniteExecutionStatus as ProtocolFiniteExecutionStatus, FrontendTelemetryBatch,
     FrontendTelemetryLevel, GalaxySceneSnapshot, HealthStatus, InboxMessageSummary,
     InventoryDistribution, InventoryLocationSummary, InventoryOwnerKind, InventoryQuantity,
@@ -91,8 +92,9 @@ use replicant_protocol::{
 use replicant_runtime::{
     ApplicationContext,
     automation::{
-        ControllerWorkflowCheckpoint, ExplorationIntent, ExplorationWorkflowCheckpoint, ScanIntent,
-        ScanTourCheckpoint, ScanTourIntent,
+        AutomationResetIntent, AutomationResetTarget, ControllerWorkflowCheckpoint,
+        ExplorationIntent, ExplorationWorkflowCheckpoint, ScanIntent, ScanTourCheckpoint,
+        ScanTourIntent, new_automation_reset_workflow,
     },
     bootstrap::BootstrapMission,
     catalogue::{CatalogueError, OperationCatalogue},
@@ -904,6 +906,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/api/triggers/{id}/fire", post(fire_trigger))
         .route("/api/automation/control", post(control_automation))
+        .route("/api/automation/reset", post(reset_automation))
         .route("/api/director", get(director_snapshot))
         .route("/api/director/reconcile", post(reconcile_director_now))
         .route("/api/director/mode", put(update_director_mode))
@@ -7531,6 +7534,148 @@ pub async fn run_director(state: Arc<AppState>, mut shutdown: watch::Receiver<bo
         }
     }
     tracing::info!("Automation Director background loop stopped");
+}
+
+fn automation_reset_targets(
+    snapshot: &DirectorSnapshot,
+) -> Result<Vec<AutomationResetTarget>, Vec<String>> {
+    let homes = snapshot
+        .regions
+        .iter()
+        .filter_map(|region| {
+            region.hub_system.as_ref().map(|home| {
+                (
+                    region.region.trim().to_ascii_lowercase(),
+                    home.trim().to_ascii_uppercase(),
+                )
+            })
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut targets = Vec::new();
+    let mut missing = Vec::new();
+    for replicant in &snapshot.replicants {
+        let Some(region) = replicant
+            .region
+            .as_deref()
+            .map(str::trim)
+            .filter(|region| !region.is_empty())
+        else {
+            missing.push(format!(
+                "{} has no Director region assignment",
+                replicant.code
+            ));
+            continue;
+        };
+        let Some(home_system) = homes.get(&region.to_ascii_lowercase()) else {
+            missing.push(format!(
+                "{} is assigned to {region}, which has no regional hub system",
+                replicant.code
+            ));
+            continue;
+        };
+        targets.push(AutomationResetTarget {
+            replicant: replicant.code.trim().to_ascii_uppercase(),
+            home_system: home_system.clone(),
+        });
+    }
+    if !missing.is_empty() {
+        return Err(missing);
+    }
+    targets.sort_by(|left, right| left.replicant.cmp(&right.replicant));
+    targets.dedup_by(|left, right| left.replicant == right.replicant);
+    Ok(targets)
+}
+
+async fn reset_automation(
+    State(state): State<Arc<AppState>>,
+    payload: Result<Json<AutomationResetRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<Versioned<AutomationResetResponse>>), ApiError> {
+    let Json(request) =
+        payload.map_err(|_| ApiError::invalid("invalid automation reset request"))?;
+    if !request.confirmed {
+        return Err(ApiError::invalid(
+            "automation reset requires explicit confirmation",
+        ));
+    }
+
+    tracing::warn!("automation reset requested");
+    let _guard = state.director_reconcile.lock().await;
+    let workflow_registry = state.catalogue.workflow_registry();
+    let snapshot = tokio::time::timeout(
+        DIRECTOR_RECONCILE_TIMEOUT,
+        reconcile_director(
+            state.client(),
+            state.repository.clone(),
+            workflow_registry.as_ref(),
+            state.revision.load(Ordering::Relaxed),
+            false,
+            false,
+        ),
+    )
+    .await
+    .map_err(|_| ApiError::director_timeout())?
+    .map_err(ApiError::runtime)?;
+    let targets = automation_reset_targets(&snapshot).map_err(|missing| {
+        tracing::warn!(
+            missing = %missing.join("; "),
+            "automation reset rejected because one or more Replicants have no home system"
+        );
+        ApiError::invalid("automation reset requires a home system for every owned Replicant")
+    })?;
+
+    set_director_mode(&state.repository, DirectorMode::Off).map_err(ApiError::runtime)?;
+    let mut policy = state
+        .repository
+        .automation_policy()
+        .map_err(ApiError::repository)?;
+    policy.automatic_triggers_enabled = false;
+    state
+        .repository
+        .set_automation_policy(policy)
+        .map_err(ApiError::repository)?;
+
+    let affected_workflows = state
+        .supervisor
+        .cancel_selected(&[])
+        .map_err(supervisor_error)?;
+
+    // The reset workflow must be allowed to run even if the operator had
+    // previously paused normal automation. Automatic launches remain disabled.
+    policy.workflows_paused = false;
+    policy = state
+        .repository
+        .set_automation_policy(policy)
+        .map_err(ApiError::repository)?;
+    let replicant_count = targets.len();
+    let reset = state
+        .repository
+        .create(new_automation_reset_workflow(AutomationResetIntent {
+            targets,
+        }))
+        .map_err(ApiError::repository)?;
+
+    let automation = automation_status(policy);
+    state.publish(LiveDelta::AutomationChanged(automation));
+    state.invalidate(DomainSlice::Director);
+    state.invalidate(DomainSlice::Workflows);
+    state.flush_invalidations();
+    state.director_wake.notify_one();
+    tracing::warn!(
+        workflow_id = %reset.id,
+        affected_workflows,
+        replicants = replicant_count,
+        "automation reset initialized"
+    );
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(Versioned::current(AutomationResetResponse {
+            automation,
+            director_mode: DirectorMode::Off,
+            affected_workflows,
+            reset_workflow: summary(&reset),
+            replicants: replicant_count,
+        })),
+    ))
 }
 
 async fn control_automation(

@@ -2,6 +2,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import { daemonApi } from "./api";
+import { ConfirmDialog, type ConfirmRequest } from "./ConfirmDialog";
 import { useDomainQuery } from "./domainQuery";
 import type {
   AutomationTrigger,
@@ -1861,8 +1862,10 @@ function goalProgress(goal: DirectorGoalSummary) {
 
 function DirectorView({
   onOpenWorkflow,
+  onResetStarted,
 }: {
   onOpenWorkflow: (workflowId: string) => void;
+  onResetStarted: (workflow: WorkflowSummary) => void;
 }) {
   const query = useDomainQuery({
     slice: "director",
@@ -1872,6 +1875,9 @@ function DirectorView({
   });
   const [mutating, setMutating] = useState(false);
   const [mutationError, setMutationError] = useState<string | null>(null);
+  const [confirmRequest, setConfirmRequest] = useState<ConfirmRequest | null>(
+    null,
+  );
   const data = query.data;
 
   const mutate = async (operation: () => Promise<DirectorSnapshot>) => {
@@ -1885,6 +1891,40 @@ function DirectorView({
     } finally {
       setMutating(false);
     }
+  };
+
+  const resetAutomation = async () => {
+    setMutating(true);
+    setMutationError(null);
+    try {
+      const result = await daemonApi.resetAutomation();
+      setMutating(false);
+      onResetStarted(result.reset_workflow);
+    } catch (reason) {
+      setMutationError(String(reason));
+      setMutating(false);
+    }
+  };
+
+  const requestReset = () => {
+    setConfirmRequest({
+      title: "Reset all automation?",
+      message:
+        "This is an account-wide recovery action. The Director will stay off after the reset, and automatic triggers will remain disabled.",
+      items: [
+        "Stop the Automation Director and disable automatic triggers.",
+        "Cancel all currently active automation workflows.",
+        "Wait for in-progress travel, then return every Replicant to its regional home system.",
+        "Unload every non-matrix device as its Replicant gets home and clear that device's tags.",
+      ],
+      confirmLabel: "Reset automation",
+      cancelLabel: "Cancel",
+      requireTyped: "RESET",
+      destructive: true,
+      onConfirm: () => {
+        void resetAutomation();
+      },
+    });
   };
 
   if (!data) {
@@ -1960,6 +2000,19 @@ function DirectorView({
           </button>
         </div>
       </div>
+
+      <section className="director-reset" aria-label="Automation recovery">
+        <div>
+          <strong>Reset automation</strong>
+          <p>
+            Stop managed automation, recall every Replicant to its regional
+            home, unload non-matrix devices, and clear their tags.
+          </p>
+        </div>
+        <button className="danger" disabled={mutating} onClick={requestReset}>
+          {mutating ? "Resetting…" : "Reset automation"}
+        </button>
+      </section>
 
       {mutationError || query.error ? (
         <p className="form-error">{mutationError ?? query.error}</p>
@@ -2337,6 +2390,12 @@ function DirectorView({
           ))}
         </div>
       </section>
+      <ConfirmDialog
+        request={confirmRequest}
+        onClose={() => {
+          setConfirmRequest(null);
+        }}
+      />
     </section>
   );
 }
@@ -2592,6 +2651,11 @@ export function AutomationsPage({
           onOpenWorkflow={(workflowId) => {
             setTab("Active");
             setSelectedId(workflowId);
+          }}
+          onResetStarted={(workflow) => {
+            setCreated((items) => [...items, workflow]);
+            setTab("Active");
+            setSelectedId(workflow.id);
           }}
         />
       ) : tab === "Templates" ? (

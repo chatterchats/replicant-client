@@ -335,6 +335,140 @@ describe("Director goal controls", () => {
     );
   });
 
+  it("sends an explicitly confirmed automation reset request", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: () =>
+        Promise.resolve({
+          protocol_version: 1,
+          payload: {
+            automation: {
+              automatic_triggers_enabled: false,
+              workflows_paused: false,
+            },
+            director_mode: "off",
+            affected_workflows: 4,
+            reset_workflow: {
+              id: "WF-RESET",
+              kind: "automation.reset",
+              status: "queued",
+              current_step: null,
+              revision: 1,
+              updated_at_ms: 10,
+            },
+            replicants: 3,
+          },
+        }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await daemonApi.resetAutomation();
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/automation/reset",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ confirmed: true }),
+      }),
+    );
+    expect(result.director_mode).toBe("off");
+    expect(result.affected_workflows).toBe(4);
+    expect(result.replicants).toBe(3);
+    expect(result.reset_workflow.kind).toBe("automation.reset");
+  });
+
+  it("puts automation reset behind an account-wide typed confirmation", async () => {
+    vi.useFakeTimers();
+    const director = {
+      metadata: { revision: 1, generated_at_ms: 10 },
+      mode: "automatic" as const,
+      regions: [],
+      goals: [],
+      replicants: [],
+      requirements: [],
+      mining_policies: [],
+      workforce: {
+        total: 0,
+        operational: 0,
+        in_transit: 0,
+        busy: 0,
+        unavailable: 0,
+        idle: 0,
+        idle_ratio: 1,
+        pending_worker_demand: 0,
+        scale_up_recommended: false,
+        scale_reason: null,
+        regions: [],
+      },
+    };
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url =
+        typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.href
+            : input.url;
+      const payload =
+        url === "/api/descriptors"
+          ? { reports: [], actions: [], workflows: [] }
+          : director;
+      return Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve({ protocol_version: 1, payload }),
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    let root: Root | undefined;
+    await act(async () => {
+      const mountedRoot = createRoot(container);
+      root = mountedRoot;
+      mountedRoot.render(<AutomationsPage workflows={[]} entities={{}} />);
+      await vi.runAllTimersAsync();
+    });
+
+    const resetButton = container.querySelector<HTMLButtonElement>(
+      ".director-reset button",
+    );
+    expect(resetButton?.textContent).toBe("Reset automation");
+
+    act(() => {
+      resetButton?.click();
+    });
+
+    const dialog = document.querySelector<HTMLElement>(".confirm-dialog");
+    expect(dialog?.textContent).toContain("Reset all automation?");
+    expect(dialog?.textContent).toContain(
+      "Cancel all currently active automation workflows.",
+    );
+    expect(dialog?.textContent).toContain(
+      "Unload every non-matrix device as its Replicant gets home",
+    );
+    expect(dialog?.textContent).toContain("Type RESET to continue");
+    const confirmButton = dialog?.querySelector<HTMLButtonElement>(
+      ".confirm-actions button.danger",
+    );
+    expect(confirmButton?.disabled).toBe(true);
+    expect(
+      fetchMock.mock.calls.some(([input]) => {
+        const url =
+          typeof input === "string"
+            ? input
+            : input instanceof URL
+              ? input.href
+              : input.url;
+        return url === "/api/automation/reset";
+      }),
+    ).toBe(false);
+
+    act(() => {
+      root?.unmount();
+    });
+    container.remove();
+  });
+
   it("renders regional Director labels through the generic goal surface", async () => {
     vi.useFakeTimers();
     const recoveryDirector = (enabled: boolean, revision: number) => ({

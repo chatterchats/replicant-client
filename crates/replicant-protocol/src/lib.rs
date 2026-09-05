@@ -3103,6 +3103,29 @@ pub struct AutomationControlResponse {
     pub affected_workflows: usize,
 }
 
+/// Explicit destructive request to reset all Director-managed automation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AutomationResetRequest {
+    /// Explicit confirmation that active automation may be cancelled and fleet state changed.
+    #[serde(default)]
+    pub confirmed: bool,
+}
+
+/// Result of starting an automation reset.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AutomationResetResponse {
+    /// Updated global safety state. Automatic triggers are disabled for the reset.
+    pub automation: AutomationStatus,
+    /// Director mode after reset initialization.
+    pub director_mode: DirectorMode,
+    /// Number of previously active workflows cancelled by the reset.
+    pub affected_workflows: usize,
+    /// Durable workflow responsible for recalling and unloading the fleet.
+    pub reset_workflow: WorkflowSummary,
+    /// Number of Replicants assigned a home-system reset target.
+    pub replicants: usize,
+}
+
 /// Severity of one workflow activity record.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
