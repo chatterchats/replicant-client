@@ -5,14 +5,15 @@
   "type": "module",
   "scripts": {
     "dev": "npm run wasm:build && vite",
-    "build": "npm run wasm:build && npm run build:web",
-    "build:web": "tsc --noEmit && vite build",
+    "build": "npm run wasm:build && npm run typecheck && npm run build:web",
+    "build:web": "vite build",
     "wasm:build": "make -C ../.. galaxy-wasm",
+    "typecheck": "tsc --noEmit",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "lint": "eslint . --max-warnings 0",
     "test": "vitest run",
-    "check": "npm run wasm:build && npm run format:check && npm run lint && npm run test && npm run build:web"
+    "check": "npm run wasm:build && npm run format:check && npm run lint && npm run test && npm run typecheck && npm run build:web"
   },
   "dependencies": {
     "react": "^19.0.0",

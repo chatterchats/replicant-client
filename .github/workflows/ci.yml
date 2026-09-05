@@ -11,25 +11,65 @@ permissions:
 
 concurrency:
   group: replicant-ci-main
-  cancel-in-progress: true
+  # Each push is classified against its immediate predecessor. Do not cancel an
+  # in-flight run or a later docs-only push could skip an unvalidated earlier domain.
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_TARGET_DIR: /home/chats/.cache/replicant-ci/target
+  PIP_CACHE_DIR: /home/chats/.cache/replicant-ci/pip
+  npm_config_cache: /home/chats/.cache/replicant-ci/npm
 
 jobs:
-  ci:
-    name: Full CI
+  changes:
+    name: Detect affected CI domains
     runs-on:
       - self-hosted
       - linux
       - x64
       - replicant-ci
+    timeout-minutes: 10
+    outputs:
+      core: ${{ steps.classify.outputs.core }}
+      policy: ${{ steps.classify.outputs.policy }}
+      galaxy: ${{ steps.classify.outputs.galaxy }}
+      web: ${{ steps.classify.outputs.web }}
+      desktop: ${{ steps.classify.outputs.desktop }}
+      docs: ${{ steps.classify.outputs.docs }}
+      docker: ${{ steps.classify.outputs.docker }}
+    steps:
+      - name: Checkout repository history
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
 
+      - name: Classify changed paths
+        id: classify
+        env:
+          BASE_SHA: ${{ github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            python3 scripts/ci_changed.py --all --github-output "$GITHUB_OUTPUT"
+          else
+            python3 scripts/ci_changed.py \
+              --base "$BASE_SHA" \
+              --head "$HEAD_SHA" \
+              --github-output "$GITHUB_OUTPUT"
+          fi
+
+  core:
+    name: Core Rust CI
+    needs: changes
+    if: needs.changes.outputs.core == 'true'
+    runs-on:
+      - self-hosted
+      - linux
+      - x64
+      - replicant-ci
     timeout-minutes: 120
-
-    env:
-      CARGO_TERM_COLOR: always
-      CARGO_TARGET_DIR: /home/chats/.cache/replicant-ci/target
-      PIP_CACHE_DIR: /home/chats/.cache/replicant-ci/pip
-      npm_config_cache: /home/chats/.cache/replicant-ci/npm
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -41,54 +81,187 @@ jobs:
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      - name: Prepare Rust toolchain
+      - name: Run core CI
+        run: make ci-core
+
+  policy:
+    name: Policy and utility CI
+    needs: changes
+    if: needs.changes.outputs.policy == 'true'
+    runs-on:
+      - self-hosted
+      - linux
+      - x64
+      - replicant-ci
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Run policy CI
+        run: make ci-policy
+
+  galaxy:
+    name: Galaxy renderer CI
+    needs: changes
+    if: needs.changes.outputs.galaxy == 'true'
+    runs-on:
+      - self-hosted
+      - linux
+      - x64
+      - replicant-ci
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Add user tools to PATH
         run: |
-          rustup toolchain install 1.96.0 \
-            --profile minimal \
-            --component clippy,rustfmt
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-          rustup target add \
-            wasm32-unknown-unknown \
-            --toolchain 1.96.0
+      - name: Run Galaxy CI
+        run: make ci-galaxy
 
-          rustc --version
-          cargo --version
-          cargo clippy --version
-          rustfmt --version
-          wasm-pack --version
+  web:
+    name: Web CI
+    needs: changes
+    if: needs.changes.outputs.web == 'true'
+    runs-on:
+      - self-hosted
+      - linux
+      - x64
+      - replicant-ci
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
-      - name: Install web dependencies
+      - name: Add user tools to PATH
         run: |
-          node --version
-          npm --version
-          npm ci --prefix apps/web
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      - name: Install desktop dependencies
+      - name: Run web CI
+        run: make ci-web
+
+  desktop:
+    name: Desktop CI
+    needs: changes
+    if: needs.changes.outputs.desktop == 'true'
+    runs-on:
+      - self-hosted
+      - linux
+      - x64
+      - replicant-ci
+    timeout-minutes: 90
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Add user tools to PATH
         run: |
-          npm ci --prefix apps/desktop
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      - name: Prepare documentation crawler
+      - name: Run desktop CI
+        run: make ci-desktop
+
+  docs:
+    name: Documentation crawler CI
+    needs: changes
+    if: needs.changes.outputs.docs == 'true'
+    runs-on:
+      - self-hosted
+      - linux
+      - x64
+      - replicant-ci
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Run crawler CI
+        run: make ci-docs
+
+  docker:
+    name: Compose configuration CI
+    needs: changes
+    if: needs.changes.outputs.docker == 'true'
+    runs-on:
+      - self-hosted
+      - linux
+      - x64
+      - replicant-ci
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Validate Compose configuration
+        run: make compose-check
+
+  summary:
+    name: CI Summary
+    needs:
+      - changes
+      - core
+      - policy
+      - galaxy
+      - web
+      - desktop
+      - docs
+      - docker
+    if: always()
+    runs-on:
+      - self-hosted
+      - linux
+      - x64
+      - replicant-ci
+    timeout-minutes: 5
+    steps:
+      - name: Require all selected domains to pass
+        env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          CORE_RESULT: ${{ needs.core.result }}
+          POLICY_RESULT: ${{ needs.policy.result }}
+          GALAXY_RESULT: ${{ needs.galaxy.result }}
+          WEB_RESULT: ${{ needs.web.result }}
+          DESKTOP_RESULT: ${{ needs.desktop.result }}
+          DOCS_RESULT: ${{ needs.docs.result }}
+          DOCKER_RESULT: ${{ needs.docker.result }}
         run: |
-          python3 --version
-          python3 -m venv reference/replicant-docs-crawler/venv
-
-          reference/replicant-docs-crawler/venv/bin/python \
-            -m pip install \
-            -r reference/replicant-docs-crawler/requirements.txt
-
-      - name: Environment summary
-        run: |
-          echo "Runner: $(hostname)"
-          echo "Rust: $(rustc --version)"
-          echo "Cargo: $(cargo --version)"
-          echo "Node: $(node --version)"
-          echo "npm: $(npm --version)"
-          echo "Python: $(python3 --version)"
-          echo "wasm-pack: $(wasm-pack --version)"
-          echo "Cargo target: $CARGO_TARGET_DIR"
-
-      - name: Run full CI
-        run: make ci
+          failed=0
+          for entry in \
+            "changes=$CHANGES_RESULT" \
+            "core=$CORE_RESULT" \
+            "policy=$POLICY_RESULT" \
+            "galaxy=$GALAXY_RESULT" \
+            "web=$WEB_RESULT" \
+            "desktop=$DESKTOP_RESULT" \
+            "docs=$DOCS_RESULT" \
+            "docker=$DOCKER_RESULT"; do
+            name=${entry%%=*}
+            result=${entry#*=}
+            printf '%-10s %s\n' "$name" "$result"
+            case "$result" in
+              success|skipped) ;;
+              *) failed=1 ;;
+            esac
+          done
+          exit "$failed"
 
       - name: Cache and disk usage
         if: always()

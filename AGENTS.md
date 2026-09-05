@@ -96,37 +96,45 @@ hatch: it never hydrates, persists, publishes, journals, or reconciles.
 
 ## Commands
 
-Toolchain is pinned: Rust 1.96.0, edition 2024, MSRV 1.94.
+Toolchain is pinned: Rust 1.96.0, edition 2024, MSRV 1.94. The pinned toolchain
+also installs `clippy`, `rustfmt`, and `wasm32-unknown-unknown`.
 
 ```sh
-make fmt          # format Rust + web + desktop
-make lint         # clippy --all-targets --all-features -D warnings
-make test         # cargo test --all-features
-make check-all    # cargo check --all-features --all-targets
-make doc          # rustdoc, warnings denied
+make doctor       # verify host tools
+make bootstrap    # install repo-local npm/crawler dependencies
+make fmt-check    # verify all formatting
+make check        # compile supported Rust configurations
+make lint         # Rust/Galaxy/web/desktop lint gates
+make test         # Rust/web/desktop tests
+make doc          # rustdoc gates, warnings denied
 make policy-checks
-make ci           # everything: lint test check-all doc policy web desktop
+make ci           # authoritative full repository gate
 ```
 
-Cargo aliases: `cargo t` = test all features, `cargo cl` = the clippy gate.
-
-Feature-combination checks (no make target exists for these):
+Domain CI targets mirror the conditional self-hosted Actions jobs:
 
 ```sh
-cargo check --no-default-features --features raw
-cargo check --no-default-features --features events
-cargo check --all-features
+make ci-core
+make ci-policy
+make ci-galaxy
+make ci-web
+make ci-desktop
+make ci-docs
 ```
 
-**Cost discipline.** `make ci` builds the full workspace plus the web bundle
-plus the Tauri desktop check. Do not run it to validate a one-line change.
-Iterate with the narrowest thing that proves the change — `cargo check -p
-<crate>`, `cargo test --all-features <testname>`, `npm --prefix apps/web run
-test` — and run `make fmt && make ci` once, at the end, before committing.
+Feature combinations are first-class Make targets: `check-default`,
+`check-raw`, `check-events`, `check-native-tls`, `check-all-features`, and
+`feature-checks`. `make msrv-check` separately proves the root client against
+its declared MSRV.
 
-Frontend and desktop have their own gates: `make web-check`, `make
-desktop-check`. Desktop requires `make desktop-prepare` first (sidecar
-staging); `make ci` already does this.
+Cargo aliases remain available for narrow work, but Make owns cross-component
+ordering. See `docs/development.md` for the build graph, dependency stamps, and
+GitHub path-classification rules.
+
+**Cost discipline.** Do not run full `make ci` to validate a one-line change.
+Iterate with the narrowest leaf/domain target that proves the change. The
+GitHub mirror applies the same rule automatically: it classifies changed paths
+and runs only affected domains, while manual workflow dispatch runs all of them.
 
 ---
 
@@ -149,9 +157,8 @@ When a change affects which operations, fields, or aliases the client exposes,
 update the relevant file under `policy/` and regenerate:
 
 ```sh
-python3 scripts/generate_operation_inventory.py
-python3 scripts/generate_authority_matrix.py
-python3 scripts/contract_policy_check.py
+make policy-generate
+make policy-checks
 ```
 
 ---
@@ -200,10 +207,6 @@ These are gates, not preferences. Do not negotiate with them.
 
 Do not trust these; the code is authoritative:
 
-- `CONTRIBUTING.md` describes the repo as a single package with no workspace.
-  It is a 12-member workspace.
-- `CONTRIBUTING.md` cites `docs/implementation/rewrite-guide.md` and
-  `src/lib.rs` cites `docs/contract/`. Neither exists.
 - `CURRENT_STATE.md` is a historical Phase 9 UI snapshot, not current state.
 
 If you fix one of these, delete its bullet here.

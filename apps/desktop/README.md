@@ -7,12 +7,16 @@ does not intrinsically stop automation.
 
 ## Development
 
-Install the existing web and desktop dependencies once:
+Install the web and desktop dependencies through the repository-owned
+lockfile bootstrap targets:
 
 ```sh
-npm --prefix apps/web install
-npm --prefix apps/desktop install
+make web-deps desktop-deps
 ```
+
+The targets use `npm ci` and only repeat when the corresponding lockfile
+changes. `make bootstrap` includes both plus the documentation crawler when a
+complete development checkout is needed.
 
 Provide the daemon token to Rust, not frontend JavaScript. Either export
 `RS_API_TOKEN`, export `RS_API_TOKEN_FILE`, or place the token in a file named
@@ -71,15 +75,19 @@ frontend capability set.
 The lightweight packaging smoke checks do not require a display server:
 
 ```sh
-make desktop-check
+make ci-desktop
+# or, for the complete repository gate:
 make ci
 ```
+
+`make desktop-check` is the desktop-domain gate itself; `ci-desktop` is the
+stable CI-facing alias used by the conditional GitHub workflow.
 
 Build signed or unsigned native packages on each target operating system after
 installing Tauri's documented platform prerequisites:
 
 ```sh
-npm --prefix apps/desktop install
+make desktop-deps web-deps
 make desktop-build
 ```
 

@@ -314,8 +314,11 @@ fails the build immediately instead of producing an image that cannot start.
 The runtime image is pinned to Fedora 44; change that base deliberately if the
 local build host/ABI changes.
 
-`make docker-check` performs the same local artifact build, resolves Compose
-configuration, and packages both production images without requiring an account. With a configured token,
+`make compose-check` resolves the base, secret-overlay, and headless Compose
+configurations with harmless placeholder credentials and does not build
+application artifacts or images. `make docker-build` performs the host artifact
+build and packages both production images; `make docker-check` is retained as a
+compatibility alias for that full validation. With a configured token,
 `make docker-smoke` starts the stack, waits for health, checks the static web
 health and proxied daemon health, and verifies a WebSocket `101` upgrade.
 Ordinary `make ci` does not require Docker.

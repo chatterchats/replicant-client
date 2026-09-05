@@ -256,26 +256,37 @@ let retrieval = client.devices().retrieve("LOCKER-CODE").await?;
 
 ## Development
 
+The root `Makefile` is the canonical cross-component build interface. On a new
+checkout, verify host tools and install repo-local dependencies with:
+
+```sh
+make doctor
+make bootstrap
+```
+
 Run the local daemon and web development server in separate terminals:
 
 ```sh
 RS_API_TOKEN=... cargo run -p replicant-server --bin replicantd
-npm --prefix apps/web install
 npm --prefix apps/web run dev
 ```
 
-Frontend-only checks are available through `make web-check`.
+Use the narrowest domain gate while iterating:
 
 ```sh
-cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --workspace --all-features
-cargo check --no-default-features --features raw
-cargo check --no-default-features --features events
-python3 scripts/contract_policy_check.py
+make ci-core
+make ci-policy
+make ci-galaxy
+make ci-web
+make ci-desktop
+make ci-docs
 ```
 
-`make ci` runs the complete repository gate.
+`make ci` composes all of those domains into the authoritative full repository
+gate. The self-hosted GitHub workflow uses the same targets but classifies the
+files changed by each push and skips unaffected domains. Manual workflow
+dispatch always runs everything. See [`docs/development.md`](docs/development.md)
+for the build graph, feature matrix, dependency bootstrap, and CI path rules.
 
 The optional Tauri shell packages the same web application and a loopback-only
 `replicantd` sidecar without changing the daemon, CLI, web development, or
