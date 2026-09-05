@@ -2398,6 +2398,48 @@ impl ReplicantsGateway {
             key,
         })
     }
+
+    /// Refreshes every owned replicant listed by the authenticated account.
+    ///
+    /// The account summary is the authoritative membership list; each detail
+    /// response is then normalized and committed before its handle is
+    /// returned. This keeps account-wide maintenance actions from relying on
+    /// whichever replicants happen to have been discovered through devices.
+    pub async fn refresh_owned(&self) -> Result<Vec<ReplicantHandle>> {
+        self.client.ensure_open()?;
+        let response = self.client.managed_raw().accounts().me().await?;
+        let mut codes = response
+            .value
+            .replicants
+            .into_iter()
+            .map(|summary| {
+                summary
+                    .replicant_code
+                    .filter(|code| !code.trim().is_empty())
+                    .ok_or_else(|| Error::Decode {
+                        message:
+                            "account replicant summary omitted required identity `replicant_code`"
+                                .into(),
+                        status: Some(200),
+                        source: None,
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        codes.sort();
+        if codes.windows(2).any(|window| window[0] == window[1]) {
+            return Err(Error::Decode {
+                message: "account replicant summary contained duplicate replicant codes".into(),
+                status: Some(200),
+                source: None,
+            });
+        }
+
+        let mut handles = Vec::with_capacity(codes.len());
+        for code in codes {
+            handles.push(self.get_owned(&code).await?);
+        }
+        Ok(handles)
+    }
 }
 impl ReplicantHandle {
     #[must_use]
@@ -2546,6 +2588,44 @@ impl DirectoryGateway {
                     .map_err(normalization)
             })
             .collect()
+    }
+
+    /// Searches the complete public replicant directory using the query's
+    /// filters. Pagination is traversed until the server reports completion.
+    pub async fn search_all(
+        &self,
+        query: &raw::replicants::ReplicantListQuery,
+    ) -> Result<Vec<domain::DirectoryProfile>> {
+        self.client.ensure_open()?;
+        let mut query = query.clone();
+        let mut profiles = Vec::new();
+        loop {
+            let response = self.client.managed_raw().replicants().list(&query).await?;
+            let next_cursor = response.value.next_cursor;
+            profiles.extend(
+                response
+                    .value
+                    .replicants
+                    .iter()
+                    .map(|profile| {
+                        domain::directory_profile(profile, observed_at())
+                            .map(|observation| observation.value)
+                            .map_err(normalization)
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            );
+            let Some(next_cursor) = next_cursor else {
+                return Ok(profiles);
+            };
+            if query.cursor == Some(next_cursor) {
+                return Err(Error::Decode {
+                    message: "replicant directory cursor did not advance".into(),
+                    status: Some(200),
+                    source: None,
+                });
+            }
+            query.cursor = Some(next_cursor);
+        }
     }
 }
 

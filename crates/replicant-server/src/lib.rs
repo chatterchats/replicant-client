@@ -6472,7 +6472,12 @@ fn spawn_action(
         let _ = registration.await;
         let outcome = spawned
             .catalogue
-            .run_action(spawned.client(), &spawned_kind, parameters)
+            .run_action_with_repository(
+                spawned.client(),
+                &spawned.repository,
+                &spawned_kind,
+                parameters,
+            )
             .await;
         finish_action(&spawned, &spawned_id, &spawned_kind, outcome);
     });

@@ -168,7 +168,11 @@ pub(crate) async fn run_operation_cli(arguments: Vec<String>) -> crate::AnyResul
                 "operation report|action KIND [NAME=VALUE ...]",
             )?;
             let request = RunOperationRequest {
-                parameters: parse_parameters(arguments)?,
+                parameters: if class == "action" {
+                    parse_action_parameters(arguments)?
+                } else {
+                    parse_parameters(arguments)?
+                },
             };
             let response = DaemonClient::from_env()
                 .run_operation(class, &kind, &request)
@@ -226,6 +230,33 @@ fn parse_parameters(
             .ok_or_else(|| crate::app_error("workflow parameters must use NAME=VALUE"))?;
         let value = serde_json::from_str(value).unwrap_or_else(|_| Value::String(value.to_owned()));
         parameters.insert(name.to_owned(), value);
+    }
+    Ok(parameters)
+}
+
+fn parse_action_parameters(
+    arguments: impl Iterator<Item = String>,
+) -> crate::AnyResult<BTreeMap<String, Value>> {
+    let mut remaining = Vec::new();
+    let mut dry_run_flag = false;
+    for argument in arguments {
+        if argument == "--dry-run" {
+            if dry_run_flag {
+                return Err(crate::app_error("--dry-run may be supplied only once"));
+            }
+            dry_run_flag = true;
+        } else {
+            remaining.push(argument);
+        }
+    }
+    let mut parameters = parse_parameters(remaining.into_iter())?;
+    if dry_run_flag {
+        if parameters.contains_key("dry_run") {
+            return Err(crate::app_error(
+                "use either --dry-run or dry_run=true, not both",
+            ));
+        }
+        parameters.insert("dry_run".to_owned(), Value::Bool(true));
     }
     Ok(parameters)
 }
@@ -331,9 +362,10 @@ Set REPLICANTD_URL to override http://127.0.0.1:8080."
 fn print_operation_help() {
     println!(
         "Daemon operation catalogue\n\n\
-Usage:\n  replicant-cli operation catalogue\n  replicant-cli operation report KIND [NAME=VALUE ...]\n  replicant-cli operation action KIND [NAME=VALUE ...]\n\n\
+Usage:\n  replicant-cli operation catalogue\n  replicant-cli operation report KIND [NAME=VALUE ...]\n  replicant-cli operation action KIND [NAME=VALUE ...]\n  replicant-cli operation action replicant.rename_by_region --dry-run\n\n\
   replicant-cli operation help KIND\n\n\
 Kinds may use catalogue aliases. Values accept JSON scalars, arrays, and objects; unquoted values are strings.\n\
+Rename replicants by region is an explicit maintenance action:\n  Alpha -> Chats-A01   Beta -> Chats-B01   Delta -> Chats-D01\n  Hub -> Chats-Hub-01  Unassigned -> Chats-U01\nNumbering is deterministic display labeling; Replicant IDs remain identity.\n\
 Set REPLICANTD_URL to override http://127.0.0.1:8080."
     );
 }
@@ -359,6 +391,23 @@ mod tests {
         assert_eq!(request.parameters["replicant"], "Chats-1");
         assert_eq!(request.parameters["system_limit"], 12);
         assert_eq!(request.parameters["replace_plan"], true);
+    }
+
+    #[test]
+    fn action_parameters_accept_dry_run_flag() {
+        let parameters =
+            parse_action_parameters(["--dry-run", "unused=value"].into_iter().map(str::to_owned))
+                .expect("action parameters");
+        assert_eq!(parameters["dry_run"], true);
+        assert_eq!(parameters["unused"], "value");
+        assert!(
+            parse_action_parameters(
+                ["--dry-run", "dry_run=false"]
+                    .into_iter()
+                    .map(str::to_owned),
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -390,6 +439,7 @@ mod tests {
             "clear_tags",
             "contribute_twaffy_injectors",
             "tag_twaffy_ring_injectors",
+            "rename_replicants_by_region",
             "Workflows",
             "survey.route",
         ] {

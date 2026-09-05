@@ -10,6 +10,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::ActionResult;
 
+/// Explicit account maintenance for deterministic region-oriented Replicant names.
+pub mod rename_by_region;
+
+pub use rename_by_region::{RenameReplicantsByRegionAction, rename_replicants_by_region};
+
 /// Machine-readable category for one finite action event.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]

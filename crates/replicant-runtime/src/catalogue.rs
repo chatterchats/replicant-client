@@ -26,8 +26,8 @@ use serde_json::{Map, Value};
 
 use crate::{
     actions::{
-        ClearTagsAction, ContributeDevicesAction, TagDevicesAction, clear_tags, contribute_devices,
-        tag_devices,
+        ClearTagsAction, ContributeDevicesAction, RenameReplicantsByRegionAction, TagDevicesAction,
+        clear_tags, contribute_devices, rename_replicants_by_region, tag_devices,
     },
     automation::{
         EventIntent, ExplorationIntent, LogisticsIntent, MiningDeployIntent, ObservatoryIntent,
@@ -221,6 +221,29 @@ impl OperationCatalogue {
         kind: &str,
         parameters: BTreeMap<String, Value>,
     ) -> Result<Value, CatalogueError> {
+        self.run_action_inner(client, None, kind, parameters).await
+    }
+
+    /// Validates and executes a finite action with the runtime repository
+    /// available to actions that consume application-owned authority.
+    pub async fn run_action_with_repository(
+        &self,
+        client: &Client,
+        repository: &WorkflowRepository,
+        kind: &str,
+        parameters: BTreeMap<String, Value>,
+    ) -> Result<Value, CatalogueError> {
+        self.run_action_inner(client, Some(repository), kind, parameters)
+            .await
+    }
+
+    async fn run_action_inner(
+        &self,
+        client: &Client,
+        repository: Option<&WorkflowRepository>,
+        kind: &str,
+        parameters: BTreeMap<String, Value>,
+    ) -> Result<Value, CatalogueError> {
         let kind = self
             .resolve_kind(OperationClass::Action, kind)
             .ok_or_else(|| unknown(OperationClass::Action, kind))?;
@@ -241,6 +264,22 @@ impl OperationCatalogue {
                     .await
                     .map_err(|error| CatalogueError::Runtime(error.to_string()))?,
             ),
+            "replicant.rename_by_region" => {
+                let repository = repository.ok_or_else(|| {
+                    CatalogueError::Runtime(
+                        "replicant.rename_by_region requires the workflow repository".to_owned(),
+                    )
+                })?;
+                serialize(
+                    rename_replicants_by_region(
+                        client,
+                        repository,
+                        &decode::<RenameReplicantsByRegionAction>(parameters)?,
+                    )
+                    .await
+                    .map_err(|error| CatalogueError::Runtime(error.to_string()))?,
+                )
+            }
             "survey.belt_search" => {
                 let input: BeltSearchAction = decode(parameters)?;
                 serialize(
@@ -1747,6 +1786,23 @@ fn descriptors() -> DescriptorCatalog {
                     required("tag", "Tag", ParameterKind::Tag),
                     defaulted("dry_run", "Dry run", ParameterKind::Boolean, false),
                 ],
+                device_commands: Vec::new(),
+            },
+            ActionDescriptor {
+                kind: operation_kind("replicant.rename_by_region"),
+                display_name: "Rename replicants by region".to_owned(),
+                aliases: strings(&["rename_replicants_by_region", "rename-by-region"]),
+                description: "Explicitly rename owned Replicants by managed region assignment (Alpha -> Chats-A01, Beta -> Chats-B01, Delta -> Chats-D01, Hub -> Chats-Hub-01). Numbering is deterministic display labeling; Replicant IDs remain identity.".to_owned(),
+                category: "replicants".to_owned(),
+                operation_class: OperationClass::Action,
+                risk: MutationRisk::Elevated,
+                applicable_to: vec![EntityKind::Replicant],
+                parameters: vec![defaulted(
+                    "dry_run",
+                    "Dry run",
+                    ParameterKind::Boolean,
+                    false,
+                )],
                 device_commands: Vec::new(),
             },
             ActionDescriptor {

@@ -7957,6 +7957,20 @@ fn load_assignments(
         .collect()
 }
 
+/// Returns the durable region assignment for each Replicant that has one.
+///
+/// The rename action consumes this projection instead of reconstructing
+/// region membership from locations or the star catalogue. An absent map entry
+/// and an explicit `None` both mean that the Replicant is currently unassigned.
+pub(crate) fn assigned_replicant_regions(
+    repository: &WorkflowRepository,
+) -> Result<BTreeMap<String, Option<String>>, ApplicationError> {
+    Ok(load_assignments(repository)?
+        .into_iter()
+        .map(|(replicant, assignment)| (replicant, assignment.region))
+        .collect())
+}
+
 fn load_goal_controls<'a>(
     repository: &WorkflowRepository,
     regions: impl IntoIterator<Item = &'a str>,

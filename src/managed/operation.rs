@@ -1756,6 +1756,14 @@ fn operation_evidence(adapter: &MutationAdapter) -> Value {
     let default = || events(&[], &[], serde_json::json!({}));
 
     match adapter {
+        MutationAdapter::ReplicantUpdate { request, .. } => serde_json::json!({
+            "event_names": [],
+            "failure_event_names": [],
+            "payload": {},
+            "expected_state": request.name.as_ref().map_or(Value::Null, |name| {
+                serde_json::json!({"name": name})
+            })
+        }),
         MutationAdapter::DeviceCommand { command, .. } => match command {
             raw::devices::DeviceCommand::Activate => events(
                 &[
