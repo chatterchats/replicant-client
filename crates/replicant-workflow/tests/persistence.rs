@@ -146,7 +146,7 @@ fn filtered_lists_exclude_terminal_rows_and_use_parent_identity() {
 }
 
 #[test]
-fn retention_removes_completed_trees_but_preserves_live_children_and_claims() {
+fn retention_removes_terminal_claim_owners_but_preserves_live_children() {
     let repository = WorkflowRepository::open_in_memory().expect("open repository");
 
     let completed_parent = create(&repository, None);
@@ -166,18 +166,24 @@ fn retention_removes_completed_trees_but_preserves_live_children_and_claims() {
         .acquire_claim(claimed.id, ResourceKey::Device("CLAIMED".to_owned()))
         .expect("acquire claim");
     let claimed = complete(&repository, claimed);
+    assert!(
+        repository
+            .claims(claimed.id)
+            .expect("list terminal claims")
+            .is_empty()
+    );
 
     assert_eq!(
         repository
             .prune_terminal_before(i64::MAX)
             .expect("prune terminal workflows"),
-        2
+        3
     );
     assert!(repository.read(completed_parent.id).unwrap().is_none());
     assert!(repository.read(completed_child.id).unwrap().is_none());
     assert!(repository.read(retained_parent.id).unwrap().is_some());
     assert!(repository.read(live_child.id).unwrap().is_some());
-    assert!(repository.read(claimed.id).unwrap().is_some());
+    assert!(repository.read(claimed.id).unwrap().is_none());
     assert_eq!(repository.activity(completed_child.id).unwrap(), Vec::new());
 }
 
