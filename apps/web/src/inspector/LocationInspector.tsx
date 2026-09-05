@@ -7,19 +7,6 @@ import {
 } from "./InspectorFields";
 import { InspectorStructuredFields } from "./InspectorStructuredFields";
 
-function humanizeKey(value: string) {
-  return value
-    .replace(/[._-]+/g, " ")
-    .replace(/\b\w/g, (letter) => letter.toUpperCase());
-}
-
-function objectFields(value: Record<string, unknown>): InspectorField[] {
-  return Object.entries(value).map(([key, item]) => ({
-    label: humanizeKey(key),
-    value: item,
-  }));
-}
-
 function hasObject(value: Record<string, unknown> | undefined) {
   return value !== undefined && Object.keys(value).length > 0;
 }
@@ -247,7 +234,7 @@ export function LocationInspector({
                       ))}
                     </ul>
                   ) : (
-                    <InspectorFields fields={objectFields(site)} />
+                    <InspectorStructuredFields value={site} />
                   )}
                 </article>
               );
@@ -280,7 +267,7 @@ export function LocationInspector({
                 </li>
               ) : (
                 <li key={index}>
-                  <InspectorFields fields={objectFields(item)} />
+                  <InspectorStructuredFields value={item} />
                 </li>
               );
             })}
@@ -290,7 +277,7 @@ export function LocationInspector({
       {detail && hasObject(detail.advanced) ? (
         <details className="inspector-section">
           <summary>Advanced</summary>
-          <InspectorFields fields={objectFields(detail.advanced)} />
+          <InspectorStructuredFields value={detail.advanced} />
         </details>
       ) : null}
       {detail?.contents.total ? (

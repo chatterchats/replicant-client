@@ -79,6 +79,13 @@ export function relatedDeviceLabel(
   return related?.entity_type ? `${related.entity_type} (${code})` : code;
 }
 
+export function inspectorCommandLabel(value: string) {
+  return value
+    .trim()
+    .replace(/[._-]+/g, " ")
+    .replace(/\b[a-z]/g, (letter) => letter.toUpperCase());
+}
+
 export function fallbackSummary(
   entity: SelectedEntity,
   value: unknown,

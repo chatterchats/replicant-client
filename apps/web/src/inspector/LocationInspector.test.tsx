@@ -75,6 +75,29 @@ describe("LocationInspector", () => {
     expect(html).toContain("<details");
   });
 
+  it("renders advanced device objects as structured facts instead of object strings", () => {
+    const html = renderToStaticMarkup(
+      <LocationInspector
+        summary={summary}
+        detail={{
+          ...detail,
+          advanced: {
+            devices: [
+              { code: "MINER-1", device_type: "mining_drone", active: true },
+              { code: "HAULER-2", device_type: "cargo_vessel", active: false },
+            ],
+          },
+        }}
+      />,
+    );
+    expect(html).toContain("Devices");
+    expect(html).toContain("MINER-1");
+    expect(html).toContain("Device Type");
+    expect(html).toContain("mining_drone");
+    expect(html).toContain("HAULER-2");
+    expect(html).not.toContain("[object Object]");
+  });
+
   it("renders asteroid-belt resources as readable scarcity facts", () => {
     const html = renderToStaticMarkup(
       <LocationInspector

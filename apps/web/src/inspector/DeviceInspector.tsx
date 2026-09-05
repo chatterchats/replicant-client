@@ -24,6 +24,7 @@ import { InspectorFields } from "./InspectorFields";
 import { TravelSection } from "./TravelInspector";
 import {
   advertisedDeviceCommands,
+  inspectorCommandLabel,
   relatedDeviceLabel,
   type DescriptorDeviceCommand,
 } from "./inspectorModel";
@@ -155,7 +156,9 @@ function InlineDeviceAction({
       ))}
       {serverError ? <p className="inline-warning">{serverError}</p> : null}
       <button type="submit" disabled={running}>
-        {running ? "Running…" : `Run ${command.descriptor.display_name}`}
+        {running
+          ? "Running…"
+          : `Run ${inspectorCommandLabel(command.descriptor.display_name)}`}
       </button>
     </form>
   );
@@ -408,7 +411,7 @@ export function DeviceInspector({
                     className="inspector-capability unsupported"
                     key={capability}
                   >
-                    {capability} · unsupported
+                    {inspectorCommandLabel(capability)} · unsupported
                   </span>
                 );
               }
@@ -431,7 +434,7 @@ export function DeviceInspector({
                       }
                     }}
                   >
-                    {command.descriptor.display_name}
+                    {inspectorCommandLabel(command.descriptor.display_name)}
                   </button>
                   {expanded === key ? (
                     <InlineDeviceAction

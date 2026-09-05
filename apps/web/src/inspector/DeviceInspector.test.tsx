@@ -13,7 +13,10 @@ import type {
   ParameterDescriptor,
 } from "../protocol";
 import { DeviceInspector } from "./DeviceInspector";
-import { advertisedDeviceCommands } from "./inspectorModel";
+import {
+  advertisedDeviceCommands,
+  inspectorCommandLabel,
+} from "./inspectorModel";
 
 const validation = {
   minimum: null,
@@ -160,6 +163,36 @@ const device: DeviceSummary = {
 };
 
 describe("DeviceInspector", () => {
+  it("formats every raw capability name as a readable title", () => {
+    expect(
+      [
+        "clear_queue",
+        "deactivate",
+        "deploy",
+        "recall",
+        "clear_directive",
+        "assemble",
+        "launch",
+        "withdraw",
+        "activate",
+        "decommission",
+        "system_scan",
+      ].map(inspectorCommandLabel),
+    ).toEqual([
+      "Clear Queue",
+      "Deactivate",
+      "Deploy",
+      "Recall",
+      "Clear Directive",
+      "Assemble",
+      "Launch",
+      "Withdraw",
+      "Activate",
+      "Decommission",
+      "System Scan",
+    ]);
+  });
+
   it("renders the advertised ten-command set once with distinct cargo and stow", async () => {
     const container = document.createElement("div");
     const root = createRoot(container);
@@ -188,8 +221,21 @@ describe("DeviceInspector", () => {
       new Set(commandButtons.map((button) => button.textContent)).size,
     ).toBe(10);
 
+    expect(commandButtons.map((button) => button.textContent)).toEqual([
+      "Autofactory Print",
+      "Device Travel",
+      "Device Change Owner",
+      "Activate",
+      "Deactivate",
+      "Clear Queue",
+      "System Scan",
+      "Device Retarget",
+      "Device Start Mining",
+      "Device Stellar Census",
+    ]);
+
     const census = commandButtons.find((button) =>
-      button.textContent?.includes("stellar_census"),
+      button.textContent?.includes("Stellar Census"),
     ) as HTMLButtonElement;
     await act(async () => {
       census.click();

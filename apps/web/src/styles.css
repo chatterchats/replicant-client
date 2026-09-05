@@ -716,6 +716,8 @@ h1 {
   min-width: 320px;
   max-width: min(55vw, 680px);
   flex: 0 0 var(--inspector-width, 390px);
+  container-name: inspector;
+  container-type: inline-size;
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -783,7 +785,12 @@ h1 {
 .drawer-header button {
   width: 32px;
   height: 32px;
+  display: inline-grid;
+  place-items: center;
+  padding: 0;
   font-size: 1.25rem;
+  line-height: 1;
+  text-align: center;
 }
 .inspector-body {
   min-width: 0;
@@ -3559,6 +3566,12 @@ h1 {
   padding: 8px 10px;
   text-align: left;
   overflow-wrap: anywhere;
+}
+
+@container inspector (min-width: 600px) {
+  .inspector-command-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
 }
 .inspector-structured-row {
   display: contents;
