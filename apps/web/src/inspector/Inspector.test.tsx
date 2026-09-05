@@ -196,7 +196,7 @@ describe("Inspector extraction", () => {
       root.unmount();
     });
   });
-  it("offers owned device logs as a button instead of embedded activity", () => {
+  it("offers owned device logs as a button alongside recent activity", () => {
     const html = render("device", {
       entity: { kind: "device", id: "D-1" },
       ownership: "owned",
@@ -228,7 +228,7 @@ describe("Inspector extraction", () => {
 
     expect(html).toContain(">Device log</button>");
     expect(html).not.toContain('aria-label="Device log"');
-    expect(html).not.toContain("<h3>Activity</h3>");
+    expect(html).toContain("<h3>Activity</h3>");
   });
   it("opens device logs in a modal dialog", async () => {
     const deviceLogs = vi
