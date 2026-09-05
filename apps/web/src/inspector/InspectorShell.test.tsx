@@ -77,6 +77,8 @@ describe("InspectorShell", () => {
     expect(html).toContain('aria-label="Forward in inspector"');
     expect(html).toContain("disabled");
     expect(html).toContain('aria-label="Inspector history"');
+    expect(html).toContain('class="inspector-primary-controls"');
+    expect(html).toContain('class="inspector-history-controls"');
     expect(html).toContain("1. SOL");
   });
 });

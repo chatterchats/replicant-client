@@ -74,4 +74,33 @@ describe("LocationInspector", () => {
     expect(html).toContain("393");
     expect(html).toContain("<details");
   });
+
+  it("renders asteroid-belt resources as readable scarcity facts", () => {
+    const html = renderToStaticMarkup(
+      <LocationInspector
+        summary={summary}
+        detail={{
+          ...detail,
+          belt: {
+            designation: "SOL-BELT",
+            density: "dense",
+            inner_radius_au: 2.27,
+            outer_radius_au: 3.41,
+            resources: {
+              carbon: "moderate",
+              rares: "scarce",
+              silicates: "high",
+            },
+          },
+        }}
+      />,
+    );
+    expect(html).toContain("Asteroid belt");
+    expect(html).toContain("Resources");
+    expect(html).toContain("Carbon");
+    expect(html).toContain("Moderate");
+    expect(html).toContain('data-level="scarce"');
+    expect(html).toContain('data-level="high"');
+    expect(html).not.toContain("{&quot;carbon&quot;");
+  });
 });

@@ -176,7 +176,7 @@ export function InspectorShell({
             <span>{summary.secondary_label}</span>
           ) : null}
         </div>
-        <div className="inspector-header-controls">
+        <div className="inspector-primary-controls">
           <button
             type="button"
             aria-label="Copy entity ID"
@@ -194,67 +194,67 @@ export function InspectorShell({
           >
             {entityIdCopied ? "✓" : "⧉"}
           </button>
-          {navigation ? (
-            <div
-              className="inspector-history-controls"
-              aria-label="Inspector history"
-            >
-              <button
-                type="button"
-                aria-label={
-                  navigation.backLabel
-                    ? `Back to ${navigation.backLabel}`
-                    : "Back in inspector"
-                }
-                title={
-                  navigation.backLabel
-                    ? `Back to ${navigation.backLabel} (Alt+Left)`
-                    : "Back in inspector (Alt+Left)"
-                }
-                disabled={!navigation.canGoBack}
-                onClick={navigation.onBack}
-              >
-                ←
-              </button>
-              <label className="inspector-history-picker">
-                <select
-                  aria-label="Inspector history"
-                  value={navigation.position}
-                  title={`${String(navigation.position + 1)} of ${String(navigation.total)}`}
-                  onChange={(event) => {
-                    navigation.onJump(Number(event.target.value));
-                  }}
-                >
-                  {navigation.entries.map((entry) => (
-                    <option key={entry.index} value={entry.index}>
-                      {`${String(entry.index + 1)}. ${entry.label}`}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <button
-                type="button"
-                aria-label={
-                  navigation.forwardLabel
-                    ? `Forward to ${navigation.forwardLabel}`
-                    : "Forward in inspector"
-                }
-                title={
-                  navigation.forwardLabel
-                    ? `Forward to ${navigation.forwardLabel} (Alt+Right)`
-                    : "Forward in inspector (Alt+Right)"
-                }
-                disabled={!navigation.canGoForward}
-                onClick={navigation.onForward}
-              >
-                →
-              </button>
-            </div>
-          ) : null}
           <button aria-label="Close inspector" onClick={onClose}>
             ×
           </button>
         </div>
+        {navigation ? (
+          <div
+            className="inspector-history-controls"
+            aria-label="Inspector history"
+          >
+            <button
+              type="button"
+              aria-label={
+                navigation.backLabel
+                  ? `Back to ${navigation.backLabel}`
+                  : "Back in inspector"
+              }
+              title={
+                navigation.backLabel
+                  ? `Back to ${navigation.backLabel} (Alt+Left)`
+                  : "Back in inspector (Alt+Left)"
+              }
+              disabled={!navigation.canGoBack}
+              onClick={navigation.onBack}
+            >
+              ←
+            </button>
+            <label className="inspector-history-picker">
+              <select
+                aria-label="Inspector history"
+                value={navigation.position}
+                title={`${String(navigation.position + 1)} of ${String(navigation.total)}`}
+                onChange={(event) => {
+                  navigation.onJump(Number(event.target.value));
+                }}
+              >
+                {navigation.entries.map((entry) => (
+                  <option key={entry.index} value={entry.index}>
+                    {`${String(entry.index + 1)}. ${entry.label}`}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <button
+              type="button"
+              aria-label={
+                navigation.forwardLabel
+                  ? `Forward to ${navigation.forwardLabel}`
+                  : "Forward in inspector"
+              }
+              title={
+                navigation.forwardLabel
+                  ? `Forward to ${navigation.forwardLabel} (Alt+Right)`
+                  : "Forward in inspector (Alt+Right)"
+              }
+              disabled={!navigation.canGoForward}
+              onClick={navigation.onForward}
+            >
+              →
+            </button>
+          </div>
+        ) : null}
       </header>
       {vitals ? <div className="inspector-vitals">{vitals}</div> : null}
       <div className="inspector-body">

@@ -396,6 +396,56 @@ export function DeviceInspector({
           { label: "Grace period", value: device.grace_period_remaining },
         ]}
       />
+      {capabilities.length ? (
+        <section className="inspector-section inspector-capabilities-section">
+          <h3>Capabilities</h3>
+          <div className="inspector-command-grid">
+            {capabilities.map((capability) => {
+              const command = executable.get(capability);
+              if (!command) {
+                return (
+                  <span
+                    className="inspector-capability unsupported"
+                    key={capability}
+                  >
+                    {capability} · unsupported
+                  </span>
+                );
+              }
+              const key = `${command.descriptor.kind}:${command.bindingCommand}`;
+              return (
+                <div
+                  className={`inspector-command-item ${
+                    expanded === key ? "expanded" : ""
+                  }`}
+                  key={key}
+                >
+                  <button
+                    onClick={() => {
+                      if (canRunInline(command)) {
+                        setExpanded((current) =>
+                          current === key ? null : key,
+                        );
+                      } else {
+                        onRunCommand(command);
+                      }
+                    }}
+                  >
+                    {command.descriptor.display_name}
+                  </button>
+                  {expanded === key ? (
+                    <InlineDeviceAction
+                      command={command}
+                      entities={entities}
+                      onFinished={onOperationFinished}
+                    />
+                  ) : null}
+                </div>
+              );
+            })}
+          </div>
+        </section>
+      ) : null}
       <DeviceRolePanel
         device={device}
         detail={detail}
@@ -538,51 +588,6 @@ export function DeviceInspector({
               </li>
             ))}
           </ul>
-        </section>
-      ) : null}
-      {capabilities.length ? (
-        <section className="inspector-section">
-          <h3>Capabilities</h3>
-          <div className="inspector-command-grid">
-            {capabilities.map((capability) => {
-              const command = executable.get(capability);
-              if (!command) {
-                return (
-                  <span
-                    className="inspector-capability unsupported"
-                    key={capability}
-                  >
-                    {capability} · unsupported
-                  </span>
-                );
-              }
-              const key = `${command.descriptor.kind}:${command.bindingCommand}`;
-              return (
-                <div key={key}>
-                  <button
-                    onClick={() => {
-                      if (canRunInline(command)) {
-                        setExpanded((current) =>
-                          current === key ? null : key,
-                        );
-                      } else {
-                        onRunCommand(command);
-                      }
-                    }}
-                  >
-                    {command.descriptor.display_name}
-                  </button>
-                  {expanded === key ? (
-                    <InlineDeviceAction
-                      command={command}
-                      entities={entities}
-                      onFinished={onOperationFinished}
-                    />
-                  ) : null}
-                </div>
-              );
-            })}
-          </div>
         </section>
       ) : null}
       {relationGroups.map(([label, codes]) =>

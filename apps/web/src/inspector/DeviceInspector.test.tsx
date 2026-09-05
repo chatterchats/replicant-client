@@ -367,7 +367,7 @@ describe("DeviceInspector", () => {
       "shuttle",
     ]);
   });
-  it("shows directive configuration and places child devices after capabilities", () => {
+  it("places capabilities immediately after core details and before later sections", () => {
     const html = renderToStaticMarkup(
       <DeviceInspector
         device={{
@@ -398,6 +398,9 @@ describe("DeviceInspector", () => {
     expect(html).toContain("TARAZEDAR-BELT-1");
     expect(html).toContain("Deliver");
     expect(html).toContain("SOL-3-L4");
+    expect(html.indexOf("Capabilities")).toBeLessThan(
+      html.indexOf("Directive"),
+    );
     expect(html.indexOf("Capabilities")).toBeLessThan(
       html.indexOf("Controlled devices"),
     );

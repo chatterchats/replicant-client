@@ -5,6 +5,7 @@ import {
   presentInspectorValue,
   type InspectorField,
 } from "./InspectorFields";
+import { InspectorStructuredFields } from "./InspectorStructuredFields";
 
 function humanizeKey(value: string) {
   return value
@@ -208,9 +209,12 @@ export function LocationInspector({
         </section>
       ) : null}
       {specialized.map(([title, value]) => (
-        <section className="inspector-section" key={title}>
+        <section
+          className="inspector-section inspector-data-section"
+          key={title}
+        >
           <h3>{title}</h3>
-          <InspectorFields fields={objectFields(value)} />
+          <InspectorStructuredFields value={value} />
         </section>
       ))}
       {detail?.resource_sites.length ? (

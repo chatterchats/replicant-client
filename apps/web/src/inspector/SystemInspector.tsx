@@ -1,18 +1,7 @@
 import type { EntitySummary, SystemInspectorSummary } from "../protocol";
 import { InspectorCollection } from "./InspectorCollection";
-import { InspectorFields, type InspectorField } from "./InspectorFields";
-
-function humanizeKey(value: string) {
-  return value
-    .replace(/[._-]+/g, " ")
-    .replace(/\b\w/g, (letter) => letter.toUpperCase());
-}
-function objectFields(value: Record<string, unknown>): InspectorField[] {
-  return Object.entries(value).map(([key, item]) => ({
-    label: humanizeKey(key),
-    value: item,
-  }));
-}
+import { InspectorFields } from "./InspectorFields";
+import { InspectorStructuredFields } from "./InspectorStructuredFields";
 
 export function SystemInspector({
   summary,
@@ -55,21 +44,21 @@ export function SystemInspector({
         ]}
       />
       {detail && Object.keys(detail.stellar).length ? (
-        <section className="inspector-section">
+        <section className="inspector-section inspector-data-section">
           <h3>Star</h3>
-          <InspectorFields fields={objectFields(detail.stellar)} />
+          <InspectorStructuredFields value={detail.stellar} />
         </section>
       ) : null}
       {detail && Object.keys(detail.asteroid_belt).length ? (
-        <section className="inspector-section">
+        <section className="inspector-section inspector-data-section">
           <h3>Asteroid belt</h3>
-          <InspectorFields fields={objectFields(detail.asteroid_belt)} />
+          <InspectorStructuredFields value={detail.asteroid_belt} />
         </section>
       ) : null}
       {detail && Object.keys(detail.outer_system).length ? (
-        <section className="inspector-section">
+        <section className="inspector-section inspector-data-section">
           <h3>Outer system</h3>
-          <InspectorFields fields={objectFields(detail.outer_system)} />
+          <InspectorStructuredFields value={detail.outer_system} />
         </section>
       ) : null}
       {detail?.entry_point ? (
