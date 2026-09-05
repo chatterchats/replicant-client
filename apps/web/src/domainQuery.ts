@@ -17,6 +17,8 @@ export interface DomainQueryResult<T> {
   refresh: () => Promise<void>;
 }
 
+const AUTO_INVALIDATION_DELAY_MS = 1_500;
+
 export function domainInvalidationKey(
   slice: DomainSlice | readonly DomainSlice[] | undefined,
   invalidated: Partial<Record<DomainSlice, number>>,
