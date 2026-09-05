@@ -3224,7 +3224,9 @@ async fn reset_recover_transient_devices(
             )
             .await
             .map_err(string_error)?;
-        await_success(&operation).await?;
+        if !await_recovery_operation(&operation).await? {
+            return Ok(false);
+        }
         let device = handle
             .refresh()
             .await
@@ -3340,7 +3342,9 @@ async fn reset_unload_device(
                 )
                 .await
                 .map_err(string_error)?;
-            await_success(&operation).await?;
+            if !await_recovery_operation(&operation).await? {
+                return Ok(false);
+            }
             device = handle
                 .refresh()
                 .await
@@ -3348,15 +3352,16 @@ async fn reset_unload_device(
                 .snapshot()
                 .await
                 .map_err(string_error)?;
+            // A successful deploy response is authoritative for the mutation,
+            // but the managed relationship projection may lag briefly. Recheck
+            // on the next reset pass instead of failing or resubmitting.
             if device
                 .relationships
                 .stowed_in
                 .as_ref()
                 .is_some_and(|parent| parent.id.as_str().eq_ignore_ascii_case(vessel_code))
             {
-                return Err(format!(
-                    "automation reset deployed {device_code}, but it remains stowed in {vessel_code}"
-                ));
+                return Ok(false);
             }
         }
         checkpoint
@@ -3387,7 +3392,9 @@ async fn reset_unload_device(
                 )
                 .await
                 .map_err(string_error)?;
-            await_success(&operation).await?;
+            if !await_recovery_operation(&operation).await? {
+                return Ok(false);
+            }
             device = handle
                 .refresh()
                 .await

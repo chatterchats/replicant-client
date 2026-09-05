@@ -1737,6 +1737,13 @@ fn device_command_expects_evidence(command: &raw::devices::DeviceCommand) -> boo
     }
 }
 
+fn device_command_response_completes(command: &raw::devices::DeviceCommand) -> bool {
+    matches!(
+        command,
+        raw::devices::DeviceCommand::Deploy | raw::devices::DeviceCommand::Stow { .. }
+    )
+}
+
 fn operation_evidence(adapter: &MutationAdapter) -> Value {
     fn events(names: &[&str], failures: &[&str], payload: Value) -> Value {
         serde_json::json!({
@@ -2570,10 +2577,18 @@ async fn attempt(client: &Client, id: &OperationId) -> Result<()> {
         }
         Ok(response) => {
             // Most mutations still require normalized target evidence after a
-            // successful HTTP response. The account inbox has no managed target
-            // projection to reconcile, and POST /v1/messages/read returns the
-            // authoritative result of that targetless mutation.
-            let response_completes = matches!(&adapter, MutationAdapter::MessagesMarkRead { .. });
+            // successful HTTP response. Deploy and stow return the complete
+            // final placement in their typed command response, so they do not
+            // need a second event to become terminal. The account inbox likewise
+            // has no managed target projection to reconcile, and
+            // POST /v1/messages/read returns the authoritative result of that
+            // targetless mutation.
+            let response_completes = matches!(&adapter, MutationAdapter::MessagesMarkRead { .. })
+                || matches!(
+                    &adapter,
+                    MutationAdapter::DeviceCommand { command, .. }
+                        if device_command_response_completes(command)
+                );
             let next = if response_completes {
                 OperationStatus::Completed
             } else if expects_evidence {
@@ -3036,6 +3051,32 @@ mod tests {
 
         client.close().await.expect("close");
         server.verify().await; // panics if the mock was not hit exactly once
+    }
+
+    #[tokio::test]
+    async fn synchronous_device_command_completes_from_typed_response() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/devices/D1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "device_code": "D1",
+                "status": "idle",
+                "location": "SOL-3"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = client_at(&server.uri()).await;
+
+        let operation = device_command(&client, "D1", raw::devices::DeviceCommand::Deploy)
+            .await
+            .expect("synchronous device command");
+
+        assert_eq!(
+            operation.status().await.expect("status"),
+            OperationStatus::Completed
+        );
+        client.close().await.expect("close");
     }
 
     #[tokio::test]
