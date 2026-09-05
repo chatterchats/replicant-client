@@ -12416,6 +12416,7 @@ fn claimed_scan_tour_devices(context: &WorkflowContext) -> Result<BTreeSet<Strin
 struct ScanTourFleetDeviceCandidate {
     code: String,
     stowed: bool,
+    assigned_replicant: Option<String>,
     controller: Option<String>,
     controlled_devices: BTreeSet<String>,
 }
@@ -12442,6 +12443,11 @@ fn scan_tour_candidate(device: &Device, stowed: bool) -> ScanTourFleetDeviceCand
     ScanTourFleetDeviceCandidate {
         code: device.key.id.as_str().to_owned(),
         stowed,
+        assigned_replicant: device
+            .relationships
+            .assigned_replicant
+            .as_ref()
+            .map(|replicant| replicant.id.as_str().to_owned()),
         controller: device
             .relationships
             .controller
@@ -12461,6 +12467,7 @@ async fn available_scan_tour_fleet(
     client: &Client,
     staging_location: &str,
     vessel: &Device,
+    preferred_replicant: &str,
 ) -> Result<ScanTourFleetAvailability, String> {
     let claimed = claimed_scan_tour_devices(context)?;
     let vessel_code = vessel.key.id.as_str();
@@ -12500,13 +12507,15 @@ async fn available_scan_tour_fleet(
         }
     }
 
+    // Do not require the staging-location fleet to be relationship-free.
+    // Survey controllers commonly remain paired with their drones while idle,
+    // and those complete families are the preferred reusable fleet.
     let controller_handles = client
         .devices()
         .controllers(DeviceType::SurveyController)
         .owned()
         .idle()
         .at(staging_location)
-        .without_adopted_devices()
         .collect()
         .await
         .map_err(string_error)?;
@@ -12526,7 +12535,6 @@ async fn available_scan_tour_fleet(
         .of_type(DeviceType::from("survey_drone"))
         .idle()
         .at(staging_location)
-        .without_controller()
         .collect()
         .await
         .map_err(string_error)?;
@@ -12539,23 +12547,31 @@ async fn available_scan_tour_fleet(
         drones.push(scan_tour_candidate(&snapshot, false));
     }
 
-    select_scan_tour_fleet_availability(controllers, drones)
+    select_scan_tour_fleet_availability(controllers, drones, Some(preferred_replicant))
 }
 
 fn select_scan_tour_fleet_availability(
     mut controllers: Vec<ScanTourFleetDeviceCandidate>,
     mut drones: Vec<ScanTourFleetDeviceCandidate>,
+    preferred_replicant: Option<&str>,
 ) -> Result<ScanTourFleetAvailability, String> {
+    let assigned_to_preferred = |candidate: &ScanTourFleetDeviceCandidate| {
+        preferred_replicant.is_some_and(|replicant| {
+            candidate.assigned_replicant.as_deref() == Some(replicant)
+        })
+    };
     controllers.sort_by(|left, right| {
         right
             .stowed
             .cmp(&left.stowed)
+            .then_with(|| assigned_to_preferred(right).cmp(&assigned_to_preferred(left)))
             .then_with(|| left.code.cmp(&right.code))
     });
     drones.sort_by(|left, right| {
         right
             .stowed
             .cmp(&left.stowed)
+            .then_with(|| assigned_to_preferred(right).cmp(&assigned_to_preferred(left)))
             .then_with(|| left.code.cmp(&right.code))
     });
 
@@ -12610,6 +12626,7 @@ fn select_scan_tour_fleet_availability(
             right
                 .stowed
                 .cmp(&left.stowed)
+                .then_with(|| assigned_to_preferred(right).cmp(&assigned_to_preferred(left)))
                 .then_with(|| left.code.cmp(&right.code))
         });
         selected.extend(fill);
@@ -12826,8 +12843,18 @@ async fn ensure_scan_tour_fleet_capacity(
         .map(|location| location.id.as_str().to_owned())
         .ok_or_else(|| format!("survey vessel {vessel} has no current staging location"))?;
 
-    let availability =
-        available_scan_tour_fleet(context, client, &staging_location, &vessel_snapshot).await?;
+    let preferred_replicant = checkpoint
+        .replicant
+        .clone()
+        .ok_or_else(|| "survey tour checkpoint has no resolved replicant".to_owned())?;
+    let availability = available_scan_tour_fleet(
+        context,
+        client,
+        &staging_location,
+        &vessel_snapshot,
+        &preferred_replicant,
+    )
+    .await?;
     if !ensure_scan_tour_stow_capacity(context, checkpoint, &vessel_snapshot, &availability)? {
         return Ok(false);
     }
@@ -12849,8 +12876,14 @@ async fn ensure_scan_tour_fleet_capacity(
 
     // A parallel shard may have won the claim race between discovery and
     // reservation. Refresh the claim-aware view before deciding what to print.
-    let availability =
-        available_scan_tour_fleet(context, client, &staging_location, &vessel_snapshot).await?;
+    let availability = available_scan_tour_fleet(
+        context,
+        client,
+        &staging_location,
+        &vessel_snapshot,
+        &preferred_replicant,
+    )
+    .await?;
     if !ensure_scan_tour_stow_capacity(context, checkpoint, &vessel_snapshot, &availability)? {
         return Ok(false);
     }
@@ -12934,8 +12967,14 @@ async fn ensure_scan_tour_fleet_capacity(
     }
 
     if print_location.eq_ignore_ascii_case(&staging_location) {
-        let availability =
-            available_scan_tour_fleet(context, client, &staging_location, &vessel_snapshot).await?;
+        let availability = available_scan_tour_fleet(
+            context,
+            client,
+            &staging_location,
+            &vessel_snapshot,
+            &preferred_replicant,
+        )
+        .await?;
         if !ensure_scan_tour_stow_capacity(context, checkpoint, &vessel_snapshot, &availability)? {
             return Ok(false);
         }
@@ -16400,6 +16439,7 @@ mod tests {
         let controller = ScanTourFleetDeviceCandidate {
             code: "CONTROLLER".to_owned(),
             stowed: true,
+            assigned_replicant: None,
             controller: None,
             // The live collection projection can omit the controller-side
             // reverse relationship even while each drone points at it.
@@ -16410,12 +16450,13 @@ mod tests {
             .map(|code| ScanTourFleetDeviceCandidate {
                 code: code.to_owned(),
                 stowed: true,
+                assigned_replicant: None,
                 controller: Some("CONTROLLER".to_owned()),
                 controlled_devices: BTreeSet::new(),
             })
             .collect();
 
-        let availability = select_scan_tour_fleet_availability(vec![controller], drones)
+        let availability = select_scan_tour_fleet_availability(vec![controller], drones, None)
             .expect("select stowed survey fleet");
 
         assert_eq!(availability.controllers, vec!["CONTROLLER".to_owned()]);
@@ -16434,10 +16475,108 @@ mod tests {
     }
 
     #[test]
+    fn scan_tour_reuses_idle_controller_with_existing_drones() {
+        let controller = ScanTourFleetDeviceCandidate {
+            code: "CONTROLLER".to_owned(),
+            stowed: false,
+            assigned_replicant: Some("R-1".to_owned()),
+            controller: None,
+            controlled_devices: BTreeSet::from([
+                "D1".to_owned(),
+                "D2".to_owned(),
+                "D3".to_owned(),
+            ]),
+        };
+        let drones = ["D1", "D2", "D3"]
+            .into_iter()
+            .map(|code| ScanTourFleetDeviceCandidate {
+                code: code.to_owned(),
+                stowed: false,
+                assigned_replicant: Some("R-1".to_owned()),
+                controller: Some("CONTROLLER".to_owned()),
+                controlled_devices: BTreeSet::new(),
+            })
+            .collect();
+
+        let availability = select_scan_tour_fleet_availability(vec![controller], drones, Some("R-1"))
+            .expect("select adopted survey fleet");
+
+        assert_eq!(availability.controllers, vec!["CONTROLLER".to_owned()]);
+        assert_eq!(
+            availability.drones,
+            vec!["D1".to_owned(), "D2".to_owned(), "D3".to_owned()]
+        );
+        assert_eq!(availability.stowed_selected, 0);
+        assert!(
+            scan_tour_fleet_print_requests(
+                availability.controllers.len(),
+                availability.drones.len(),
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn scan_tour_prefers_idle_fleet_already_assigned_to_worker() {
+        let controllers = vec![
+            ScanTourFleetDeviceCandidate {
+                code: "A-OTHER".to_owned(),
+                stowed: false,
+                assigned_replicant: Some("R-OTHER".to_owned()),
+                controller: None,
+                controlled_devices: BTreeSet::from([
+                    "A-D1".to_owned(),
+                    "A-D2".to_owned(),
+                    "A-D3".to_owned(),
+                ]),
+            },
+            ScanTourFleetDeviceCandidate {
+                code: "Z-MATCH".to_owned(),
+                stowed: false,
+                assigned_replicant: Some("R-TARGET".to_owned()),
+                controller: None,
+                controlled_devices: BTreeSet::from([
+                    "Z-D1".to_owned(),
+                    "Z-D2".to_owned(),
+                    "Z-D3".to_owned(),
+                ]),
+            },
+        ];
+        let drones = [
+            ("A-D1", "A-OTHER", "R-OTHER"),
+            ("A-D2", "A-OTHER", "R-OTHER"),
+            ("A-D3", "A-OTHER", "R-OTHER"),
+            ("Z-D1", "Z-MATCH", "R-TARGET"),
+            ("Z-D2", "Z-MATCH", "R-TARGET"),
+            ("Z-D3", "Z-MATCH", "R-TARGET"),
+        ]
+        .into_iter()
+        .map(|(code, controller, replicant)| ScanTourFleetDeviceCandidate {
+            code: code.to_owned(),
+            stowed: false,
+            assigned_replicant: Some(replicant.to_owned()),
+            controller: Some(controller.to_owned()),
+            controlled_devices: BTreeSet::new(),
+        })
+        .collect();
+
+        let availability =
+            select_scan_tour_fleet_availability(controllers, drones, Some("R-TARGET"))
+                .expect("select preferred adopted survey fleet");
+
+        assert_eq!(availability.controllers, vec!["Z-MATCH".to_owned()]);
+        assert_eq!(
+            availability.drones,
+            vec!["Z-D1".to_owned(), "Z-D2".to_owned(), "Z-D3".to_owned()]
+        );
+    }
+
+    #[test]
     fn scan_tour_counts_partial_stowed_fleet_before_printing() {
         let controller = ScanTourFleetDeviceCandidate {
             code: "CONTROLLER".to_owned(),
             stowed: true,
+            assigned_replicant: None,
             controller: None,
             controlled_devices: BTreeSet::new(),
         };
@@ -16445,18 +16584,20 @@ mod tests {
             ScanTourFleetDeviceCandidate {
                 code: "D1".to_owned(),
                 stowed: true,
+                assigned_replicant: None,
                 controller: Some("CONTROLLER".to_owned()),
                 controlled_devices: BTreeSet::new(),
             },
             ScanTourFleetDeviceCandidate {
                 code: "D2".to_owned(),
                 stowed: true,
+                assigned_replicant: None,
                 controller: Some("CONTROLLER".to_owned()),
                 controlled_devices: BTreeSet::new(),
             },
         ];
 
-        let availability = select_scan_tour_fleet_availability(vec![controller], drones)
+        let availability = select_scan_tour_fleet_availability(vec![controller], drones, None)
             .expect("select partial stowed survey fleet");
 
         assert_eq!(availability.controllers, vec!["CONTROLLER".to_owned()]);
