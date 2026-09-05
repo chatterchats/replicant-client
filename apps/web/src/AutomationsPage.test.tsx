@@ -387,6 +387,7 @@ describe("Director goal controls", () => {
       replicants: [],
       requirements: [],
       mining_policies: [],
+      catalogue_policies: [],
       workforce: {
         total: 0,
         operational: 0,
@@ -986,6 +987,129 @@ describe("Director goal controls", () => {
     });
     container.remove();
   });
+
+  it("overrides the regional catalogue four-worker cap", async () => {
+    vi.useFakeTimers();
+    const catalogueDirector = (override: boolean, revision: number) => ({
+      metadata: { revision, generated_at_ms: revision * 10 },
+      mode: "automatic" as const,
+      regions: [
+        {
+          region: "delta",
+          status: "established" as const,
+          hub_system: "DELTA-HUB",
+          hub_location: "DELTA-HUB-L4",
+          replicants: ["R-1", "R-2", "R-3", "R-4", "R-5"],
+          known_systems: 120,
+        },
+      ],
+      goals: [
+        {
+          id: "enhance_star_catalogue:delta",
+          kind: "enhance_star_catalogue" as const,
+          region: "delta",
+          status: "active" as const,
+          objective: "Maintain current planet/moon survey coverage",
+          blocker: null,
+          next_action: "Survey remaining systems",
+          progress_current: 20,
+          progress_total: 120,
+          active_workflows: [],
+          enabled: true,
+        },
+      ],
+      mining_policies: [],
+      catalogue_policies: [
+        {
+          region: "delta",
+          default_parallel_worker_cap: 4,
+          override_parallel_worker_cap: override,
+        },
+      ],
+      replicants: [],
+      requirements: [],
+      workforce: {
+        total: 5,
+        busy: 0,
+        operational: 5,
+        in_transit: 0,
+        unavailable: 0,
+        idle: 5,
+        idle_ratio: 1,
+        pending_worker_demand: 0,
+        scale_up_recommended: false,
+        scale_reason: null,
+      },
+    });
+    let directorGets = 0;
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url =
+        typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.href
+            : input.url;
+      let payload: unknown;
+      if (url === "/api/descriptors") {
+        payload = { reports: [], actions: [], workflows: [] };
+      } else if (
+        url === "/api/director/catalogue-policies/delta" &&
+        init?.method === "PUT"
+      ) {
+        payload = catalogueDirector(true, 2);
+      } else {
+        directorGets += 1;
+        payload = catalogueDirector(directorGets > 1, directorGets);
+      }
+      return Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve({ protocol_version: 1, payload }),
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    let root: Root | undefined;
+    await act(async () => {
+      const mountedRoot = createRoot(container);
+      root = mountedRoot;
+      mountedRoot.render(<AutomationsPage workflows={[]} entities={{}} />);
+      await vi.runAllTimersAsync();
+    });
+
+    const toggle = container.querySelector<HTMLInputElement>(
+      'input[aria-label="Override catalogue four-worker cap in delta"]',
+    );
+    expect(toggle?.checked).toBe(false);
+    expect(container.textContent).toContain(
+      "Parallel survey workers · default cap 4",
+    );
+
+    await act(async () => {
+      toggle?.click();
+      await vi.runAllTimersAsync();
+    });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/director/catalogue-policies/delta",
+      expect.objectContaining({
+        method: "PUT",
+        body: JSON.stringify({ override_parallel_worker_cap: true }),
+      }),
+    );
+    expect(
+      container.querySelector<HTMLInputElement>(
+        'input[aria-label="Override catalogue four-worker cap in delta"]',
+      )?.checked,
+    ).toBe(true);
+
+    act(() => {
+      root?.unmount();
+    });
+    container.remove();
+  });
+
   it("updates the regional mining density policy", async () => {
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
@@ -1004,6 +1128,7 @@ describe("Director goal controls", () => {
                 expand_sparse: true,
               },
             ],
+            catalogue_policies: [],
             replicants: [],
             requirements: [],
             workforce: {
@@ -1051,6 +1176,7 @@ describe("Director goal controls", () => {
       regions: [],
       goals: [],
       mining_policies: [],
+      catalogue_policies: [],
       replicants: names.map((name, index) => ({
         code: `R-${String(index + 1)}`,
         name,

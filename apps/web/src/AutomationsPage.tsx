@@ -1948,6 +1948,9 @@ function DirectorView({
   const miningPolicies = new Map(
     data.mining_policies.map((policy) => [policy.region, policy]),
   );
+  const cataloguePolicies = new Map(
+    data.catalogue_policies.map((policy) => [policy.region, policy]),
+  );
   const replicantLabels = new Map(
     data.replicants.map((replicant) => [
       replicant.code,
@@ -2246,6 +2249,13 @@ function DirectorView({
                   expand_moderate: true,
                   expand_sparse: true,
                 };
+                const cataloguePolicy = cataloguePolicies.get(
+                  region.region,
+                ) ?? {
+                  region: region.region,
+                  default_parallel_worker_cap: 4,
+                  override_parallel_worker_cap: false,
+                };
                 return (
                   <div
                     className={`director-regional-goal ${goal.status}`}
@@ -2315,6 +2325,36 @@ function DirectorView({
                             }
                           />
                           Sparse
+                        </label>
+                      </div>
+                    ) : null}
+                    {goal.kind === "enhance_star_catalogue" ? (
+                      <div
+                        className="director-catalogue-policy"
+                        aria-label={`Catalogue survey parallelism in ${region.region}`}
+                      >
+                        <span>
+                          Parallel survey workers · default cap{" "}
+                          {cataloguePolicy.default_parallel_worker_cap}
+                        </span>
+                        <label>
+                          <input
+                            type="checkbox"
+                            checked={
+                              cataloguePolicy.override_parallel_worker_cap
+                            }
+                            disabled={mutating}
+                            aria-label={`Override catalogue four-worker cap in ${region.region}`}
+                            onChange={(event) =>
+                              void mutate(() =>
+                                daemonApi.setDirectorCataloguePolicy(
+                                  region.region,
+                                  event.target.checked,
+                                ),
+                              )
+                            }
+                          />
+                          Override cap
                         </label>
                       </div>
                     ) : null}

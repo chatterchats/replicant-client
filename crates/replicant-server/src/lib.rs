@@ -57,14 +57,14 @@ use replicant_protocol::{
     BobnetSnapshot, BootstrapMissionSummary, BootstrapSnapshot, CargoCarrierSummary,
     CargoResourceSummary, CargoSnapshot, CreateTriggerRequest, DaemonHealth, DescriptorCatalog,
     DeviceClaim, DeviceInspectorSummary, DeviceLogSummary, DeviceLogsSnapshot,
-    DeviceRuntimeInspectorSummary, DeviceSummary, DevicesSnapshot, DirectorGoalControlRequest,
-    DirectorMiningPolicyRequest, DirectorMode, DirectorModeRequest, DirectorReplicantRegionRequest,
-    DirectorSnapshot, DirectoryReplicantDetail, DirectoryReplicantDetailSnapshot,
-    DirectoryReplicantSummary, DirectorySnapshot, DomainSlice, EntityId, EntityIndexSnapshot,
-    EntityInspectorDetail, EntityInspectorSnapshot, EntityKind, EntityRef, EntitySummary,
-    ErrorResponse, EventCriterionSummary, EventRequirementKind, EventRequirementSummary,
-    EventRewardItem, EventRewardsSummary, EventSummary, EventsSnapshot, FactoryJobSummary,
-    FiniteExecution as ProtocolFiniteExecution, FiniteExecutionHistoryResponse,
+    DeviceRuntimeInspectorSummary, DeviceSummary, DevicesSnapshot, DirectorCataloguePolicyRequest,
+    DirectorGoalControlRequest, DirectorMiningPolicyRequest, DirectorMode, DirectorModeRequest,
+    DirectorReplicantRegionRequest, DirectorSnapshot, DirectoryReplicantDetail,
+    DirectoryReplicantDetailSnapshot, DirectoryReplicantSummary, DirectorySnapshot, DomainSlice,
+    EntityId, EntityIndexSnapshot, EntityInspectorDetail, EntityInspectorSnapshot, EntityKind,
+    EntityRef, EntitySummary, ErrorResponse, EventCriterionSummary, EventRequirementKind,
+    EventRequirementSummary, EventRewardItem, EventRewardsSummary, EventSummary, EventsSnapshot,
+    FactoryJobSummary, FiniteExecution as ProtocolFiniteExecution, FiniteExecutionHistoryResponse,
     FiniteExecutionStatus as ProtocolFiniteExecutionStatus, FrontendTelemetryBatch,
     FrontendTelemetryLevel, GalaxySceneSnapshot, HealthStatus, InboxMessageSummary,
     InventoryDistribution, InventoryLocationSummary, InventoryOwnerKind, InventoryQuantity,
@@ -104,7 +104,8 @@ use replicant_runtime::{
     orchestration::expanded_system_region_map,
     orchestration::{
         assign_replicant_region, cached_director_snapshot, goal_is_regional, parse_goal_kind,
-        reconcile_director, set_director_mode, set_goal_enabled, set_mining_expansion_policy,
+        reconcile_director, set_catalogue_parallel_override, set_director_mode, set_goal_enabled,
+        set_mining_expansion_policy,
     },
     requirements::{AvailabilityKind, InfrastructureKind, RequirementScope, RequirementTarget},
     survey::summarize_plan,
@@ -909,6 +910,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(
             "/api/director/mining-policies/{region}",
             put(update_director_mining_policy),
+        )
+        .route(
+            "/api/director/catalogue-policies/{region}",
+            put(update_director_catalogue_policy),
         )
         .route(
             "/api/director/replicants/{code}/region",
@@ -7351,6 +7356,33 @@ async fn update_director_mining_policy(
         region,
         request.expand_moderate,
         request.expand_sparse,
+    )
+    .map_err(ApiError::runtime)?;
+    director_control_changed(&state)
+}
+
+async fn update_director_catalogue_policy(
+    State(state): State<Arc<AppState>>,
+    Path(region): Path<String>,
+    payload: Result<Json<DirectorCataloguePolicyRequest>, JsonRejection>,
+) -> Result<Json<Versioned<DirectorSnapshot>>, ApiError> {
+    let Json(request) =
+        payload.map_err(|_| ApiError::invalid("invalid Director catalogue policy request"))?;
+    let region = region.trim();
+    if region.is_empty() {
+        return Err(ApiError::invalid(
+            "Director catalogue policy requires a region",
+        ));
+    }
+    tracing::info!(
+        region,
+        override_parallel_worker_cap = request.override_parallel_worker_cap,
+        "Automation Director catalogue parallelism policy changed"
+    );
+    set_catalogue_parallel_override(
+        &state.repository,
+        region,
+        request.override_parallel_worker_cap,
     )
     .map_err(ApiError::runtime)?;
     director_control_changed(&state)

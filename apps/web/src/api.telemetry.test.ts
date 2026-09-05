@@ -136,6 +136,9 @@ describe("daemon telemetry timing helpers", () => {
     expect(normalizeDaemonRoute("/api/workflows/WF-ALPHA/activity")).toBe(
       "/api/workflows/:id/activity",
     );
+    expect(normalizeDaemonRoute("/api/director/catalogue-policies/delta")).toBe(
+      "/api/director/catalogue-policies/:region",
+    );
   });
 
   it("correlates a resource entry into separate browser timing phases", () => {

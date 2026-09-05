@@ -404,6 +404,17 @@ pub struct DirectorMiningPolicySummary {
     pub expand_sparse: bool,
 }
 
+/// Parallelism policy for one region's Enhance Star Catalogue goal.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DirectorCataloguePolicySummary {
+    /// Canonical Director region.
+    pub region: String,
+    /// Normal parallel survey-worker cap before the override is enabled.
+    pub default_parallel_worker_cap: usize,
+    /// Whether the normal survey concurrency cap may be exceeded.
+    pub override_parallel_worker_cap: bool,
+}
+
 /// Shared prerequisite categories raised by Automation Director goals.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -581,6 +592,9 @@ pub struct DirectorSnapshot {
     /// Per-region density policy for the mining-expansion goal.
     #[serde(default)]
     pub mining_policies: Vec<DirectorMiningPolicySummary>,
+    /// Per-region parallelism policy for Enhance Star Catalogue.
+    #[serde(default)]
+    pub catalogue_policies: Vec<DirectorCataloguePolicySummary>,
     /// Replicant assignments and utilization.
     pub replicants: Vec<DirectorReplicantAssignment>,
     /// Durable cross-goal prerequisites raised during reconciliation.
@@ -616,6 +630,13 @@ pub struct DirectorMiningPolicyRequest {
     pub expand_moderate: bool,
     /// Whether new mining sites may expand into sparse belts.
     pub expand_sparse: bool,
+}
+
+/// Updates the parallelism override for one regional Enhance Star Catalogue goal.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DirectorCataloguePolicyRequest {
+    /// Whether the normal four-worker survey concurrency cap may be exceeded.
+    pub override_parallel_worker_cap: bool,
 }
 
 /// Permanently assigns a Replicant to a region.
@@ -3771,6 +3792,7 @@ mod tests {
         let decoded: DirectorSnapshot =
             serde_json::from_value(legacy).expect("deserialize legacy Director snapshot");
         assert!(decoded.mining_policies.is_empty());
+        assert!(decoded.catalogue_policies.is_empty());
         assert!(decoded.requirements.is_empty());
         assert!(decoded.urgency.is_empty());
         assert!(decoded.workforce.regions.is_empty());

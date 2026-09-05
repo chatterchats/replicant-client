@@ -407,6 +407,7 @@ describe("parseDirectorResponse", () => {
     });
     expect(legacy.payload.goals).toEqual([]);
     expect(legacy.payload.mining_policies).toEqual([]);
+    expect(legacy.payload.catalogue_policies).toEqual([]);
     expect(legacy.payload.requirements).toEqual([]);
     expect(legacy.payload.workforce).toMatchObject({
       operational: 0,

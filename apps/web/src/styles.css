@@ -3347,7 +3347,8 @@ h1 {
   font-size: 0.88rem;
   color: var(--muted);
 }
-.director-regional-goal > .director-mining-policy {
+.director-regional-goal > .director-mining-policy,
+.director-regional-goal > .director-catalogue-policy {
   margin-top: 0.55rem;
   display: flex;
   justify-content: flex-start;
@@ -3356,13 +3357,15 @@ h1 {
   gap: 0.4rem 0.8rem;
   font-size: 0.8rem;
 }
-.director-mining-policy > span {
+.director-mining-policy > span,
+.director-catalogue-policy > span {
   color: var(--muted);
 }
 .director-mining-policy > strong {
   font-size: 0.8rem;
 }
-.director-mining-policy label {
+.director-mining-policy label,
+.director-catalogue-policy label {
   display: inline-flex;
   align-items: center;
   gap: 0.3rem;

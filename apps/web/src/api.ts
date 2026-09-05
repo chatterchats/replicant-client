@@ -173,6 +173,10 @@ export function normalizeDaemonRoute(path: string): string {
       "/api/director/mining-policies/:region",
     ],
     [
+      /^\/api\/director\/catalogue-policies\/[^/]+$/,
+      "/api/director/catalogue-policies/:region",
+    ],
+    [
       /^\/api\/director\/replicants\/[^/]+\/region$/,
       "/api/director/replicants/:code/region",
     ],
@@ -546,6 +550,20 @@ export const daemonApi = {
         {
           expand_moderate: expandModerate,
           expand_sparse: expandSparse,
+        },
+      ),
+    ).payload;
+  },
+  async setDirectorCataloguePolicy(
+    region: string,
+    overrideParallelWorkerCap: boolean,
+  ) {
+    return parseDirectorResponse(
+      await send(
+        "PUT",
+        `/api/director/catalogue-policies/${encodeURIComponent(region)}`,
+        {
+          override_parallel_worker_cap: overrideParallelWorkerCap,
         },
       ),
     ).payload;

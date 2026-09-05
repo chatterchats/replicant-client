@@ -249,6 +249,7 @@ const director: DirectorSnapshot = {
   regions: [],
   goals: [],
   mining_policies: [],
+  catalogue_policies: [],
   replicants: [],
   requirements: [],
   workforce: {

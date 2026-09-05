@@ -23,10 +23,11 @@ use replicant_client::{
     raw::RequestPriority,
 };
 use replicant_protocol::{
-    DirectorGoalKind, DirectorGoalStatus, DirectorGoalSummary, DirectorMiningPolicySummary,
-    DirectorMode, DirectorRegionStatus, DirectorRegionSummary, DirectorRegionalWorkforceSummary,
-    DirectorReplicantAssignment, DirectorSnapshot, DirectorUrgencyFact, DirectorWorkerState,
-    DirectorWorkforceSummary, SnapshotMetadata, WorkflowId as ProtocolWorkflowId,
+    DirectorCataloguePolicySummary, DirectorGoalKind, DirectorGoalStatus, DirectorGoalSummary,
+    DirectorMiningPolicySummary, DirectorMode, DirectorRegionStatus, DirectorRegionSummary,
+    DirectorRegionalWorkforceSummary, DirectorReplicantAssignment, DirectorSnapshot,
+    DirectorUrgencyFact, DirectorWorkerState, DirectorWorkforceSummary, SnapshotMetadata,
+    WorkflowId as ProtocolWorkflowId,
 };
 use replicant_transport::ResourceMap;
 use replicant_workflow::{
@@ -77,6 +78,7 @@ const SETTINGS_NS: &str = "director.settings";
 const SETTINGS_KEY: &str = "singleton";
 const GOAL_CONTROL_NS: &str = "director.goal_control";
 const MINING_POLICY_NS: &str = "director.mining_policy";
+const CATALOGUE_POLICY_NS: &str = "director.catalogue_policy";
 const GOAL_RUNTIME_NS: &str = "director.goal_runtime";
 const REPLICANT_NS: &str = "director.replicant";
 const WORKFORCE_NS: &str = "director.workforce";
@@ -177,6 +179,12 @@ struct MiningExpansionPolicy {
     expand_moderate: bool,
     #[serde(default = "default_true")]
     expand_sparse: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
+struct CatalogueParallelismPolicy {
+    #[serde(default)]
+    override_parallel_worker_cap: bool,
 }
 
 impl Default for MiningExpansionPolicy {
@@ -562,6 +570,58 @@ fn mining_policy_summaries<'a>(
         .collect()
 }
 
+/// Enables or disables the normal four-worker concurrency cap for one
+/// region's Enhance Star Catalogue goal.
+///
+/// The override only allows already-available regional workers to participate
+/// beyond the baseline cap. Workforce growth pressure remains bounded by the
+/// normal capped target so enabling this switch cannot cause an unbounded
+/// cloning request from a large survey backlog.
+pub fn set_catalogue_parallel_override(
+    repository: &WorkflowRepository,
+    region: &str,
+    override_parallel_worker_cap: bool,
+) -> Result<(), ApplicationError> {
+    let region = canonical_region(region);
+    repository.put_document(
+        CATALOGUE_POLICY_NS,
+        &region,
+        &CatalogueParallelismPolicy {
+            override_parallel_worker_cap,
+        },
+    )?;
+    Ok(())
+}
+
+fn catalogue_parallelism_policy(
+    repository: &WorkflowRepository,
+    region: &str,
+) -> Result<CatalogueParallelismPolicy, ApplicationError> {
+    repository
+        .read_document(CATALOGUE_POLICY_NS, &canonical_region(region))?
+        .map(|(value, _)| serde_json::from_value(value))
+        .transpose()
+        .map(|value| value.unwrap_or_default())
+        .map_err(Into::into)
+}
+
+fn catalogue_policy_summaries<'a>(
+    repository: &WorkflowRepository,
+    regions: impl IntoIterator<Item = &'a str>,
+) -> Result<Vec<DirectorCataloguePolicySummary>, ApplicationError> {
+    regions
+        .into_iter()
+        .map(|region| {
+            let policy = catalogue_parallelism_policy(repository, region)?;
+            Ok(DirectorCataloguePolicySummary {
+                region: canonical_region(region),
+                default_parallel_worker_cap: MAX_PARALLEL_CATALOGUE_WORKERS,
+                override_parallel_worker_cap: policy.override_parallel_worker_cap,
+            })
+        })
+        .collect()
+}
+
 /// Permanently assigns an existing Replicant to a region.
 ///
 /// Passing `None` is an explicit operator action that clears the assignment;
@@ -624,6 +684,7 @@ pub fn cached_director_snapshot(
                 regions: Vec::new(),
                 goals,
                 mining_policies: Vec::new(),
+                catalogue_policies: Vec::new(),
                 replicants: Vec::new(),
                 requirements: load_requirement_summaries(repository)?,
                 workforce: DirectorWorkforceSummary {
@@ -684,6 +745,10 @@ fn apply_durable_snapshot_overrides(
             .collect();
     }
     snapshot.mining_policies = mining_policy_summaries(
+        repository,
+        snapshot.regions.iter().map(|region| region.region.as_str()),
+    )?;
+    snapshot.catalogue_policies = catalogue_policy_summaries(
         repository,
         snapshot.regions.iter().map(|region| region.region.as_str()),
     )?;
@@ -1569,6 +1634,10 @@ pub async fn reconcile_director(
         repository.as_ref(),
         region_summaries.iter().map(|region| region.region.as_str()),
     )?;
+    let catalogue_policies = catalogue_policy_summaries(
+        repository.as_ref(),
+        region_summaries.iter().map(|region| region.region.as_str()),
+    )?;
     let requirement_summaries = requirements.persist(&repository)?;
 
     tracing::info!(
@@ -1594,6 +1663,7 @@ pub async fn reconcile_director(
         regions: region_summaries,
         goals,
         mining_policies,
+        catalogue_policies,
         replicants: workers
             .into_iter()
             .map(|worker| DirectorReplicantAssignment {
@@ -5004,6 +5074,21 @@ fn planetary_survey_complete(location: &Location) -> bool {
     location.survey_progress.system_survey_complete() == Some(true)
 }
 
+fn desired_catalogue_parallel_workers(
+    unsurveyed_systems: usize,
+    override_parallel_worker_cap: bool,
+) -> usize {
+    if unsurveyed_systems == 0 {
+        return 0;
+    }
+    let demand = unsurveyed_systems.div_ceil(CATALOGUE_SYSTEMS_PER_WORKER);
+    if override_parallel_worker_cap {
+        demand.max(1)
+    } else {
+        demand.clamp(1, MAX_PARALLEL_CATALOGUE_WORKERS)
+    }
+}
+
 fn reconcile_enhance_catalogue(
     client: &Client,
     context: &GoalReconcileContext<'_>,
@@ -5014,6 +5099,7 @@ fn reconcile_enhance_catalogue(
 ) -> Result<DirectorGoalSummary, ApplicationError> {
     let kind = DirectorGoalKind::EnhanceStarCatalogue;
     let enabled = goal_enabled(context.controls, kind, Some(&region.region));
+    let policy = catalogue_parallelism_policy(context.repository, &region.region)?;
     let id = goal_instance_id(kind, Some(&region.region));
     let mut runtime = load_goal_runtime(context.repository, &id)?;
     prune_runtime_workflows(&mut runtime, context.workflows);
@@ -5080,20 +5166,20 @@ fn reconcile_enhance_catalogue(
             .collect::<Vec<_>>()
     };
 
-    let desired_parallel = if unsurveyed.is_empty() {
-        0
-    } else {
-        unsurveyed
-            .len()
-            .div_ceil(CATALOGUE_SYSTEMS_PER_WORKER)
-            .clamp(1, MAX_PARALLEL_CATALOGUE_WORKERS)
-    };
+    let desired_parallel =
+        desired_catalogue_parallel_workers(unsurveyed.len(), policy.override_parallel_worker_cap);
+    // Keep workforce growth pressure at the normal four-worker baseline even
+    // when the operator opts into using additional already-available workers.
+    // The override is a concurrency escape hatch, not an instruction to clone
+    // enough Replicants to match an arbitrarily large catalogue backlog.
+    let baseline_parallel = desired_catalogue_parallel_workers(unsurveyed.len(), false);
     let open_slots = desired_parallel.saturating_sub(active.len());
+    let baseline_open_slots = baseline_parallel.saturating_sub(active.len());
     let available_workers = idle_catalogue_workers(workers, &region.region, reserved);
     let in_transit_workers = regional_workers_in_transit(workers, &region.region, reserved);
     let launch_slots = open_slots.min(available_workers.len());
-    let worker_shortage =
-        open_slots.saturating_sub(available_workers.len().saturating_add(in_transit_workers));
+    let worker_shortage = baseline_open_slots
+        .saturating_sub(available_workers.len().saturating_add(in_transit_workers));
 
     let mut blocker = None;
     let mut next_action = None;
@@ -5139,7 +5225,7 @@ fn reconcile_enhance_catalogue(
     } else {
         if worker_shortage > 0 && !pending.is_empty() {
             let reason = format!(
-                "{} catalogue backlog can use {desired_parallel} parallel worker(s), but {worker_shortage} slot(s) lack an idle regional Replicant with a racing vessel",
+                "{} catalogue baseline can use {baseline_parallel} parallel worker(s), but {worker_shortage} slot(s) lack an idle regional Replicant with a racing vessel",
                 region.region
             );
             requirements.raise(
@@ -10368,6 +10454,53 @@ mod tests {
                 .all(|shard| shard.len() <= CATALOGUE_SYSTEMS_PER_WORKER)
         );
         assert_eq!(shards.iter().map(Vec::len).sum::<usize>(), 80);
+    }
+
+    #[test]
+    fn catalogue_parallel_override_removes_four_worker_cap() {
+        assert_eq!(
+            desired_catalogue_parallel_workers(
+                CATALOGUE_SYSTEMS_PER_WORKER * MAX_PARALLEL_CATALOGUE_WORKERS + 1,
+                false,
+            ),
+            MAX_PARALLEL_CATALOGUE_WORKERS
+        );
+        assert_eq!(
+            desired_catalogue_parallel_workers(CATALOGUE_SYSTEMS_PER_WORKER * 9, true),
+            9
+        );
+        assert_eq!(desired_catalogue_parallel_workers(0, true), 0);
+    }
+
+    #[test]
+    fn catalogue_parallel_override_is_region_scoped_and_defaults_off() {
+        let repository = WorkflowRepository::open_in_memory().expect("workflow repository");
+
+        let initial = catalogue_policy_summaries(&repository, ["alpha", "beta"])
+            .expect("load catalogue policies");
+        assert!(
+            initial
+                .iter()
+                .all(|policy| !policy.override_parallel_worker_cap)
+        );
+
+        set_catalogue_parallel_override(&repository, "Alpha", true)
+            .expect("enable catalogue override");
+        let updated = catalogue_policy_summaries(&repository, ["alpha", "beta"])
+            .expect("reload catalogue policies");
+
+        assert!(
+            updated
+                .iter()
+                .find(|policy| policy.region == "alpha")
+                .is_some_and(|policy| policy.override_parallel_worker_cap)
+        );
+        assert!(
+            updated
+                .iter()
+                .find(|policy| policy.region == "beta")
+                .is_some_and(|policy| !policy.override_parallel_worker_cap)
+        );
     }
 
     #[test]

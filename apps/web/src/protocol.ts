@@ -222,6 +222,12 @@ export interface DirectorMiningPolicySummary {
   expand_sparse: boolean;
 }
 
+export interface DirectorCataloguePolicySummary {
+  region: string;
+  default_parallel_worker_cap: number;
+  override_parallel_worker_cap: boolean;
+}
+
 export interface DirectorGoalSummary {
   id: string;
   kind: DirectorGoalKind;
@@ -290,6 +296,7 @@ export interface DirectorSnapshot {
   regions: DirectorRegionSummary[];
   goals: DirectorGoalSummary[];
   mining_policies: DirectorMiningPolicySummary[];
+  catalogue_policies: DirectorCataloguePolicySummary[];
   replicants: DirectorReplicantAssignment[];
   requirements: DirectorRequirementSummary[];
   workforce: DirectorWorkforceSummary;
@@ -4833,6 +4840,23 @@ export function parseDirectorResponse(
             "expand moderate belts",
           ),
           expand_sparse: boolean(policy.expand_sparse, "expand sparse belts"),
+        };
+      }),
+      catalogue_policies: array(
+        item.catalogue_policies ?? [],
+        "Director catalogue policies",
+      ).map((value) => {
+        const policy = record(value, "Director catalogue policy");
+        return {
+          region: requiredString(policy.region, "catalogue policy region"),
+          default_parallel_worker_cap: number(
+            policy.default_parallel_worker_cap,
+            "catalogue default parallel worker cap",
+          ),
+          override_parallel_worker_cap: boolean(
+            policy.override_parallel_worker_cap,
+            "catalogue parallel worker cap override",
+          ),
         };
       }),
       replicants: item.replicants.map((value) => {
