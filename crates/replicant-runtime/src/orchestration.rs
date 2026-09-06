@@ -17,9 +17,9 @@ use std::{
 
 use futures::{StreamExt, stream};
 use replicant_client::{
-    Client, Device, DeviceType, Location, Replicant, Star,
+    Client, Device, DeviceType, Location, Replicant, Star, SyncDomain,
     domain::{GalacticPosition, Inventory, InventoryOwner},
-    managed::ReadinessComponent,
+    managed::{Readiness, ReadinessComponent},
     raw::RequestPriority,
 };
 use replicant_protocol::{
@@ -91,6 +91,8 @@ const BLUEPRINT_CATALOGUE_CACHE_NS: &str = "director.blueprint_catalogue";
 const BLUEPRINT_CATALOGUE_CACHE_KEY: &str = "latest";
 const HUB_REFRESH_CACHE_NS: &str = "director.system_hub_refresh";
 const HUB_REFRESH_CACHE_KEY: &str = "latest";
+const INVENTORY_AUTHORITY_CACHE_NS: &str = "director.inventory_authority";
+const INVENTORY_AUTHORITY_CACHE_KEY: &str = "latest";
 const ACTIVE_EVENT_CACHE_NS: &str = "director.active_event_snapshot";
 const ACTIVE_EVENT_CACHE_KEY: &str = "latest";
 const SNAPSHOT_KEY: &str = "latest";
@@ -122,6 +124,7 @@ const BLUEPRINT_SHOP_CACHE_TTL_MS: i64 = 10 * 60 * 1000;
 const BLUEPRINT_SHOP_PARTIAL_CACHE_TTL_MS: i64 = 2 * 60 * 1000;
 const BLUEPRINT_CATALOGUE_CACHE_TTL_MS: i64 = 30 * 60 * 1000;
 const HUB_REFRESH_CACHE_TTL_MS: i64 = 5 * 60 * 1000;
+const INVENTORY_AUTHORITY_CACHE_TTL_MS: i64 = 5 * 60 * 1000;
 const ACTIVE_EVENT_CACHE_TTL_MS: i64 = 2 * 60 * 1000;
 const ACTIVE_EVENT_STALE_FALLBACK_MS: i64 = 10 * 60 * 1000;
 
@@ -398,6 +401,11 @@ struct BlueprintCatalogueCache {
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 struct HubRefreshCache {
     #[serde(default, deserialize_with = "deserialize_hub_refresh_time")]
+    refreshed_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct InventoryAuthorityCache {
     refreshed_at_ms: i64,
 }
 
@@ -839,6 +847,64 @@ async fn refresh_system_hubs(
     Ok(errors)
 }
 
+async fn refresh_inventory_authority(
+    client: &Client,
+    repository: &WorkflowRepository,
+    now: i64,
+    force: bool,
+) -> Result<bool, ApplicationError> {
+    let cache = repository
+        .read_document(INVENTORY_AUTHORITY_CACHE_NS, INVENTORY_AUTHORITY_CACHE_KEY)?
+        .map(|(value, _)| serde_json::from_value::<InventoryAuthorityCache>(value))
+        .transpose()?
+        .unwrap_or_default();
+    let age_ms = now.saturating_sub(cache.refreshed_at_ms);
+    if !force
+        && cache.refreshed_at_ms > 0
+        && age_ms <= INVENTORY_AUTHORITY_CACHE_TTL_MS
+    {
+        tracing::debug!(
+            age_ms,
+            ttl_ms = INVENTORY_AUTHORITY_CACHE_TTL_MS,
+            phase = "inventory",
+            "Director reused authoritative account inventory baseline"
+        );
+        return Ok(true);
+    }
+
+    match client.sync().domain(SyncDomain::Inventory).await {
+        Ok(report) if report.completed.contains(&SyncDomain::Inventory) => {
+            repository.put_document(
+                INVENTORY_AUTHORITY_CACHE_NS,
+                INVENTORY_AUTHORITY_CACHE_KEY,
+                &InventoryAuthorityCache {
+                    refreshed_at_ms: now,
+                },
+            )?;
+            tracing::debug!(
+                phase = "inventory",
+                "Director refreshed authoritative account inventory baseline"
+            );
+            Ok(true)
+        }
+        Ok(_) => {
+            tracing::warn!(
+                phase = "inventory",
+                "Director inventory synchronization completed without authoritative inventory coverage"
+            );
+            Ok(false)
+        }
+        Err(error) => {
+            tracing::warn!(
+                phase = "inventory",
+                error = %error,
+                "Director could not refresh authoritative account inventory baseline"
+            );
+            Ok(false)
+        }
+    }
+}
+
 /// Evaluates all standing goals and, in automatic mode, creates the batch work
 /// required to move them forward.
 pub async fn reconcile_director(
@@ -879,7 +945,8 @@ pub async fn reconcile_director(
     );
     let hub_refresh_errors =
         refresh_system_hubs(client, &repository, &mut devices, now, force_slow_refresh).await?;
-    let inventories = client.state().inventories()?;
+    let placement_authority_complete = complete_owned_device_census(client);
+    let mut inventories = client.state().inventories()?;
     tracing::debug!(
         phase = "inventory",
         count = inventories.len(),
@@ -988,6 +1055,25 @@ pub async fn reconcile_director(
         mark_manufacturing_footholds(&mut regions, &devices, &location_systems, &system_regions);
 
     let goal_controls = load_goal_controls(&repository, regions.keys().map(String::as_str))?;
+    let unserviced_authority_needed = regions.values().any(|region| {
+        goal_enabled(
+            &goal_controls,
+            DirectorGoalKind::UnservicedResources,
+            Some(&region.region),
+        )
+    });
+    let resource_authority_complete = if unserviced_authority_needed
+        && placement_authority_complete
+    {
+        let complete =
+            refresh_inventory_authority(client, &repository, now, force_slow_refresh).await?;
+        if complete {
+            inventories = client.state().inventories()?;
+        }
+        complete
+    } else {
+        false
+    };
     let mut requirements = DirectorRequirementGraph::load(&repository, now)?;
     let blueprint_catalogue_needed =
         goal_enabled(&goal_controls, DirectorGoalKind::BlueprintAcquisition, None)
@@ -1077,7 +1163,6 @@ pub async fn reconcile_director(
     )?);
     // Placement recovery is intentionally evaluated only after global goals
     // have persisted their work, so this snapshot includes same-pass intent.
-    let placement_authority_complete = complete_owned_device_census(client);
     let placement_snapshot = workflow_registry.placement_intent_snapshot(&repository, None);
     let placement_snapshot_error = placement_snapshot.is_err();
 
@@ -1380,7 +1465,7 @@ pub async fn reconcile_director(
             &system_regions,
             &regions,
             &unserviced_workflows,
-            placement_authority_complete,
+            resource_authority_complete,
             &mut unserviced_launch_available,
         )?);
 
@@ -5645,7 +5730,6 @@ fn reconcile_unserviced_resources(
         .or_else(|| location_systems.get(hub).cloned());
     let managed_systems = managed_mining_systems(devices, location_systems);
 
-    let mut unknown_stock = 0usize;
     let mut by_location = BTreeMap::<String, UnservicedResourceCandidate>::new();
     for stock in stock_locations(
         inventories,
@@ -5656,10 +5740,7 @@ fn reconcile_unserviced_resources(
     ) {
         match stock.region.as_deref() {
             Some(mapped) if crate::canonical_region(mapped) != region.region => continue,
-            None => {
-                unknown_stock += 1;
-                continue;
-            }
+            None => continue,
             Some(_) => {}
         }
         if stock.location == hub
@@ -5684,23 +5765,6 @@ fn reconcile_unserviced_resources(
             entry.total_quantity += quantity;
         }
     }
-    if unknown_stock > 0 {
-        save_goal_runtime(context.repository, &id, &runtime)?;
-        return Ok(summary(
-            DirectorGoalStatus::Blocked,
-            Some(format!(
-                "{unknown_stock} positive resource stock location(s) have unresolved regional authority"
-            )),
-            Some(
-                "Refresh managed locations and regional assignments before resource recovery"
-                    .to_owned(),
-            ),
-            0,
-            unknown_stock,
-            Vec::new(),
-        ));
-    }
-
     let mut candidates = by_location
         .into_values()
         .filter(|candidate| !candidate.resources.is_empty() && candidate.total_quantity > 0)
@@ -8625,9 +8689,12 @@ fn goal_instance_id(kind: DirectorGoalKind, region: Option<&str>) -> String {
 }
 
 fn complete_owned_device_census(client: &Client) -> bool {
-    let readiness = client.readiness();
+    owned_device_authority_ready(client.readiness())
+}
+
+fn owned_device_authority_ready(readiness: Readiness) -> bool {
     [
-        readiness.full_rest,
+        readiness.essential_rest,
         readiness.event_catchup,
         readiness.sse_connectivity,
         readiness.store_health,
@@ -8665,6 +8732,69 @@ mod tests {
             .start()
             .await
             .expect("start test client")
+    }
+
+    #[test]
+    fn essential_readiness_is_sufficient_for_owned_device_authority() {
+        let readiness = Readiness {
+            local_restoration: ReadinessComponent::Ready,
+            account_binding: ReadinessComponent::Ready,
+            essential_rest: ReadinessComponent::Ready,
+            full_rest: ReadinessComponent::Pending,
+            event_catchup: ReadinessComponent::Ready,
+            sse_connectivity: ReadinessComponent::Ready,
+            background_reconciliation: ReadinessComponent::Pending,
+            store_health: ReadinessComponent::Ready,
+        };
+        assert!(owned_device_authority_ready(readiness));
+        assert!(!owned_device_authority_ready(Readiness {
+            event_catchup: ReadinessComponent::Degraded,
+            ..readiness
+        }));
+    }
+
+    #[tokio::test]
+    async fn inventory_authority_refresh_is_targeted_and_cached() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/inventory"))
+            .and(query_param("limit", "50"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "locations": [{
+                    "location": "ALPHA-BELT-1",
+                    "items": [{"resource_type": "carbon", "quantity": 12}]
+                }],
+                "next_cursor": null
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = test_client_at(&server).await;
+        let repository = WorkflowRepository::open_in_memory().expect("workflow repository");
+        let now = 1_000_000;
+
+        assert!(
+            refresh_inventory_authority(&client, &repository, now, false)
+                .await
+                .expect("initial inventory authority")
+        );
+        assert!(
+            refresh_inventory_authority(
+                &client,
+                &repository,
+                now + INVENTORY_AUTHORITY_CACHE_TTL_MS,
+                false,
+            )
+            .await
+            .expect("cached inventory authority")
+        );
+        assert!(client.state().inventories().expect("inventories").iter().any(
+            |inventory| inventory.location.as_ref().is_some_and(|location| {
+                location.id.as_str() == "ALPHA-BELT-1"
+            })
+        ));
+        server.verify().await;
+        client.close().await.expect("close client");
     }
 
     fn salvage_test_region(home: Option<&str>) -> RegionView {
@@ -12560,6 +12690,86 @@ mod tests {
             vec![ProtocolWorkflowId(workflows[0].id.to_string())]
         );
         assert!(reserved.contains("A-1"));
+    }
+
+    #[test]
+    fn unserviced_resources_ignores_stock_outside_known_regional_authority() {
+        let repository = WorkflowRepository::open_in_memory().expect("repository");
+        let mut controls = GoalControls::default();
+        controls
+            .regional
+            .entry(DirectorGoalKind::UnservicedResources)
+            .or_default()
+            .insert("alpha".to_owned(), true);
+        let region = RegionView {
+            region: "alpha".to_owned(),
+            status: DirectorRegionStatus::Established,
+            hub_system: Some("ALPHA".to_owned()),
+            hub_location: Some("ALPHA-HUB".to_owned()),
+            known_systems: BTreeSet::from(["ALPHA".to_owned(), "KNOWN".to_owned()]),
+        };
+        let regions = BTreeMap::from([("alpha".to_owned(), region.clone())]);
+        let workflows = Vec::new();
+        let context = GoalReconcileContext {
+            repository: &repository,
+            workflows: &workflows,
+            controls: &controls,
+            automatic: true,
+            now: 10,
+        };
+        let inventories = vec![
+            Inventory {
+                owner: InventoryOwner::Location(replicant_client::LocationKey::live(
+                    "KNOWN-BELT-1".into(),
+                )),
+                location: Some(replicant_client::LocationKey::live(
+                    "KNOWN-BELT-1".into(),
+                )),
+                items: vec![replicant_client::domain::InventoryItem {
+                    resource: "rares".to_owned(),
+                    quantity: 5_000,
+                }],
+            },
+            Inventory {
+                owner: InventoryOwner::Location(replicant_client::LocationKey::live(
+                    "UNKNOWN-BELT-1".into(),
+                )),
+                location: Some(replicant_client::LocationKey::live(
+                    "UNKNOWN-BELT-1".into(),
+                )),
+                items: vec![replicant_client::domain::InventoryItem {
+                    resource: "carbon".to_owned(),
+                    quantity: 100,
+                }],
+            },
+        ];
+        let system_regions = BTreeMap::from([("KNOWN".to_owned(), "alpha".to_owned())]);
+        let mut reserved = BTreeSet::new();
+        let mut launch_available = true;
+
+        let summary = reconcile_unserviced_resources(
+            &context,
+            &region,
+            &[],
+            &mut reserved,
+            &[],
+            &[],
+            &inventories,
+            &BTreeMap::new(),
+            &system_regions,
+            &regions,
+            &workflows,
+            true,
+            &mut launch_available,
+        )
+        .expect("unserviced resource summary");
+
+        assert_eq!(summary.status, DirectorGoalStatus::Blocked);
+        assert_eq!(
+            summary.blocker.as_deref(),
+            Some("No operational regional Replicant is available for local resource recovery")
+        );
+        assert_eq!(summary.progress_total, 1);
     }
 
     #[test]

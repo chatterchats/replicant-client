@@ -273,7 +273,9 @@ The initial standing goals are intentionally batch-oriented rather than one-goal
   Propulsor sizing is an explicitly versioned Director planning heuristic, and completion still
   requires terminal occurrence evidence rather than merely observing deployed hardware.
 - **Stranded Device Recovery** remains disabled by default and retains the conservative failed-placement
-  provenance/census checks used to prove that an exact device is safe to recover. Its execution path is
+  provenance/census checks used to prove that an exact device is safe to recover. Owned-device authority
+  requires the Essential Account+Devices baseline plus event continuity, live SSE, and healthy durable
+  storage; it does not require the unrelated Full startup baseline. Its execution path is
   Replicant-first: a local-control `logistics.manifest` claims a region-assigned Replicant and hosted
   vessel, travels that authority to the disconnected origin before cleanup or pickup, re-reads the exact
   device, then either commands a travel-capable device home directly or uses normal carrier logistics.
@@ -283,7 +285,11 @@ The initial standing goals are intentionally batch-oriented rather than one-goal
   recovery cannot replay the shipment.
 - **Unserviced Resources** remains disabled by default and means one-shot recovery of positive regional
   resource stock outside the regional hub system and outside systems already in the managed mining
-  footprint. Candidates are prioritized by recoverable quantity and dispatched through a Replicant-led
+  footprint. When enabled, the Director establishes a bounded authoritative account-inventory baseline
+  on demand and reuses it for five minutes while event continuity remains healthy. Positive stock whose
+  system has no regional authority stays outside every regional goal until that system is classified; it
+  does not block recovery of known regional stock. Candidates are prioritized by recoverable quantity
+  and dispatched through a Replicant-led
   local-control `logistics.manifest`. After the Replicant establishes authority at the source, the normal
   transport planner stages cargo-capable transport (for example a cargo freighter) to collect the stock,
   deliver it to the exact regional hub, and return borrowed transport while the Replicant returns home.
