@@ -19778,12 +19778,7 @@ mod tests {
         const WORKER: &str = "RECOVERY-REP";
         const VESSEL: &str = "RECOVERY-REP-VESSEL";
 
-        repository
-            .put_document(
-                "director.replicant",
-                WORKER,
-                &serde_json::json!({"region": "alpha"}),
-            )
+        crate::orchestration::assign_replicant_region(repository, WORKER, Some("alpha"), None)
             .expect("recovery Replicant region assignment");
 
         Mock::given(method("GET"))
