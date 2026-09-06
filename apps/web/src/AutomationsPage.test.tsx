@@ -115,6 +115,37 @@ describe("descriptor workflow form", () => {
     expect(deviceHtml).toContain("+ Add device");
   });
 
+  it("validates required device manifests and positive whole quantities", () => {
+    const descriptor: WorkflowDescriptor = {
+      kind: "test.workflow",
+      display_name: "Test",
+      aliases: [],
+      description: "Test",
+      category: "test",
+      operation_class: "workflow",
+      applicable_to: [],
+      risk: "low",
+      supported_triggers: ["manual"],
+      parameters: [parameter("devices", { type: "device_manifest" })],
+    };
+
+    expect(validateParameters(descriptor, { devices: [] })).toEqual({
+      devices: "Required",
+    });
+    expect(
+      validateParameters(descriptor, {
+        devices: [{ device_type: "survey_drone", quantity: 0 }],
+      }),
+    ).toEqual({
+      devices: "Each device needs a type and positive whole-number quantity",
+    });
+    expect(
+      validateParameters(descriptor, {
+        devices: [{ device_type: "survey_drone", quantity: 2 }],
+      }),
+    ).toEqual({});
+  });
+
   it("offers manufacturing locations in owned System Hub systems as dispatch sources", () => {
     const html = renderToStaticMarkup(
       <ParameterField

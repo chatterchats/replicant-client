@@ -1308,6 +1308,9 @@ impl OperationCatalogue {
         if class == OperationClass::Workflow && kind == regional_dispatch_workflow_kind().as_str() {
             return validate_regional_dispatch_parameters(parameters, values, defaults_only);
         }
+        if class == OperationClass::Action && kind == "contribute_devices" {
+            return validate_contribute_devices_parameters(parameters, values, defaults_only);
+        }
         if let Some(name) = values
             .keys()
             .find(|name| !parameters.iter().any(|item| item.name == name.as_str()))
@@ -1341,6 +1344,111 @@ impl OperationCatalogue {
         }
         Ok(values)
     }
+}
+
+fn validate_contribute_devices_parameters(
+    parameters: &[ParameterDescriptor],
+    mut values: BTreeMap<String, Value>,
+    defaults_only: bool,
+) -> Result<BTreeMap<String, Value>, CatalogueError> {
+    const LEGACY_FIELDS: [&str; 2] = ["device_type", "count"];
+
+    if let Some(name) = values.keys().find(|name| {
+        !parameters.iter().any(|item| item.name == name.as_str())
+            && !LEGACY_FIELDS.contains(&name.as_str())
+    }) {
+        return Err(CatalogueError::Invalid(format!(
+            "unknown parameter `{name}` for `contribute_devices`"
+        )));
+    }
+
+    for parameter in parameters {
+        if !values.contains_key(&parameter.name)
+            && let Some(default) = &parameter.default
+        {
+            values.insert(parameter.name.clone(), default.clone());
+        }
+        let Some(value) = values.get(&parameter.name) else {
+            if parameter.required && !defaults_only && parameter.name != "devices" {
+                return Err(CatalogueError::Invalid(format!(
+                    "missing required parameter `{}`",
+                    parameter.name
+                )));
+            }
+            continue;
+        };
+        validate_parameter(parameter, value)?;
+    }
+
+    if defaults_only {
+        return Ok(values);
+    }
+
+    if values
+        .get("tag")
+        .and_then(Value::as_str)
+        .is_some_and(|tag| tag.trim().is_empty())
+    {
+        return Err(CatalogueError::Invalid(
+            "parameter `tag` must not be empty".to_owned(),
+        ));
+    }
+
+    let manifest = values.get("devices");
+    let legacy_type = values.get("device_type").filter(|value| !value.is_null());
+    let legacy_count = values.get("count").filter(|value| !value.is_null());
+    if manifest.is_some() && (legacy_type.is_some() || legacy_count.is_some()) {
+        return Err(CatalogueError::Invalid(
+            "`devices` cannot be combined with legacy `device_type`/`count`".to_owned(),
+        ));
+    }
+
+    if let Some(manifest) = manifest {
+        let entries = manifest.as_array().ok_or_else(|| {
+            CatalogueError::Invalid("parameter `devices` must be a device manifest".to_owned())
+        })?;
+        if entries.is_empty() {
+            return Err(CatalogueError::Invalid(
+                "parameter `devices` must contain at least one device request".to_owned(),
+            ));
+        }
+        for entry in entries {
+            let Some(entry) = entry.as_object() else {
+                return Err(CatalogueError::Invalid(
+                    "each `devices` entry must be an object".to_owned(),
+                ));
+            };
+            let device_type = entry
+                .get("device_type")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .unwrap_or_default();
+            let quantity = entry.get("quantity").and_then(Value::as_i64);
+            if device_type.is_empty() || quantity.is_none_or(|quantity| quantity <= 0) {
+                return Err(CatalogueError::Invalid(
+                    "each `devices` entry requires a device_type and positive integer quantity"
+                        .to_owned(),
+                ));
+            }
+        }
+        return Ok(values);
+    }
+
+    let device_type = legacy_type
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    if device_type.is_empty() {
+        return Err(CatalogueError::Invalid(
+            "missing required parameter `devices`".to_owned(),
+        ));
+    }
+    if legacy_count.is_some_and(|count| count.as_u64().is_none_or(|count| count == 0)) {
+        return Err(CatalogueError::Invalid(
+            "legacy parameter `count` must be a positive integer".to_owned(),
+        ));
+    }
+    Ok(values)
 }
 
 fn validate_belt_search_parameters(
@@ -1749,7 +1857,8 @@ fn descriptors() -> DescriptorCatalog {
                 kind: operation_kind("contribute_devices"),
                 display_name: "Contribute devices".to_owned(),
                 aliases: strings(&["contribute_twaffy_injectors"]),
-                description: "Contribute selected owned devices at a destination.".to_owned(),
+                description: "Contribute one or more selected owned device types at a destination."
+                    .to_owned(),
                 category: "devices".to_owned(),
                 operation_class: OperationClass::Action,
                 risk: MutationRisk::Elevated,
@@ -1760,14 +1869,16 @@ fn descriptors() -> DescriptorCatalog {
                 ],
                 parameters: vec![
                     required("destination", "Destination", ParameterKind::Location),
-                    required("device_type", "Device type", ParameterKind::DeviceType),
+                    {
+                        let mut parameter =
+                            required("devices", "Devices", ParameterKind::DeviceManifest);
+                        parameter.description =
+                            "Add device types and the exact quantity to contribute for each."
+                                .to_owned();
+                        parameter
+                    },
                     required("owner", "Owner", ParameterKind::Replicant),
                     optional("tag", "Tag", ParameterKind::Tag),
-                    bounded(
-                        optional("count", "Maximum devices", ParameterKind::Integer),
-                        Some(1.0),
-                        None,
-                    ),
                     defaulted("dry_run", "Dry run", ParameterKind::Boolean, false),
                 ],
                 device_commands: Vec::new(),
@@ -4664,6 +4775,60 @@ mod tests {
         assert!(validated.contains_key("resources"));
         assert!(validated.contains_key("devices"));
         assert!(validated.contains_key("device_tags"));
+    }
+
+    #[test]
+    fn contribute_devices_surfaces_manifest_and_accepts_legacy_parameters() {
+        let catalogue = OperationCatalogue::new().expect("catalogue");
+        let descriptor = catalogue
+            .descriptors()
+            .actions
+            .iter()
+            .find(|descriptor| descriptor.kind.0 == "contribute_devices")
+            .expect("contribute devices descriptor");
+        let kinds = descriptor
+            .parameters
+            .iter()
+            .map(|parameter| (parameter.name.as_str(), &parameter.kind))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(kinds.get("devices"), Some(&&ParameterKind::DeviceManifest));
+        assert!(!kinds.contains_key("device_type"));
+        assert!(!kinds.contains_key("count"));
+
+        catalogue
+            .validate(
+                OperationClass::Action,
+                "contribute_devices",
+                BTreeMap::from([
+                    ("destination".to_owned(), serde_json::json!("SOL-1")),
+                    (
+                        "devices".to_owned(),
+                        serde_json::json!([
+                            {"device_type": "survey_drone", "quantity": 3},
+                            {"device_type": "ami_survey_controller", "quantity": 1}
+                        ]),
+                    ),
+                    ("owner".to_owned(), serde_json::json!("OWNER-1")),
+                ]),
+                false,
+            )
+            .expect("structured contribution should validate");
+
+        let legacy = catalogue
+            .validate(
+                OperationClass::Action,
+                "contribute_devices",
+                BTreeMap::from([
+                    ("destination".to_owned(), serde_json::json!("SOL-1")),
+                    ("device_type".to_owned(), serde_json::json!("survey_drone")),
+                    ("count".to_owned(), serde_json::json!(2)),
+                    ("owner".to_owned(), serde_json::json!("OWNER-1")),
+                ]),
+                false,
+            )
+            .expect("legacy contribution should validate");
+        assert_eq!(legacy["count"], serde_json::json!(2));
+        assert_eq!(legacy["dry_run"], serde_json::json!(false));
     }
 
     #[test]

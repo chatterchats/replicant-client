@@ -272,11 +272,34 @@ export function validateParameters(
   for (const parameter of visibleParameters(descriptor, values)) {
     const value = values[parameter.name];
     const empty = value === "" || value === null || value === undefined;
-    if (parameter.required && empty) {
+    const emptyDeviceManifest =
+      parameter.kind.type === "device_manifest" &&
+      Array.isArray(value) &&
+      value.length === 0;
+    if (parameter.required && (empty || emptyDeviceManifest)) {
       errors[parameter.name] = "Required";
       continue;
     }
     if (empty) continue;
+    if (
+      parameter.kind.type === "device_manifest" &&
+      Array.isArray(value) &&
+      value.some((entry) => {
+        if (!entry || typeof entry !== "object") return true;
+        const record = entry as Record<string, unknown>;
+        return (
+          typeof record.device_type !== "string" ||
+          record.device_type.trim().length === 0 ||
+          typeof record.quantity !== "number" ||
+          !Number.isInteger(record.quantity) ||
+          record.quantity <= 0
+        );
+      })
+    ) {
+      errors[parameter.name] =
+        "Each device needs a type and positive whole-number quantity";
+      continue;
+    }
     if (parameter.kind.type === "integer" && !Number.isInteger(Number(value)))
       errors[parameter.name] = "Enter a whole number";
     if (

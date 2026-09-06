@@ -1,11 +1,13 @@
 //! Finite application actions.
 
 use std::{
+    collections::BTreeMap,
     io,
     time::{Duration, Instant},
 };
 
 use replicant_client::{Client, DeviceType, Operation, OperationStatus, SyncDomain, raw};
+use replicant_transport::DeviceRequest;
 use serde::{Deserialize, Serialize};
 
 use crate::ActionResult;
@@ -301,20 +303,27 @@ pub async fn clear_tags(
 pub struct ContributeDevicesAction {
     /// Location receiving the contribution.
     pub destination: String,
-    /// Device type selected at the destination.
+    /// Device types and exact per-type quantities selected at the destination.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub devices: Vec<DeviceRequest>,
+    /// Legacy single device type accepted for stored/direct callers.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub device_type: String,
     /// Owned replicant name or code that must own each selected device.
     pub owner: String,
     /// Optional device tag required in addition to type and location.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tag: Option<String>,
-    /// Optional maximum number of devices, selected in stable code order.
+    /// Legacy optional maximum number of devices for `device_type`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub count: Option<usize>,
     /// When true, return the plan without submitting mutations.
+    #[serde(default)]
     pub dry_run: bool,
 }
 
 impl ContributeDevicesAction {
-    /// Creates an action selecting every matching device.
+    /// Creates a legacy-compatible action selecting every matching device of one type.
     #[must_use]
     pub fn new(
         destination: impl Into<String>,
@@ -323,7 +332,26 @@ impl ContributeDevicesAction {
     ) -> Self {
         Self {
             destination: destination.into(),
+            devices: Vec::new(),
             device_type: device_type.into(),
+            owner: owner.into(),
+            tag: None,
+            count: None,
+            dry_run: false,
+        }
+    }
+
+    /// Creates an action from a structured multi-device manifest.
+    #[must_use]
+    pub fn from_manifest(
+        destination: impl Into<String>,
+        devices: Vec<DeviceRequest>,
+        owner: impl Into<String>,
+    ) -> Self {
+        Self {
+            destination: destination.into(),
+            devices,
+            device_type: String::new(),
             owner: owner.into(),
             tag: None,
             count: None,
@@ -348,8 +376,11 @@ pub struct ContributionDevicePlan {
 pub struct ContributionPlan {
     /// Destination location.
     pub destination: String,
-    /// Selected device type.
+    /// Backward-compatible single-type summary; empty for a multi-type request.
     pub device_type: String,
+    /// Normalized requested device types and quantities.
+    #[serde(default)]
+    pub requested_devices: Vec<DeviceRequest>,
     /// Optional device tag required by the action.
     pub tag: Option<String>,
     /// Resolved owned replicant code.
@@ -367,40 +398,95 @@ pub struct ContributeDevicesActionResult {
     pub report: ActionReport,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ContributionRequestLimit {
+    device_type: String,
+    count: Option<usize>,
+    require_exact: bool,
+}
+
 /// Resolves parameters and current state without submitting mutations.
 pub async fn plan_device_contribution(
     client: &Client,
     action: &ContributeDevicesAction,
 ) -> ActionResult<ContributionPlan> {
-    validate_contribution(action)?;
+    let requests = contribution_request_limits(action)?;
     let owner = resolve_owned_replicant(client, &action.owner, &action.destination).await?;
-    let handles = client
-        .devices()
-        .refresh_many()
-        .of_type(DeviceType::from(action.device_type.as_str()))
-        .at(&action.destination)
-        .collect()
-        .await?;
-    let mut candidates = Vec::with_capacity(handles.len());
-    for handle in handles {
-        let snapshot = handle.snapshot().await?;
-        candidates.push(ContributionCandidate {
-            device: handle.id().as_str().to_owned(),
-            owner: assigned_replicant(&snapshot).map(str::to_owned),
-            tags: snapshot.tags,
+    let mut selected_devices = Vec::new();
+    let mut requested_devices = Vec::with_capacity(requests.len());
+
+    for request in &requests {
+        let handles = client
+            .devices()
+            .refresh_many()
+            .of_type(DeviceType::from(request.device_type.as_str()))
+            .at(&action.destination)
+            .collect()
+            .await?;
+        let mut candidates = Vec::with_capacity(handles.len());
+        for handle in handles {
+            let snapshot = handle.snapshot().await?;
+            candidates.push(ContributionCandidate {
+                device: handle.id().as_str().to_owned(),
+                owner: assigned_replicant(&snapshot).map(str::to_owned),
+                tags: snapshot.tags,
+            });
+        }
+
+        let selected =
+            select_contribution_devices(candidates, action.tag.as_deref(), request.count, &owner);
+        if request.require_exact
+            && let Some(count) = request.count
+            && selected.len() != count
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "requested {count} {} device(s) at {}, but only {} matching device(s) are available",
+                    request.device_type,
+                    action.destination,
+                    selected.len()
+                ),
+            )
+            .into());
+        }
+        let quantity = match request.count {
+            Some(count) => i64::try_from(count).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "requested quantity for {} is too large",
+                        request.device_type
+                    ),
+                )
+            })?,
+            None => i64::try_from(selected.len()).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("selected quantity for {} is too large", request.device_type),
+                )
+            })?,
+        };
+        requested_devices.push(DeviceRequest {
+            quantity,
+            device_type: request.device_type.clone(),
         });
+        selected_devices.extend(selected);
     }
+
+    selected_devices.sort_by(|left, right| left.device.cmp(&right.device));
+    let device_type = if requested_devices.len() == 1 {
+        requested_devices[0].device_type.clone()
+    } else {
+        String::new()
+    };
 
     Ok(ContributionPlan {
         destination: action.destination.clone(),
-        device_type: action.device_type.clone(),
+        device_type,
+        requested_devices,
         tag: action.tag.clone(),
-        devices: select_contribution_devices(
-            candidates,
-            action.tag.as_deref(),
-            action.count,
-            &owner,
-        ),
+        devices: selected_devices,
         owner,
     })
 }
@@ -551,22 +637,90 @@ fn select_contribution_devices(
         .collect()
 }
 
-fn validate_contribution(action: &ContributeDevicesAction) -> ActionResult<()> {
-    if action.destination.is_empty() || action.device_type.is_empty() || action.owner.is_empty() {
+fn contribution_request_limits(
+    action: &ContributeDevicesAction,
+) -> ActionResult<Vec<ContributionRequestLimit>> {
+    if action.destination.trim().is_empty() || action.owner.trim().is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "destination, device_type, and owner must not be empty",
+            "destination and owner must not be empty",
         )
         .into());
     }
-    if action.tag.as_deref() == Some("") || action.count == Some(0) {
+    if action
+        .tag
+        .as_deref()
+        .is_some_and(|tag| tag.trim().is_empty())
+    {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "tag must not be empty").into());
+    }
+
+    let legacy_device_type = action.device_type.trim();
+    if !action.devices.is_empty() && (!legacy_device_type.is_empty() || action.count.is_some()) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "tag must not be empty and count must be greater than zero",
+            "devices manifest cannot be combined with legacy device_type/count",
         )
         .into());
     }
-    Ok(())
+
+    if !action.devices.is_empty() {
+        let mut quantities = BTreeMap::<String, i64>::new();
+        for request in &action.devices {
+            let device_type = request.device_type.trim();
+            if device_type.is_empty() || request.quantity <= 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "each contributed device type must be non-empty with quantity greater than zero",
+                )
+                .into());
+            }
+            let quantity = quantities.entry(device_type.to_owned()).or_default();
+            *quantity = quantity.checked_add(request.quantity).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("requested quantity for {device_type} is too large"),
+                )
+            })?;
+        }
+        return quantities
+            .into_iter()
+            .map(|(device_type, quantity)| {
+                let count = usize::try_from(quantity).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("requested quantity for {device_type} is too large"),
+                    )
+                })?;
+                Ok(ContributionRequestLimit {
+                    device_type,
+                    count: Some(count),
+                    require_exact: true,
+                })
+            })
+            .collect::<Result<Vec<_>, io::Error>>()
+            .map_err(Into::into);
+    }
+
+    if legacy_device_type.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "at least one contributed device type is required",
+        )
+        .into());
+    }
+    if action.count == Some(0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "count must be greater than zero",
+        )
+        .into());
+    }
+    Ok(vec![ContributionRequestLimit {
+        device_type: legacy_device_type.to_owned(),
+        count: action.count,
+        require_exact: false,
+    }])
 }
 
 async fn resolve_owned_replicant(
@@ -779,6 +933,78 @@ mod tests {
         );
         assert!(selected[0].owner_change_required);
         assert!(!selected[1].owner_change_required);
+    }
+
+    #[test]
+    fn contribution_manifest_aggregates_types_and_preserves_legacy_selection() {
+        let manifest = ContributeDevicesAction::from_manifest(
+            "SOL-1",
+            vec![
+                DeviceRequest {
+                    device_type: "survey_drone".into(),
+                    quantity: 2,
+                },
+                DeviceRequest {
+                    device_type: "ami_survey_controller".into(),
+                    quantity: 1,
+                },
+                DeviceRequest {
+                    device_type: "survey_drone".into(),
+                    quantity: 3,
+                },
+            ],
+            "OWNER-1",
+        );
+        assert_eq!(
+            contribution_request_limits(&manifest).expect("manifest"),
+            vec![
+                ContributionRequestLimit {
+                    device_type: "ami_survey_controller".into(),
+                    count: Some(1),
+                    require_exact: true,
+                },
+                ContributionRequestLimit {
+                    device_type: "survey_drone".into(),
+                    count: Some(5),
+                    require_exact: true,
+                },
+            ]
+        );
+
+        let mut legacy = ContributeDevicesAction::new("SOL-1", "survey_drone", "OWNER-1");
+        legacy.count = Some(2);
+        assert_eq!(
+            contribution_request_limits(&legacy).expect("legacy"),
+            vec![ContributionRequestLimit {
+                device_type: "survey_drone".into(),
+                count: Some(2),
+                require_exact: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn contribution_manifest_rejects_invalid_or_ambiguous_requests() {
+        let invalid = ContributeDevicesAction::from_manifest(
+            "SOL-1",
+            vec![DeviceRequest {
+                device_type: "survey_drone".into(),
+                quantity: 0,
+            }],
+            "OWNER-1",
+        );
+        assert!(contribution_request_limits(&invalid).is_err());
+
+        let mut mixed = ContributeDevicesAction::from_manifest(
+            "SOL-1",
+            vec![DeviceRequest {
+                device_type: "survey_drone".into(),
+                quantity: 1,
+            }],
+            "OWNER-1",
+        );
+        mixed.device_type = "survey_drone".into();
+        assert!(contribution_request_limits(&mixed).is_err());
     }
 
     #[test]
