@@ -779,10 +779,10 @@ describe("parseDirectorResponse", () => {
             region: "alpha",
             status: "active",
             objective:
-              "Establish AMI transport service for producing regional resources",
+              "Recover regional resource stock outside managed mining systems",
             blocker: null,
             next_action:
-              "Establish AMI shuttle service from ALPHA-BELT to ALPHA-HUB",
+              "Recover 500 resource units from ALPHA-BELT and deliver them to ALPHA-HUB",
             progress_current: 0,
             progress_total: 1,
             active_workflows: ["WF-TRANSPORT"],

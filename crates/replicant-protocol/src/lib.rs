@@ -271,7 +271,7 @@ pub enum DirectorGoalKind {
     MaintainSystemHubs,
     /// Recover stranded owned devices to regional System Hubs.
     StrandedDeviceRecovery,
-    /// Establish AMI transport service for producing regional resources.
+    /// Recover regional resource stock outside managed mining systems.
     UnservicedResources,
     /// Extend relay reach where regional work requires it.
     ExpandFtlNetwork,

@@ -9,7 +9,7 @@ use std::{
 
 use replicant_client::{
     Client, Star,
-    domain::{Device, DeviceStatus, DeviceType, Inventory, InventoryOwner, Location, LocationType},
+    domain::{Device, DeviceStatus, DeviceType, Location},
 };
 use replicant_mining_planner::{
     BlueprintSpec, CARGO_FREIGHTER, FactoryWorkload, MAINTENANCE_DRONE, MINING_CONTROLLER,
@@ -1421,104 +1421,6 @@ async fn selected_belt_for_route(
                 ),
             )
         })
-}
-
-/// Determines whether positive belt output is currently serviceable.
-///
-/// Positive location stock alone is insufficient: the location must be an
-/// exact discovered belt with a complete system mapping and operational mining
-/// installation.
-fn positive_location_stock(inventories: &[Inventory], location: &str) -> bool {
-    inventories.iter().any(|inventory| {
-        matches!(&inventory.owner, InventoryOwner::Location(key) if key.id.as_str() == location)
-            && inventory.items.iter().any(|item| item.quantity > 0)
-    })
-}
-
-pub(crate) fn resource_present(
-    devices: &[Device],
-    locations: &[Location],
-    inventories: &[Inventory],
-    location: &str,
-) -> EvidenceState {
-    let positive_stock = positive_location_stock(inventories, location);
-    if !positive_stock {
-        return EvidenceState::Absent;
-    }
-    let Some(location_record) = locations
-        .iter()
-        .find(|record| record.key.id.as_str() == location)
-    else {
-        return EvidenceState::Unknown;
-    };
-    match location_record.location_type.as_ref() {
-        None => return EvidenceState::Unknown,
-        Some(LocationType::Belt) => {}
-        Some(_) => return EvidenceState::Absent,
-    }
-    let Some(system) = location_record.system.as_deref() else {
-        return EvidenceState::Unknown;
-    };
-    mining_site_evidence_state(devices, system, location)
-}
-
-fn mining_site_evidence_state(devices: &[Device], system: &str, belt: &str) -> EvidenceState {
-    let audit = audit_site(devices, system, belt);
-    if audit.operational {
-        return EvidenceState::Present;
-    }
-    if devices
-        .iter()
-        .any(|device| device_location(device) == Some(belt) && device.device_type.is_none())
-    {
-        return EvidenceState::Unknown;
-    }
-    for code in [
-        audit.assets.mining_controller.as_deref(),
-        audit.assets.survey_controller.as_deref(),
-        audit.assets.maintenance_drone.as_deref(),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        let Some(device) = find_device(devices, code) else {
-            return EvidenceState::Unknown;
-        };
-        let Some(status) = device.status.as_ref().map(DeviceStatus::as_str) else {
-            return EvidenceState::Unknown;
-        };
-        if !documented_transport_status(status)
-            && !matches!(status, "active" | "deactivated" | "offline")
-        {
-            return EvidenceState::Unknown;
-        }
-        if device
-            .active_directive
-            .as_ref()
-            .is_some_and(|active| active.directive.is_none() || active.status.as_deref().is_none())
-        {
-            return EvidenceState::Unknown;
-        }
-    }
-    EvidenceState::Absent
-}
-
-/// Applies the same resource predicate when callers can report census
-/// completeness separately. Positive stock with incomplete authority is never
-/// treated as absent.
-pub(crate) fn resource_present_with_authority(
-    devices: &[Device],
-    locations: &[Location],
-    inventories: &[Inventory],
-    location: &str,
-    complete_authority: bool,
-) -> EvidenceState {
-    let positive_stock = positive_location_stock(inventories, location);
-    if positive_stock && !complete_authority {
-        EvidenceState::Unknown
-    } else {
-        resource_present(devices, locations, inventories, location)
-    }
 }
 
 fn managed_belt_asset_count(devices: &[Device], belt: &str) -> usize {

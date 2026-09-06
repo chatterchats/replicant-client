@@ -335,7 +335,7 @@ fn operational_vessel_for<'a>(replicant: &Replicant, devices: &'a [Device]) -> O
         device
             .device_type
             .as_ref()
-            .is_some_and(|kind| kind.as_str() == "racing_vessel")
+            .is_some_and(|kind| matches!(kind.as_str(), "racing_vessel" | "heaven_vessel"))
             && (replicant.hosted_device.as_ref() == Some(&device.key)
                 || device.relationships.hosting_replicant.as_ref() == Some(&replicant.key))
     })
@@ -387,7 +387,8 @@ fn unix_millis() -> i64 {
 #[cfg(test)]
 mod tests {
     use replicant_client::domain::{
-        AccessScope, DeviceCommand, DeviceFeature, DeviceKey, DeviceRelationships, ReplicantKey,
+        AccessScope, DeviceCommand, DeviceFeature, DeviceKey, DeviceRelationships, DeviceType,
+        ReplicantKey,
     };
     use replicant_workflow::{
         NewWorkflow, RequirementScope, ResourceKey, ResourceRequirement, WorkItemSpec, WorkflowKind,
@@ -468,6 +469,31 @@ mod tests {
             .collect();
 
         assert_eq!(free_attach_capacity(&carrier), 7);
+    }
+
+    #[test]
+    fn operational_worker_vessel_accepts_racing_and_heaven_hosts() {
+        let replicant = managed_replicant(Some("HOST-1"));
+
+        let mut heaven = managed_device("HOST-1", &[], &[]);
+        heaven.device_type = Some(DeviceType::HeavenVessel);
+        assert_eq!(
+            operational_vessel_for(&replicant, std::slice::from_ref(&heaven))
+                .map(|device| device.key.id.as_str()),
+            Some("HOST-1")
+        );
+
+        let mut racing = heaven.clone();
+        racing.device_type = Some(DeviceType::RacingVessel);
+        assert_eq!(
+            operational_vessel_for(&replicant, std::slice::from_ref(&racing))
+                .map(|device| device.key.id.as_str()),
+            Some("HOST-1")
+        );
+
+        let mut cargo = heaven;
+        cargo.device_type = Some(DeviceType::from("cargo_vessel"));
+        assert!(operational_vessel_for(&replicant, &[cargo]).is_none());
     }
 
     #[test]

@@ -537,7 +537,7 @@ describe("Director goal controls", () => {
           region: "alpha",
           status: "satisfied" as const,
           objective:
-            "Establish AMI transport service for producing regional resources",
+            "Recover regional resource stock outside managed mining systems",
           blocker: null,
           next_action: null,
           progress_current: 1,
@@ -634,7 +634,7 @@ describe("Director goal controls", () => {
     );
     expect(regionalGoals?.textContent).toContain("Unserviced Resources");
     expect(regionalGoals?.textContent).toContain(
-      "Establish AMI transport service for producing regional resources",
+      "Recover regional resource stock outside managed mining systems",
     );
     expect(regionalGoals?.textContent).toContain("satisfied · 1 / 1");
     expect(regionalGoals?.textContent).toContain("Stranded Device Recovery");

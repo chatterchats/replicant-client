@@ -18,7 +18,7 @@ use std::{
 use futures::{StreamExt, stream};
 use replicant_client::{
     Client, Device, DeviceType, Location, Replicant, Star,
-    domain::{GalacticPosition, Inventory, InventoryOwner, LocationType},
+    domain::{GalacticPosition, Inventory, InventoryOwner},
     managed::ReadinessComponent,
     raw::RequestPriority,
 };
@@ -33,8 +33,7 @@ use replicant_transport::ResourceMap;
 use replicant_workflow::{
     RepositoryError, ResourceKey, WorkflowFailureDisposition, WorkflowId, WorkflowInstance,
     WorkflowPlacementIntentSnapshot, WorkflowPlacementIntentSubject, WorkflowPlacementProvenance,
-    WorkflowPlacementResolution, WorkflowRegistry, WorkflowRepository,
-    WorkflowServiceIntentSnapshot, WorkflowServiceIntentState, WorkflowStatus,
+    WorkflowPlacementResolution, WorkflowRegistry, WorkflowRepository, WorkflowStatus,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
@@ -325,6 +324,7 @@ struct WorkerView {
     role_affinity: Option<String>,
     busy_workflow: Option<WorkflowId>,
     racing_vessel: Option<String>,
+    heaven_vessel: Option<String>,
     physical_location: Option<String>,
     state: WorkerState,
 }
@@ -926,6 +926,7 @@ pub async fn reconcile_director(
     let busy = busy_replicants(&repository, &workflows)?;
     let assignments = load_assignments(&repository)?;
     let racing_vessels = hosted_racing_vessels(&devices);
+    let heaven_vessels = hosted_heaven_vessels(&devices);
     let mut workers = replicants
         .iter()
         .cloned()
@@ -934,7 +935,9 @@ pub async fn reconcile_director(
             let assignment = assignments.get(&code);
             let region = assignment.and_then(|value| value.region.clone());
             let racing_vessel = racing_vessels.get(&code).cloned();
-            let vessel = racing_vessel.as_deref().and_then(|vessel_code| {
+            let heaven_vessel = heaven_vessels.get(&code).cloned();
+            let worker_vessel = racing_vessel.as_deref().or(heaven_vessel.as_deref());
+            let vessel = worker_vessel.and_then(|vessel_code| {
                 devices
                     .iter()
                     .find(|device| device.key.id.as_str() == vessel_code)
@@ -972,6 +975,7 @@ pub async fn reconcile_director(
                 role_affinity: assignment.and_then(|value| value.role_affinity.clone()),
                 busy_workflow,
                 racing_vessel,
+                heaven_vessel,
                 physical_location,
                 replicant,
                 state,
@@ -1360,20 +1364,21 @@ pub async fn reconcile_director(
             &mut requirements,
             now,
         )?);
-        // Expand Mining may have created the exact route campaign above.  Read
-        // the repository and service projection again so this goal never races
-        // a same-pass mining expansion with a duplicate campaign.
+        // Unserviced Resources is deliberately separate from mining expansion:
+        // it recovers one-shot stock outside the managed mining footprint rather
+        // than creating persistent mining-service infrastructure.
         let unserviced_workflows = repository.list()?;
-        let service_snapshot = workflow_registry.service_intent_snapshot(&repository, None)?;
         goals.push(reconcile_unserviced_resources(
             &goal_context,
-            workflow_registry,
-            &service_snapshot,
             region,
+            &workers,
+            &mut reserved_workers,
             &devices,
             &locations,
             &inventories,
+            &location_systems,
             &system_regions,
+            &regions,
             &unserviced_workflows,
             placement_authority_complete,
             &mut unserviced_launch_available,
@@ -3787,6 +3792,7 @@ fn reconcile_stranded_device_recovery(
             candidate.device_code, candidate.destination
         ),
         placement_recovery: Some(candidate.metadata.clone()),
+        local_control_replicant: None,
     };
     let created = context.repository.create_or_reuse_active(
         new_logistics_manifest_workflow(intent),
@@ -4089,6 +4095,7 @@ fn reconcile_maintain_system_hubs(
                     allow_transport_staging: false,
                     region: Some(region.region.clone()),
                     purpose,
+                    local_control_replicant: None,
                 },
             ))?;
             tracing::info!(
@@ -5014,6 +5021,7 @@ fn reconcile_event_completion(
                     .create(new_event_campaign_workflow(EventCampaignIntent {
                         region: region.region.clone(),
                         home,
+                        replicant: Some(worker.clone()),
                     }))?;
             tracing::info!(
                 workflow_id = %workflow.id,
@@ -5500,21 +5508,25 @@ fn belt_searched_systems(
         .collect()
 }
 #[derive(Clone, Debug)]
-struct UnservicedRouteCandidate {
-    route: crate::mining::AmiTransportRouteIntent,
-    resource_state: crate::mining::EvidenceState,
+struct UnservicedResourceCandidate {
+    location: String,
+    system: String,
+    resources: ResourceMap,
+    total_quantity: i64,
 }
 
 #[allow(clippy::too_many_arguments)]
 fn reconcile_unserviced_resources(
     context: &GoalReconcileContext<'_>,
-    workflow_registry: &WorkflowRegistry,
-    service_snapshot: &WorkflowServiceIntentSnapshot,
     region: &RegionView,
+    workers: &[WorkerView],
+    reserved_workers: &mut BTreeSet<String>,
     devices: &[Device],
     locations: &[Location],
     inventories: &[Inventory],
+    location_systems: &BTreeMap<String, String>,
     system_regions: &BTreeMap<String, String>,
+    regions: &BTreeMap<String, RegionView>,
     workflows: &[WorkflowInstance],
     complete_authority: bool,
     launch_available: &mut bool,
@@ -5523,9 +5535,11 @@ fn reconcile_unserviced_resources(
     let id = goal_instance_id(kind, Some(&region.region));
     let enabled = goal_enabled(context.controls, kind, Some(&region.region));
     let objective = initial_goal_objective(kind);
-    let disabled_next = "Enable this standing goal to reconcile AMI transport coverage";
+    let disabled_next = "Enable this standing goal to recover worthwhile regional resource stock";
     let missing_home =
-        "No exact regional System Hub location is available for AMI transport delivery";
+        "No exact regional System Hub location is available for resource recovery delivery";
+    let authority_blocker =
+        "Complete managed device and resource authority before recovering unserviced resources";
     let mut runtime = load_goal_runtime(context.repository, &id)?;
     prune_runtime_workflows(&mut runtime, workflows);
 
@@ -5548,395 +5562,255 @@ fn reconcile_unserviced_resources(
             active_workflows,
             enabled,
         };
-    let retained = workflows
-        .iter()
-        .filter(|workflow| {
-            !workflow.status.is_terminal() && runtime.active_workflows.contains(&workflow.id)
-        })
-        .filter_map(|workflow| {
-            let intent = workflow.config::<MiningCampaignIntent>().ok()?;
-            (intent.region == region.region
-                && intent.transport_routes.iter().any(|route| {
-                    !route.system.trim().is_empty()
-                        && route.collect != route.deliver
-                        && route.deliver == region.hub_location.as_deref().unwrap_or_default()
-                }))
-            .then_some(workflow.id)
-        })
-        .collect::<Vec<_>>();
-    let retained_route = workflows
-        .iter()
-        .filter(|workflow| retained.contains(&workflow.id))
-        .filter_map(|workflow| workflow.config::<MiningCampaignIntent>().ok())
-        .flat_map(|intent| intent.transport_routes)
-        .find(|route| route.deliver == region.hub_location.as_deref().unwrap_or_default());
+
+    let mut active = Vec::new();
+    for workflow in workflows.iter().filter(|workflow| {
+        !workflow.status.is_terminal()
+            && workflow.kind == crate::automation::logistics_manifest_workflow_kind()
+    }) {
+        let Ok(intent) = workflow.config::<LogisticsManifestIntent>() else {
+            continue;
+        };
+        let belongs_here = intent
+            .region
+            .as_deref()
+            .is_some_and(|value| crate::canonical_region(value) == region.region);
+        if belongs_here && intent.purpose.starts_with("director:unserviced_resources:") {
+            if let Some(worker) = intent
+                .local_control_replicant
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                reserved_workers.insert(worker.to_owned());
+            }
+            active.push(workflow.id);
+        }
+    }
+    active.sort();
+    active.dedup();
+    runtime.active_workflows = active.clone();
+
     if !enabled {
+        save_goal_runtime(context.repository, &id, &runtime)?;
         return Ok(summary(
             DirectorGoalStatus::Waiting,
             None,
             Some(disabled_next.to_owned()),
             0,
-            retained.len(),
-            protocol_workflow_ids(&retained),
+            active.len(),
+            protocol_workflow_ids(&active),
         ));
     }
-    if !retained.is_empty() {
+    if !active.is_empty() {
+        save_goal_runtime(context.repository, &id, &runtime)?;
         return Ok(summary(
             DirectorGoalStatus::Active,
             None,
-            Some(retained_route.as_ref().map_or_else(
-                || "Continue active AMI transport service provisioning".to_owned(),
-                |route| {
-                    format!(
-                        "Wait for existing durable work to establish AMI transport service from {} to {}",
-                        route.collect, route.deliver
-                    )
-                },
-            )),
+            Some("Continue the active one-shot regional resource recovery".to_owned()),
             0,
-            retained.len(),
-            protocol_workflow_ids(&retained),
+            active.len(),
+            protocol_workflow_ids(&active),
         ));
     }
     if !complete_authority {
+        save_goal_runtime(context.repository, &id, &runtime)?;
         return Ok(summary(
             DirectorGoalStatus::Blocked,
-            Some("Managed resource and device authority is incomplete".to_owned()),
-            Some(
-                "Complete managed synchronization before reconciling AMI transport coverage"
-                    .to_owned(),
-            ),
+            Some(authority_blocker.to_owned()),
+            Some(authority_blocker.to_owned()),
             0,
             0,
             Vec::new(),
         ));
     }
-    let mut positive_location_count = 0usize;
-    let mut unknown_location_count = 0usize;
-    let mut seen_stock = BTreeSet::new();
-    for inventory in inventories {
-        let InventoryOwner::Location(owner) = &inventory.owner else {
-            continue;
-        };
-        let collect = owner.id.as_str();
-        if !inventory.items.iter().any(|item| item.quantity > 0)
-            || !seen_stock.insert(collect.to_owned())
-        {
-            continue;
-        }
-        let Some(location) = locations
-            .iter()
-            .find(|location| location.key.id == owner.id)
-        else {
-            unknown_location_count += 1;
-            continue;
-        };
-        match location.location_type.as_ref() {
+
+    let Some(hub) = region
+        .hub_location
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        save_goal_runtime(context.repository, &id, &runtime)?;
+        return Ok(summary(
+            DirectorGoalStatus::Blocked,
+            Some(missing_home.to_owned()),
+            Some(missing_home.to_owned()),
+            0,
+            0,
+            Vec::new(),
+        ));
+    };
+    let hub_system = region
+        .hub_system
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .or_else(|| location_systems.get(hub).cloned());
+    let managed_systems = managed_mining_systems(devices, location_systems);
+
+    let mut unknown_stock = 0usize;
+    let mut by_location = BTreeMap::<String, UnservicedResourceCandidate>::new();
+    for stock in stock_locations(
+        inventories,
+        locations,
+        location_systems,
+        system_regions,
+        regions,
+    ) {
+        match stock.region.as_deref() {
+            Some(mapped) if crate::canonical_region(mapped) != region.region => continue,
             None => {
-                unknown_location_count += 1;
-                continue;
-            }
-            Some(LocationType::Belt) => {}
-            Some(_) => continue,
-        }
-        let Some(system) = location.system.as_deref() else {
-            unknown_location_count += 1;
-            continue;
-        };
-        match system_regions.get(system) {
-            Some(mapped) if mapped != &region.region => continue,
-            None => {
-                unknown_location_count += 1;
+                unknown_stock += 1;
                 continue;
             }
             Some(_) => {}
         }
-        match crate::mining::resource_present_with_authority(
-            devices,
-            locations,
-            inventories,
-            collect,
-            complete_authority,
-        ) {
-            crate::mining::EvidenceState::Present => positive_location_count += 1,
-            crate::mining::EvidenceState::Unknown => unknown_location_count += 1,
-            crate::mining::EvidenceState::Absent => {}
+        if stock.location == hub
+            || hub_system.as_deref() == Some(stock.system.as_str())
+            || managed_systems.contains(&stock.system)
+        {
+            continue;
+        }
+        let entry = by_location
+            .entry(stock.location.clone())
+            .or_insert_with(|| UnservicedResourceCandidate {
+                location: stock.location.clone(),
+                system: stock.system.clone(),
+                resources: ResourceMap::new(),
+                total_quantity: 0,
+            });
+        for (resource, quantity) in stock.resources {
+            if quantity <= 0 {
+                continue;
+            }
+            *entry.resources.entry(resource).or_default() += quantity;
+            entry.total_quantity += quantity;
         }
     }
-    if unknown_location_count > 0 {
+    if unknown_stock > 0 {
+        save_goal_runtime(context.repository, &id, &runtime)?;
         return Ok(summary(
             DirectorGoalStatus::Blocked,
-            Some("Managed resource evidence is incomplete for AMI transport".to_owned()),
+            Some(format!(
+                "{unknown_stock} positive resource stock location(s) have unresolved regional authority"
+            )),
             Some(
-                "Complete managed resource authority before reconciling AMI transport coverage"
+                "Refresh managed locations and regional assignments before resource recovery"
                     .to_owned(),
             ),
             0,
-            positive_location_count + unknown_location_count,
+            unknown_stock,
             Vec::new(),
         ));
     }
-    if positive_location_count == 0 {
+
+    let mut candidates = by_location
+        .into_values()
+        .filter(|candidate| !candidate.resources.is_empty() && candidate.total_quantity > 0)
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        right
+            .total_quantity
+            .cmp(&left.total_quantity)
+            .then_with(|| left.location.cmp(&right.location))
+    });
+    if candidates.is_empty() {
+        save_goal_runtime(context.repository, &id, &runtime)?;
         return Ok(summary(
             DirectorGoalStatus::Satisfied,
             None,
-            Some("Wait for newly producing regional resources".to_owned()),
+            Some(
+                "Wait for recoverable regional resource stock outside managed mining systems"
+                    .to_owned(),
+            ),
             0,
             0,
-            protocol_workflow_ids(&retained),
+            Vec::new(),
         ));
     }
-    let Some(hub) = region
-        .hub_location
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    else {
+
+    let candidate = &candidates[0];
+    let Some(worker) = select_idle_worker(workers, &region.region, reserved_workers, false) else {
+        save_goal_runtime(context.repository, &id, &runtime)?;
         return Ok(summary(
             DirectorGoalStatus::Blocked,
-            Some(missing_home.to_owned()),
-            Some(missing_home.to_owned()),
+            Some(
+                "No operational regional Replicant is available for local resource recovery"
+                    .to_owned(),
+            ),
+            Some(format!(
+                "Free a regional Replicant to recover {} resource units from {}",
+                candidate.total_quantity, candidate.location
+            )),
             0,
-            positive_location_count,
-            protocol_workflow_ids(&retained),
+            candidates.len(),
+            Vec::new(),
         ));
     };
-
-    let mut candidates = Vec::new();
-    let mut seen = BTreeSet::new();
-    for inventory in inventories {
-        let InventoryOwner::Location(owner) = &inventory.owner else {
-            continue;
-        };
-        let collect = owner.id.as_str();
-        if !inventory.items.iter().any(|item| item.quantity > 0) || !seen.insert(collect.to_owned())
-        {
-            continue;
-        }
-        let Some(system) = locations
-            .iter()
-            .find(|location| location.key.id.as_str() == collect)
-            .and_then(|location| location.system.clone())
-        else {
-            candidates.push(UnservicedRouteCandidate {
-                route: crate::mining::AmiTransportRouteIntent {
-                    system: String::new(),
-                    collect: collect.to_owned(),
-                    deliver: hub.to_owned(),
-                },
-                resource_state: crate::mining::EvidenceState::Unknown,
-            });
-            continue;
-        };
-        let resource_state = if !system_regions.contains_key(&system)
-            || system_regions.get(&system) != Some(&region.region)
-        {
-            if system_regions
-                .get(&system)
-                .is_some_and(|mapped| mapped != &region.region)
-            {
-                crate::mining::EvidenceState::Absent
-            } else {
-                crate::mining::EvidenceState::Unknown
-            }
-        } else {
-            crate::mining::resource_present_with_authority(
-                devices,
-                locations,
-                inventories,
-                collect,
-                complete_authority,
-            )
-        };
-        if collect == hub {
-            continue;
-        }
-        if resource_state != crate::mining::EvidenceState::Absent {
-            candidates.push(UnservicedRouteCandidate {
-                route: crate::mining::AmiTransportRouteIntent {
-                    system,
-                    collect: collect.to_owned(),
-                    deliver: hub.to_owned(),
-                },
-                resource_state,
-            });
-        }
-    }
-    candidates.sort_by(|left, right| left.route.cmp(&right.route));
-    let total = candidates.len() + retained.len();
-    if candidates
-        .iter()
-        .any(|candidate| candidate.resource_state == crate::mining::EvidenceState::Unknown)
-    {
-        return Ok(summary(
-            DirectorGoalStatus::Blocked,
-            Some("Managed resource evidence is incomplete for AMI transport".to_owned()),
-            Some(
-                "Complete managed resource authority before reconciling AMI transport coverage"
-                    .to_owned(),
-            ),
-            0,
-            total,
-            Vec::new(),
-        ));
-    }
-    if candidates.is_empty() {
-        return Ok(summary(
-            DirectorGoalStatus::Satisfied,
-            None,
-            Some("Wait for newly producing regional resources".to_owned()),
-            0,
-            0,
-            Vec::new(),
-        ));
-    }
-    let mut pending_route = None;
-    let mut covered = 0usize;
-    let mut pending = Vec::new();
-    let mut uncovered = Vec::new();
-    for candidate in &candidates {
-        let route = &candidate.route;
-        let service = if route.collect == route.deliver {
-            crate::mining::EvidenceState::Present
-        } else {
-            crate::mining::transport_service_present(
-                devices,
-                &route.system,
-                &route.collect,
-                &route.deliver,
-            )
-            .state
-        };
-        if service == crate::mining::EvidenceState::Unknown {
-            return Ok(summary(
-                DirectorGoalStatus::Blocked,
-                Some(format!(
-                    "Durable workflow intent is incomplete for AMI transport from {} to {}",
-                    route.collect, route.deliver
-                )),
-                Some(format!(
-                    "Durable workflow intent is incomplete for AMI transport from {} to {}",
-                    route.collect, route.deliver
-                )),
-                covered,
-                total,
-                Vec::new(),
-            ));
-        }
-        if service == crate::mining::EvidenceState::Present {
-            covered += 1;
-            continue;
-        }
-        let target = route.workflow_service_intent();
-        match service_snapshot.state_for(&target, Some(&region.region), Some(&route.system)) {
-            WorkflowServiceIntentState::Present(ids) => {
-                pending.extend(ids);
-                if pending_route.is_none() {
-                    pending_route = Some(route);
-                }
-            }
-            WorkflowServiceIntentState::Unknown(_) => {
-                return Ok(summary(
-                    DirectorGoalStatus::Blocked,
-                    Some(format!(
-                        "Durable workflow intent is incomplete for AMI transport from {} to {}",
-                        route.collect, route.deliver
-                    )),
-                    Some(format!(
-                        "Complete durable workflow intent for AMI transport from {} to {}",
-                        route.collect, route.deliver
-                    )),
-                    covered,
-                    total,
-                    Vec::new(),
-                ));
-            }
-            WorkflowServiceIntentState::Absent => uncovered.push(candidate),
-        }
-    }
-    pending.sort();
-    pending.dedup();
-    if !pending.is_empty() {
-        return Ok(summary(
-            DirectorGoalStatus::Active,
-            None,
-            Some(format!(
-                "Wait for existing durable work to establish AMI transport service from {} to {}",
-                pending_route
-                    .map(|route| route.collect.as_str())
-                    .unwrap_or(""),
-                pending_route
-                    .map(|route| route.deliver.as_str())
-                    .unwrap_or(""),
-            )),
-            covered,
-            total,
-            protocol_workflow_ids(&pending),
-        ));
-    }
-    if uncovered.is_empty() {
-        return Ok(summary(
-            DirectorGoalStatus::Satisfied,
-            None,
-            Some("Maintain AMI transport coverage for producing regional resources".to_owned()),
-            covered,
-            total,
-            Vec::new(),
-        ));
-    }
-    let candidate = uncovered[0];
-    let route = candidate.route.clone();
     let next_action = format!(
-        "Establish AMI {} service from {} to {}",
-        if same_system(&route.system, &route.deliver) {
-            "shuttle"
-        } else {
-            "ferry"
-        },
-        route.collect,
-        route.deliver
+        "Recover {} resource units from {} in {} and deliver them to {}",
+        candidate.total_quantity, candidate.location, candidate.system, hub
     );
     if !context.automatic {
+        save_goal_runtime(context.repository, &id, &runtime)?;
         return Ok(summary(
             DirectorGoalStatus::Active,
             None,
             Some(next_action),
-            covered,
-            total,
+            0,
+            candidates.len(),
             Vec::new(),
         ));
     }
     if !*launch_available {
+        save_goal_runtime(context.repository, &id, &runtime)?;
         return Ok(summary(
             DirectorGoalStatus::Active,
             None,
             Some(format!("{next_action} on the next Director pass")),
-            covered,
-            total,
+            0,
+            candidates.len(),
             Vec::new(),
         ));
     }
-    let target = route.workflow_service_intent();
-    let intent = MiningCampaignIntent {
-        systems: vec![route.system.clone()],
-        region: region.region.clone(),
-        hub: route.deliver.clone(),
-        max_concurrency: 1,
-        transport_routes: vec![route.clone()],
+
+    let purpose = format!(
+        "director:unserviced_resources:{}:{}",
+        candidate.location, hub
+    );
+    let manifest = LogisticsManifestIntent {
+        origin: candidate.location.clone(),
+        destination: hub.to_owned(),
+        resources: candidate.resources.clone(),
+        devices: Vec::new(),
+        device_codes: Vec::new(),
+        device_tags: Vec::new(),
+        pre_deactivate_device_codes: Vec::new(),
+        release_mining_reservations: false,
+        placement_recovery: None,
+        local_control_replicant: Some(worker.clone()),
+        return_transports: true,
+        allow_transport_staging: true,
+        region: Some(region.region.clone()),
+        purpose: purpose.clone(),
     };
     let created = context.repository.create_or_reuse_active(
-        new_mining_campaign_workflow(intent),
-        |instance| match workflow_registry.service_intent_state_for_instance(
-            instance,
-            &target,
-            Some(&region.region),
-            Some(&route.system),
-        ) {
-            WorkflowServiceIntentState::Present(_) => Ok(true),
-            WorkflowServiceIntentState::Absent => Ok(false),
-            WorkflowServiceIntentState::Unknown(_) => Err(RepositoryError::Compatibility(format!(
-                "AMI transport intent is unknown for {} to {}",
-                route.collect, route.deliver
-            ))),
+        new_logistics_manifest_workflow(manifest),
+        |instance| {
+            let Ok(existing) = instance.config::<LogisticsManifestIntent>() else {
+                return Ok(false);
+            };
+            Ok(existing.origin == candidate.location
+                && existing.destination == hub
+                && existing.resources == candidate.resources
+                && existing.placement_recovery.is_none()
+                && existing
+                    .region
+                    .as_deref()
+                    .is_some_and(|value| crate::canonical_region(value) == region.region)
+                && existing.purpose == purpose)
         },
     );
     match created {
@@ -5944,6 +5818,7 @@ fn reconcile_unserviced_resources(
             if result.created {
                 *launch_available = false;
             }
+            reserved_workers.insert(worker);
             runtime.active_workflows = vec![result.instance.id];
             runtime.last_launch_at_ms = Some(context.now);
             save_goal_runtime(context.repository, &id, &runtime)?;
@@ -5951,8 +5826,8 @@ fn reconcile_unserviced_resources(
                 DirectorGoalStatus::Active,
                 None,
                 Some(next_action),
-                covered,
-                total,
+                0,
+                candidates.len(),
                 vec![ProtocolWorkflowId(result.instance.id.to_string())],
             ))
         }
@@ -5960,8 +5835,8 @@ fn reconcile_unserviced_resources(
             DirectorGoalStatus::Blocked,
             Some(error.to_string()),
             Some(next_action),
-            covered,
-            total,
+            0,
+            candidates.len(),
             Vec::new(),
         )),
     }
@@ -6053,6 +5928,92 @@ fn reconcile_expand_mining(
         .cloned()
         .collect::<BTreeSet<_>>();
 
+    // Once the mining stack itself is healthy, keep its AMI transport service
+    // reconciled as part of mining ownership. This is the behavior that used
+    // to be exposed incorrectly as the Unserviced Resources goal. Deployment
+    // and repair remain higher priority, while transport authority is resolved
+    // before optional System Ward relocation.
+    let mut missing_transport_routes = Vec::new();
+    let mut pending_transport_workflows = Vec::new();
+    let mut transport_service_blocker = None;
+    if pending.is_empty() {
+        let deliver = region
+            .hub_location
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        if deliver.is_none() && !healthy_systems.is_empty() {
+            transport_service_blocker = Some(
+                "No exact regional System Hub location is available for AMI transport service"
+                    .to_owned(),
+            );
+        }
+        if let Some(deliver) = deliver {
+            'systems: for system in &healthy_systems {
+                let Some(belts) = belt_designations.get(system) else {
+                    continue;
+                };
+                for belt in belts {
+                    if !crate::mining::audit_site(devices, system, belt).operational {
+                        continue;
+                    }
+                    let route = crate::mining::AmiTransportRouteIntent {
+                        system: system.clone(),
+                        collect: belt.clone(),
+                        deliver: deliver.to_owned(),
+                    };
+                    match crate::mining::transport_service_present(
+                        devices,
+                        &route.system,
+                        &route.collect,
+                        &route.deliver,
+                    )
+                    .state
+                    {
+                        crate::mining::EvidenceState::Present => continue,
+                        crate::mining::EvidenceState::Unknown => {
+                            transport_service_blocker = Some(format!(
+                                "Managed AMI transport evidence is incomplete for {} to {}",
+                                route.collect, route.deliver
+                            ));
+                            break 'systems;
+                        }
+                        crate::mining::EvidenceState::Absent => {}
+                    }
+
+                    let mut matching = workflows
+                        .iter()
+                        .filter(|workflow| {
+                            !workflow.status.is_terminal()
+                                && workflow.kind
+                                    == crate::automation::mining_campaign_workflow_kind()
+                        })
+                        .filter_map(|workflow| {
+                            let intent = workflow.config::<MiningCampaignIntent>().ok()?;
+                            (crate::canonical_region(&intent.region) == region.region
+                                && intent
+                                    .transport_routes
+                                    .iter()
+                                    .any(|candidate| candidate == &route))
+                            .then_some(workflow.id)
+                        })
+                        .collect::<Vec<_>>();
+                    matching.sort();
+                    matching.dedup();
+                    if matching.is_empty() {
+                        missing_transport_routes.push(route);
+                    } else {
+                        pending_transport_workflows.extend(matching);
+                    }
+                }
+            }
+        }
+    }
+    pending_transport_workflows.sort();
+    pending_transport_workflows.dedup();
+    missing_transport_routes.sort();
+    missing_transport_routes.dedup();
+
     let relay_systems = relay_device_systems(devices, location_systems);
     let disconnected = pending
         .difference(&relay_systems)
@@ -6099,82 +6060,30 @@ fn reconcile_expand_mining(
     let next_action;
 
     let status = if !enabled {
-        next_action =
-            Some("Enable this standing goal to reconcile regional mining sites".to_owned());
+        next_action = Some(
+            "Enable this standing goal to reconcile regional mining sites and transport service"
+                .to_owned(),
+        );
         DirectorGoalStatus::Waiting
     } else if !active.is_empty() {
         next_action = Some(
-            "Continue the active regional mining repair, expansion, or ward-rebalance workflow"
+            "Continue the active regional mining repair, expansion, transport-service, or ward-rebalance workflow"
                 .to_owned(),
         );
         DirectorGoalStatus::Active
     } else if recently_launched {
         next_action = Some(
-            "Wait briefly before replanning the next mining or ward-rebalance action".to_owned(),
+            "Wait briefly before replanning the next mining, transport-service, or ward-rebalance action"
+                .to_owned(),
         );
         DirectorGoalStatus::Waiting
-    } else if pending.is_empty()
-        && let Some(relocation) = relocations.first()
-    {
-        next_action = Some(format!(
-            "Move System Ward {} from {} to {} so the higher-priority mining belt is protected",
-            relocation.ward_code, relocation.source_system, relocation.target_system
-        ));
-        if automatic {
-            let mut pre_deactivate_device_codes = relocation.pause_devices.clone();
-            if !pre_deactivate_device_codes.contains(&relocation.ward_code) {
-                // Keep the ward last: displaced mining/survey controllers must
-                // be quiesced before the system protection is removed.
-                pre_deactivate_device_codes.push(relocation.ward_code.clone());
-            }
-            let workflow =
-                repository.create(new_logistics_manifest_workflow(LogisticsManifestIntent {
-                    origin: relocation.origin.clone(),
-                    destination: relocation.target_belt.clone(),
-                    resources: ResourceMap::new(),
-                    devices: Vec::new(),
-                    device_codes: vec![relocation.ward_code.clone()],
-                    device_tags: Vec::new(),
-                    pre_deactivate_device_codes,
-                    release_mining_reservations: true,
-                    placement_recovery: None,
-                    return_transports: relocation.origin.contains('-'),
-                    allow_transport_staging: true,
-                    region: Some(region.region.clone()),
-                    purpose: mining_ward_relocation_purpose(
-                        &region.region,
-                        &relocation.ward_code,
-                        &relocation.target_system,
-                    ),
-                }))?;
-            tracing::info!(
-                workflow_id = %workflow.id,
-                region = %region.region,
-                ward = %relocation.ward_code,
-                source_system = %relocation.source_system,
-                target_system = %relocation.target_system,
-                "Director launched mining System Ward rebalance"
-            );
-            runtime.active_workflows = vec![workflow.id];
-            runtime.last_launch_at_ms = Some(now);
-        }
-        DirectorGoalStatus::Active
-    } else if pending.is_empty() {
-        next_action = Some(format!(
-            "Maintain all eligible regional mining belts within {MINING_EXPANSION_RADIUS_LY:.0} LY of the regional hub; keep up to {MINING_WARD_SITES_PER_REGION} priority non-hub mining systems protected with System Wards"
-        ));
-        DirectorGoalStatus::Satisfied
-    } else {
-        // System Ward availability must never prevent the base mining stack
-        // from coming online. Protection is reconciled opportunistically after
-        // the selected sites are operational.
+    } else if !pending.is_empty() {
         let targets = relay_connected_mining_targets(
             &pending,
             &relay_systems,
             &managed_systems,
             &belt_density,
         );
-
         if targets.is_empty() && !disconnected.is_empty() {
             blocker = Some(format!(
                 "{} mining system(s) needing deployment or repair require active FTL coverage",
@@ -6237,6 +6146,105 @@ fn reconcile_expand_mining(
             }
             DirectorGoalStatus::Active
         }
+    } else if let Some(reason) = transport_service_blocker.as_ref() {
+        blocker = Some(reason.clone());
+        next_action = Some(
+            "Refresh managed mining and transport state before reconciling AMI transport service"
+                .to_owned(),
+        );
+        DirectorGoalStatus::Blocked
+    } else if !pending_transport_workflows.is_empty() {
+        runtime.active_workflows = pending_transport_workflows.clone();
+        next_action = Some(
+            "Continue existing durable work that is establishing missing AMI mining transport service"
+                .to_owned(),
+        );
+        DirectorGoalStatus::Active
+    } else if let Some(route) = missing_transport_routes.first().cloned() {
+        next_action = Some(format!(
+            "Establish AMI {} service from {} to {}",
+            if same_system(&route.system, &route.deliver) {
+                "shuttle"
+            } else {
+                "ferry"
+            },
+            route.collect,
+            route.deliver
+        ));
+        if automatic {
+            let intent = MiningCampaignIntent {
+                systems: vec![route.system.clone()],
+                region: region.region.clone(),
+                hub: route.deliver.clone(),
+                max_concurrency: 1,
+                transport_routes: vec![route.clone()],
+            };
+            let result = repository.create_or_reuse_active(
+                new_mining_campaign_workflow(intent),
+                |workflow| {
+                    let Ok(existing) = workflow.config::<MiningCampaignIntent>() else {
+                        return Ok(false);
+                    };
+                    Ok(crate::canonical_region(&existing.region) == region.region
+                        && existing
+                            .transport_routes
+                            .iter()
+                            .any(|candidate| candidate == &route))
+                },
+            )?;
+            tracing::info!(
+                workflow_id = %result.instance.id,
+                region = %region.region,
+                collect = %route.collect,
+                deliver = %route.deliver,
+                created = result.created,
+                "Director reconciled AMI mining transport service"
+            );
+            runtime.active_workflows = vec![result.instance.id];
+            runtime.last_launch_at_ms = Some(now);
+        }
+        DirectorGoalStatus::Active
+    } else if let Some(relocation) = relocations.first() {
+        next_action = Some(format!(
+            "Move System Ward {} from {} to {} so the higher-priority mining belt is protected",
+            relocation.ward_code, relocation.source_system, relocation.target_system
+        ));
+        if automatic {
+            let mut pre_deactivate_device_codes = relocation.pause_devices.clone();
+            if !pre_deactivate_device_codes.contains(&relocation.ward_code) {
+                pre_deactivate_device_codes.push(relocation.ward_code.clone());
+            }
+            let workflow =
+                repository.create(new_logistics_manifest_workflow(LogisticsManifestIntent {
+                    origin: relocation.origin.clone(),
+                    destination: relocation.target_belt.clone(),
+                    resources: ResourceMap::new(),
+                    devices: Vec::new(),
+                    device_codes: vec![relocation.ward_code.clone()],
+                    device_tags: Vec::new(),
+                    pre_deactivate_device_codes,
+                    release_mining_reservations: true,
+                    placement_recovery: None,
+                    local_control_replicant: None,
+                    return_transports: relocation.origin.contains('-'),
+                    allow_transport_staging: true,
+                    region: Some(region.region.clone()),
+                    purpose: mining_ward_relocation_purpose(
+                        &region.region,
+                        &relocation.ward_code,
+                        &relocation.target_system,
+                    ),
+                }))?;
+            tracing::info!(workflow_id = %workflow.id, region = %region.region, ward = %relocation.ward_code, source_system = %relocation.source_system, target_system = %relocation.target_system, "Director launched mining System Ward rebalance");
+            runtime.active_workflows = vec![workflow.id];
+            runtime.last_launch_at_ms = Some(now);
+        }
+        DirectorGoalStatus::Active
+    } else {
+        next_action = Some(format!(
+            "Maintain all eligible regional mining belts within {MINING_EXPANSION_RADIUS_LY:.0} LY of the regional hub, their AMI transport service, and up to {MINING_WARD_SITES_PER_REGION} priority non-hub System Wards"
+        ));
+        DirectorGoalStatus::Satisfied
     };
     save_goal_runtime(repository, &id, &runtime)?;
 
@@ -6253,7 +6261,7 @@ fn reconcile_expand_mining(
         region: Some(region.region.clone()),
         status,
         objective: format!(
-            "Expand mining across eligible belts within {MINING_EXPANSION_RADIUS_LY:.0} LY of the regional hub in {} ({}); harden up to {MINING_WARD_SITES_PER_REGION} priority non-hub mining systems with System Wards",
+            "Expand mining across eligible belts within {MINING_EXPANSION_RADIUS_LY:.0} LY of the regional hub in {} ({}); maintain AMI transport service and harden up to {MINING_WARD_SITES_PER_REGION} priority non-hub mining systems with System Wards",
             region.region,
             density_scope.join(", ")
         ),
@@ -7932,6 +7940,25 @@ fn hosted_racing_vessels(devices: &[Device]) -> BTreeMap<String, String> {
         .collect()
 }
 
+fn hosted_heaven_vessels(devices: &[Device]) -> BTreeMap<String, String> {
+    devices
+        .iter()
+        .filter(|device| device.device_type.as_ref() == Some(&DeviceType::HeavenVessel))
+        .filter_map(|device| {
+            device
+                .relationships
+                .hosting_replicant
+                .as_ref()
+                .map(|replicant| {
+                    (
+                        replicant.id.as_str().to_owned(),
+                        device.key.id.as_str().to_owned(),
+                    )
+                })
+        })
+        .collect()
+}
+
 fn busy_replicants(
     repository: &WorkflowRepository,
     workflows: &[WorkflowInstance],
@@ -8318,7 +8345,13 @@ fn select_idle_worker(
         .filter(|worker| worker.state == WorkerState::Operational)
         .filter(|worker| !reserved.contains(worker.replicant.key.id.as_str()))
         .filter(|worker| !require_racing_vessel || worker.racing_vessel.is_some())
-        .min_by_key(|worker| worker.role_affinity.is_none())
+        .min_by_key(|worker| {
+            (
+                worker.role_affinity.is_none(),
+                !require_racing_vessel && worker.heaven_vessel.is_none(),
+                worker.replicant.key.id.as_str(),
+            )
+        })
         .map(|worker| worker.replicant.key.id.as_str().to_owned())
 }
 
@@ -8480,7 +8513,7 @@ fn initial_goal_objective(kind: DirectorGoalKind) -> &'static str {
             "Recover stranded owned devices to regional System Hubs"
         }
         DirectorGoalKind::UnservicedResources => {
-            "Establish AMI transport service for producing regional resources"
+            "Recover regional resource stock outside managed mining systems"
         }
         DirectorGoalKind::ExpandFtlNetwork => "Maintain and extend regional FTL reach",
         DirectorGoalKind::EstablishBeacons => "Maintain beacon coverage at useful known systems",
@@ -8714,9 +8747,28 @@ mod tests {
             role_affinity: None,
             busy_workflow: None,
             racing_vessel: None,
+            heaven_vessel: None,
             physical_location: Some(location.to_owned()),
             state: WorkerState::Operational,
         }
+    }
+
+    #[test]
+    fn general_worker_selection_prefers_heaven_and_keeps_racing_for_speed_sensitive_work() {
+        let mut racing = test_worker("A-RACING", "alpha", "ALPHA-HUB");
+        racing.racing_vessel = Some("RACE-VESSEL".to_owned());
+        let mut heaven = test_worker("Z-HEAVEN", "alpha", "ALPHA-HUB");
+        heaven.heaven_vessel = Some("HEAVEN-VESSEL".to_owned());
+        let workers = vec![racing, heaven];
+
+        assert_eq!(
+            select_idle_worker(&workers, "alpha", &BTreeSet::new(), false).as_deref(),
+            Some("Z-HEAVEN")
+        );
+        assert_eq!(
+            select_idle_worker(&workers, "alpha", &BTreeSet::new(), true).as_deref(),
+            Some("A-RACING")
+        );
     }
 
     #[test]
@@ -10405,6 +10457,7 @@ mod tests {
                 allow_transport_staging: false,
                 region: Some("alpha".to_owned()),
                 purpose: hub_supply_purpose("alpha", "HUB1"),
+                local_control_replicant: None,
             }))
             .expect("create manifest");
         let workflows = repository.list().expect("list workflows");
@@ -10940,12 +10993,66 @@ mod tests {
     }
 
     #[test]
+    fn event_reconciliation_pins_the_selected_heaven_worker() {
+        let repository = WorkflowRepository::open_in_memory().expect("workflow repository");
+        let controls = GoalControls::default();
+        let workflows = repository.list().expect("workflows");
+        let context = GoalReconcileContext {
+            repository: &repository,
+            workflows: &workflows,
+            controls: &controls,
+            automatic: true,
+            now: DEFAULT_RETRY_COOLDOWN_MS + 1,
+        };
+        let region = RegionView {
+            region: "alpha".to_owned(),
+            status: DirectorRegionStatus::Established,
+            hub_system: Some("ALPHA".to_owned()),
+            hub_location: Some("ALPHA-HUB".to_owned()),
+            known_systems: BTreeSet::from(["ALPHA".to_owned()]),
+        };
+        let mut racing = test_worker("A-RACING", "alpha", "ALPHA-HUB");
+        racing.racing_vessel = Some("RACE-VESSEL".to_owned());
+        let mut heaven = test_worker("Z-HEAVEN", "alpha", "ALPHA-HUB");
+        heaven.heaven_vessel = Some("HEAVEN-VESSEL".to_owned());
+        let workers = vec![racing, heaven];
+        let mut reserved = BTreeSet::new();
+        let mut requirements =
+            DirectorRequirementGraph::load(&repository, context.now).expect("requirements");
+
+        let summary = reconcile_event_completion(
+            &context,
+            &region,
+            &["ALPHA-EVENT-1".to_owned()],
+            None,
+            &workers,
+            &mut reserved,
+            &mut requirements,
+        )
+        .expect("reconcile event completion");
+
+        assert_eq!(summary.status, DirectorGoalStatus::Active);
+        assert!(reserved.contains("Z-HEAVEN"));
+        let workflow = repository
+            .list()
+            .expect("event workflow")
+            .into_iter()
+            .find(|workflow| workflow.kind == crate::automation::event_campaign_workflow_kind())
+            .expect("event campaign");
+        let intent = workflow
+            .config::<EventCampaignIntent>()
+            .expect("event campaign intent");
+        assert_eq!(intent.replicant.as_deref(), Some("Z-HEAVEN"));
+    }
+
+    #[test]
     fn repeated_event_reconciliation_blocks_equivalent_permanent_work() {
         let repository = WorkflowRepository::open_in_memory().expect("workflow repository");
         let failed = repository
             .create(new_event_campaign_workflow(EventCampaignIntent {
                 region: "alpha".to_owned(),
                 home: "ALPHA-HUB".to_owned(),
+                replicant: None,
             }))
             .expect("create failed campaign");
         let events = vec!["ALPHA-EVENT-1".to_owned()];
@@ -11285,6 +11392,7 @@ mod tests {
                 .create(new_event_campaign_workflow(EventCampaignIntent {
                     region: "alpha".to_owned(),
                     home: "ALPHA-HUB".to_owned(),
+                    replicant: None,
                 }))
                 .expect("create failed campaign");
             let events = vec!["ALPHA-EVENT-1".to_owned()];
@@ -12296,7 +12404,7 @@ mod tests {
         );
         assert_eq!(
             initial_goal_objective(DirectorGoalKind::UnservicedResources),
-            "Establish AMI transport service for producing regional resources"
+            "Recover regional resource stock outside managed mining systems"
         );
         for event in [
             "ami.adopted",
@@ -12320,7 +12428,7 @@ mod tests {
     }
 
     #[test]
-    fn unserviced_resources_retains_work_and_requires_complete_authority() {
+    fn unserviced_resources_retains_one_shot_recovery_and_requires_complete_authority() {
         let repository = WorkflowRepository::open_in_memory().expect("repository");
         let mut controls = GoalControls::default();
         controls
@@ -12335,8 +12443,7 @@ mod tests {
             hub_location: Some("ALPHA-HUB".to_owned()),
             known_systems: BTreeSet::from(["ALPHA".to_owned()]),
         };
-        let registry = WorkflowRegistry::new();
-        let service_snapshot = WorkflowServiceIntentSnapshot::default();
+        let regions = BTreeMap::from([("alpha".to_owned(), region.clone())]);
         let empty_workflows = Vec::new();
         let context = GoalReconcileContext {
             repository: &repository,
@@ -12346,16 +12453,19 @@ mod tests {
             now: 10,
         };
         let mut launch_available = true;
+        let mut reserved = BTreeSet::new();
 
         let blocked = reconcile_unserviced_resources(
             &context,
-            &registry,
-            &service_snapshot,
             &region,
+            &[],
+            &mut reserved,
             &[],
             &[],
             &[],
             &BTreeMap::new(),
+            &BTreeMap::new(),
+            &regions,
             &[],
             false,
             &mut launch_available,
@@ -12363,31 +12473,19 @@ mod tests {
         .expect("incomplete authority summary");
         assert_eq!(blocked.status, DirectorGoalStatus::Blocked);
 
-        let route = crate::mining::AmiTransportRouteIntent {
-            system: "ALPHA".to_owned(),
-            collect: "ALPHA-BELT-1".to_owned(),
-            deliver: "ALPHA-HUB".to_owned(),
-        };
         let workflow = repository
-            .create(new_mining_campaign_workflow(MiningCampaignIntent {
-                systems: vec![route.system.clone()],
-                region: region.region.clone(),
-                hub: route.deliver.clone(),
-                transport_routes: vec![route],
-                max_concurrency: 1,
+            .create(new_logistics_manifest_workflow(LogisticsManifestIntent {
+                origin: "ISOLATED-BELT-1".to_owned(),
+                destination: "ALPHA-HUB".to_owned(),
+                resources: BTreeMap::from([("rares".to_owned(), 5_000)]),
+                local_control_replicant: Some("A-1".to_owned()),
+                return_transports: true,
+                allow_transport_staging: true,
+                region: Some("alpha".to_owned()),
+                purpose: "director:unserviced_resources:ISOLATED-BELT-1:ALPHA-HUB".to_owned(),
+                ..LogisticsManifestIntent::default()
             }))
-            .expect("route campaign");
-        save_goal_runtime(
-            &repository,
-            &goal_instance_id(DirectorGoalKind::UnservicedResources, Some("alpha")),
-            &GoalRuntime {
-                active_workflows: vec![workflow.id],
-                last_launch_at_ms: Some(0),
-                launch_records: Vec::new(),
-                prospect_exhausted_signature: None,
-            },
-        )
-        .expect("save runtime");
+            .expect("resource recovery manifest");
         let workflows = vec![workflow];
         let context = GoalReconcileContext {
             repository: &repository,
@@ -12398,27 +12496,30 @@ mod tests {
         };
         let active = reconcile_unserviced_resources(
             &context,
-            &registry,
-            &service_snapshot,
             &region,
+            &[],
+            &mut reserved,
             &[],
             &[],
             &[],
             &BTreeMap::new(),
+            &BTreeMap::new(),
+            &regions,
             &workflows,
             false,
             &mut launch_available,
         )
-        .expect("retained work summary");
+        .expect("retained recovery summary");
         assert_eq!(active.status, DirectorGoalStatus::Active);
         assert_eq!(
             active.active_workflows,
             vec![ProtocolWorkflowId(workflows[0].id.to_string())]
         );
+        assert!(reserved.contains("A-1"));
     }
 
     #[test]
-    fn unserviced_route_campaign_reuses_exact_intent_after_repository_reopen() {
+    fn mining_transport_route_campaign_reuses_exact_intent_after_repository_reopen() {
         let directory =
             std::env::temp_dir().join(format!("replicant-unserviced-{}", uuid::Uuid::new_v4()));
         let path = directory.join("workflow.sqlite");
@@ -12456,11 +12557,11 @@ mod tests {
                     Some("alpha"),
                     Some("ALPHA"),
                 ) {
-                    WorkflowServiceIntentState::Present(_) => Ok(true),
-                    WorkflowServiceIntentState::Absent => Ok(false),
-                    WorkflowServiceIntentState::Unknown(_) => Err(RepositoryError::Compatibility(
-                        "unknown AMI route intent".to_owned(),
-                    )),
+                    replicant_workflow::WorkflowServiceIntentState::Present(_) => Ok(true),
+                    replicant_workflow::WorkflowServiceIntentState::Absent => Ok(false),
+                    replicant_workflow::WorkflowServiceIntentState::Unknown(_) => Err(
+                        RepositoryError::Compatibility("unknown AMI route intent".to_owned()),
+                    ),
                 }
             })
             .expect("reuse route campaign");

@@ -588,6 +588,9 @@ pub struct RegionalDispatchIntent {
     /// Additional device-type quantities to deliver.
     #[serde(default)]
     pub devices: Vec<DeviceRequest>,
+    /// Optional operator tag applied to every device manufactured for this dispatch.
+    #[serde(default)]
+    pub print_tag: Option<String>,
 }
 
 /// Restart-safe provisioning and delivery state for a regional dispatch.
@@ -770,6 +773,11 @@ pub struct LogisticsManifestIntent {
     /// Optional exact failed-custody metadata for Stranded Device Recovery.
     #[serde(default)]
     pub placement_recovery: Option<PlacementRecoveryMetadata>,
+    /// Optional regional Replicant that must establish local command authority
+    /// at the origin before any payload mutation begins. Placement recovery
+    /// implicitly enables this mode even for legacy persisted intents.
+    #[serde(default)]
+    pub local_control_replicant: Option<String>,
     /// Return borrowed transport carriers to their starting scope after delivery.
     #[serde(default)]
     pub return_transports: bool,
@@ -816,6 +824,27 @@ pub struct LogisticsWorkflowCheckpoint {
     /// Per-device recovery tag cleanup operation and its last observed state.
     #[serde(default)]
     pub placement_recovery_cleanup: BTreeMap<String, PlacementRecoveryCleanup>,
+    /// Replicant durably selected for local-control logistics.
+    #[serde(default)]
+    pub local_control_replicant: Option<String>,
+    /// Hosted vessel claimed together with the local-control Replicant.
+    #[serde(default)]
+    pub local_control_vessel: Option<String>,
+    /// Exact physical location captured before local-control dispatch.
+    #[serde(default)]
+    pub local_control_home: Option<String>,
+    /// Origin system where local command authority must be established.
+    #[serde(default)]
+    pub local_control_origin_system: Option<String>,
+    /// Delivery has completed and must not be replayed after restart.
+    #[serde(default)]
+    pub delivery_complete: bool,
+    /// Persisted delivery result used while the Replicant returns home.
+    #[serde(default)]
+    pub delivery_report: Option<DeliveryReport>,
+    /// Local-control Replicant has returned to its captured home.
+    #[serde(default)]
+    pub local_control_returned: bool,
 }
 
 /// Intent for a fully provisioned buyer-side trade run.
@@ -1063,6 +1092,10 @@ pub struct EventCampaignIntent {
     pub region: String,
     /// Regional manufacturing and staging home.
     pub home: String,
+    /// Director-selected regional Replicant. Persisting the selection keeps the
+    /// workflow on the same worker across daemon restarts.
+    #[serde(default)]
+    pub replicant: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -2688,6 +2721,7 @@ impl WorkflowFactory for EventCampaignWorkflowFactory {
         let config = EventCampaignIntent {
             region: legacy.region,
             home: checkpoint.home.clone().or(legacy.home).unwrap_or_default(),
+            replicant: checkpoint.replicant.clone(),
         };
         Ok(Some(WorkflowMigration::new(
             serde_json::to_value(config).map_err(string_error)?,
@@ -5626,6 +5660,515 @@ impl WorkflowExecutor for RegionalDispatchWorkflow {
     }
 }
 
+fn manifest_requires_local_control(intent: &LogisticsManifestIntent) -> bool {
+    intent.placement_recovery.is_some()
+        || intent
+            .local_control_replicant
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+}
+
+fn manifest_operation_id(
+    workflow_id: WorkflowId,
+    action: &str,
+    subject: &str,
+    destination: &str,
+) -> OperationId {
+    let workflow = workflow_id.to_string();
+    let canonical_subject = subject.trim().to_ascii_uppercase();
+    let canonical_destination = destination.trim().to_ascii_uppercase();
+    let mut hasher = Sha256::new();
+    hasher.update(b"replicant.logistics-manifest.operation.v1\0");
+    for component in [
+        workflow.as_str(),
+        action,
+        canonical_subject.as_str(),
+        canonical_destination.as_str(),
+    ] {
+        hasher.update((component.len() as u64).to_le_bytes());
+        hasher.update(component.as_bytes());
+    }
+    let digest = hasher.finalize();
+    let hex = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    OperationId::new(format!("logistics-manifest:{hex}"))
+}
+
+fn manifest_travel_destination(travel: &TravelState) -> Option<&str> {
+    travel
+        .final_destination
+        .as_ref()
+        .or(travel.destination.as_ref())
+        .map(|location| location.id.as_str())
+}
+
+fn manifest_local_control_region(intent: &LogisticsManifestIntent) -> Option<String> {
+    intent
+        .region
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(canonical_region)
+}
+
+async fn claim_manifest_local_control(
+    context: &WorkflowContext,
+    client: &Client,
+    intent: &LogisticsManifestIntent,
+    checkpoint: &mut LogisticsWorkflowCheckpoint,
+) -> Result<bool, String> {
+    if !manifest_requires_local_control(intent) {
+        return Ok(true);
+    }
+
+    let requested = checkpoint
+        .local_control_replicant
+        .as_deref()
+        .or_else(|| {
+            intent
+                .local_control_replicant
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        })
+        .map(str::to_owned);
+    let region = manifest_local_control_region(intent);
+    let assignments = crate::orchestration::assigned_replicant_regions(context.repository())
+        .map_err(string_error)?;
+
+    let mut candidates = if let Some(code) = requested {
+        vec![code]
+    } else {
+        let Some(region) = region.as_deref() else {
+            return Err("local-control logistics requires a region or pinned Replicant".to_owned());
+        };
+        assignments
+            .iter()
+            .filter_map(|(code, assigned)| {
+                assigned
+                    .as_deref()
+                    .is_some_and(|assigned| canonical_region(assigned) == region)
+                    .then_some(code.clone())
+            })
+            .collect::<Vec<_>>()
+    };
+    candidates.sort();
+    candidates.dedup();
+
+    for code in candidates {
+        if let Some(region) = region.as_deref() {
+            let assigned = assignments
+                .get(&code)
+                .and_then(|assigned| assigned.as_deref())
+                .map(canonical_region);
+            if assigned.as_deref() != Some(region) {
+                if intent
+                    .local_control_replicant
+                    .as_deref()
+                    .is_some_and(|requested| requested.eq_ignore_ascii_case(&code))
+                {
+                    return Err(format!(
+                        "local-control Replicant {code} is not durably assigned to region {region}"
+                    ));
+                }
+                continue;
+            }
+        }
+
+        let handle = match client.replicants().get_owned(&code).await {
+            Ok(handle) => handle,
+            Err(error) => {
+                if intent
+                    .local_control_replicant
+                    .as_deref()
+                    .is_some_and(|requested| requested.eq_ignore_ascii_case(&code))
+                {
+                    return Err(string_error(error));
+                }
+                continue;
+            }
+        };
+        let snapshot = handle.snapshot().await.map_err(string_error)?;
+        let Some(vessel_code) = snapshot
+            .hosted_device
+            .as_ref()
+            .map(|device| device.id.as_str().to_owned())
+        else {
+            if intent
+                .local_control_replicant
+                .as_deref()
+                .is_some_and(|requested| requested.eq_ignore_ascii_case(&code))
+            {
+                return Err(format!(
+                    "local-control Replicant {code} has no hosted vessel"
+                ));
+            }
+            continue;
+        };
+        let vessel = client
+            .devices()
+            .get(&vessel_code)
+            .await
+            .map_err(string_error)?
+            .snapshot()
+            .await
+            .map_err(string_error)?;
+        if vessel
+            .relationships
+            .hosting_replicant
+            .as_ref()
+            .is_none_or(|hosted| !hosted.id.as_str().eq_ignore_ascii_case(&code))
+        {
+            continue;
+        }
+
+        if !try_claim_available(context, ResourceKey::Replicant(code.clone()))? {
+            continue;
+        }
+        if !try_claim_available(context, ResourceKey::Device(vessel_code.clone()))? {
+            context
+                .release_claim(&ResourceKey::Replicant(code.clone()))
+                .map_err(string_error)?;
+            continue;
+        }
+
+        let home = vessel
+            .location
+            .as_ref()
+            .or(snapshot.location.as_ref())
+            .map(|location| location.id.as_str().to_owned())
+            .or_else(|| checkpoint.local_control_home.clone());
+        let Some(home) = home else {
+            context
+                .release_claim(&ResourceKey::Device(vessel_code.clone()))
+                .map_err(string_error)?;
+            context
+                .release_claim(&ResourceKey::Replicant(code.clone()))
+                .map_err(string_error)?;
+            continue;
+        };
+
+        checkpoint.local_control_replicant = Some(code);
+        checkpoint.local_control_vessel = Some(vessel_code);
+        checkpoint.local_control_home = Some(home);
+        return Ok(true);
+    }
+
+    Ok(false)
+}
+
+async fn ensure_manifest_local_control_at_origin(
+    context: &mut WorkflowContext,
+    client: &Client,
+    intent: &LogisticsManifestIntent,
+    checkpoint: &mut LogisticsWorkflowCheckpoint,
+) -> Result<bool, String> {
+    if !manifest_requires_local_control(intent) {
+        return Ok(true);
+    }
+    let replicant = checkpoint
+        .local_control_replicant
+        .clone()
+        .ok_or_else(|| "local-control logistics lost its Replicant selection".to_owned())?;
+    let vessel_code = checkpoint
+        .local_control_vessel
+        .clone()
+        .ok_or_else(|| "local-control logistics lost its hosted vessel selection".to_owned())?;
+    let origin_system = if let Some(system) = checkpoint.local_control_origin_system.clone() {
+        system
+    } else {
+        let system = resolve_location_system(client, &intent.origin)
+            .await
+            .unwrap_or_else(|_| intent.origin.clone());
+        checkpoint.local_control_origin_system = Some(system.clone());
+        context
+            .persist_checkpoint(checkpoint)
+            .map_err(string_error)?;
+        system
+    };
+
+    let handle = client
+        .replicants()
+        .get_owned(&replicant)
+        .await
+        .map_err(string_error)?;
+    let snapshot = handle.snapshot().await.map_err(string_error)?;
+    let vessel = client
+        .devices()
+        .get(&vessel_code)
+        .await
+        .map_err(string_error)?
+        .snapshot()
+        .await
+        .map_err(string_error)?;
+    let current_location = vessel.location.as_ref().or(snapshot.location.as_ref());
+    let active_travel = snapshot.travel.as_ref().or(vessel.travel.as_ref());
+
+    if active_travel.is_none()
+        && current_location
+            .is_some_and(|location| designation_in_system(location.id.as_str(), &origin_system))
+    {
+        return Ok(true);
+    }
+
+    if let Some(travel) = active_travel {
+        let planned = manifest_travel_destination(travel);
+        context
+            .advance_to("waiting_for_local_control_travel", checkpoint)
+            .map_err(string_error)?;
+        if !planned.is_some_and(|destination| {
+            destination.eq_ignore_ascii_case(&origin_system)
+                || designation_in_system(destination, &origin_system)
+        }) {
+            context
+                .emit_activity(format!(
+                    "local-control Replicant {replicant} is already travelling to {:?}; waiting for that trip to finish before dispatching to {origin_system}",
+                    planned
+                ))
+                .map_err(string_error)?;
+        }
+        context.mark_waiting().map_err(string_error)?;
+        return Ok(false);
+    }
+
+    context
+        .advance_to("establishing_local_control", checkpoint)
+        .map_err(string_error)?;
+    let operation = handle
+        .travel()
+        .to(origin_system.clone())
+        .depart_with_id(manifest_operation_id(
+            context.id(),
+            "local-control-to-origin",
+            &replicant,
+            &origin_system,
+        ))
+        .await
+        .map_err(string_error)?;
+    let status = operation.status().await.map_err(string_error)?;
+    if matches!(
+        status,
+        OperationStatus::Cancelled | OperationStatus::Rejected | OperationStatus::Failed
+    ) {
+        return Err(format!(
+            "local-control Replicant {replicant} could not travel to {origin_system}: operation {} ended as {:?}",
+            operation.id(),
+            status
+        ));
+    }
+    context.mark_waiting().map_err(string_error)?;
+    Ok(false)
+}
+
+async fn ensure_manifest_local_control_returned(
+    context: &mut WorkflowContext,
+    client: &Client,
+    checkpoint: &mut LogisticsWorkflowCheckpoint,
+) -> Result<bool, String> {
+    let Some(replicant) = checkpoint.local_control_replicant.clone() else {
+        return Ok(true);
+    };
+    let home = checkpoint
+        .local_control_home
+        .clone()
+        .ok_or_else(|| "local-control logistics lost its captured home location".to_owned())?;
+    let vessel_code = checkpoint
+        .local_control_vessel
+        .clone()
+        .ok_or_else(|| "local-control logistics lost its hosted vessel selection".to_owned())?;
+    let handle = client
+        .replicants()
+        .get_owned(&replicant)
+        .await
+        .map_err(string_error)?;
+    let snapshot = handle.snapshot().await.map_err(string_error)?;
+    let vessel = client
+        .devices()
+        .get(&vessel_code)
+        .await
+        .map_err(string_error)?
+        .snapshot()
+        .await
+        .map_err(string_error)?;
+    let current_location = vessel.location.as_ref().or(snapshot.location.as_ref());
+    let active_travel = snapshot.travel.as_ref().or(vessel.travel.as_ref());
+
+    if active_travel.is_none()
+        && current_location.is_some_and(|location| location.id.as_str().eq_ignore_ascii_case(&home))
+    {
+        checkpoint.local_control_returned = true;
+        context
+            .persist_checkpoint(checkpoint)
+            .map_err(string_error)?;
+        return Ok(true);
+    }
+    if let Some(travel) = active_travel {
+        context
+            .advance_to("returning_local_control", checkpoint)
+            .map_err(string_error)?;
+        let planned = manifest_travel_destination(travel);
+        if !planned.is_some_and(|destination| destination.eq_ignore_ascii_case(&home)) {
+            context
+                .emit_activity(format!(
+                    "local-control Replicant {replicant} is already travelling to {:?}; waiting for that trip to finish before returning to {home}",
+                    planned
+                ))
+                .map_err(string_error)?;
+        }
+        context.mark_waiting().map_err(string_error)?;
+        return Ok(false);
+    }
+
+    context
+        .advance_to("returning_local_control", checkpoint)
+        .map_err(string_error)?;
+    let operation = handle
+        .travel()
+        .to(home.clone())
+        .depart_with_id(manifest_operation_id(
+            context.id(),
+            "local-control-return-home",
+            &replicant,
+            &home,
+        ))
+        .await
+        .map_err(string_error)?;
+    let status = operation.status().await.map_err(string_error)?;
+    if matches!(
+        status,
+        OperationStatus::Cancelled | OperationStatus::Rejected | OperationStatus::Failed
+    ) {
+        return Err(format!(
+            "local-control Replicant {replicant} could not return to {home}: operation {} ended as {:?}",
+            operation.id(),
+            status
+        ));
+    }
+    context.mark_waiting().map_err(string_error)?;
+    Ok(false)
+}
+
+enum DirectRecoveryProgress {
+    NotApplicable,
+    Waiting,
+    Delivered(DeliveryReport),
+}
+
+async fn try_direct_placement_recovery(
+    context: &mut WorkflowContext,
+    client: &Client,
+    intent: &LogisticsManifestIntent,
+    checkpoint: &LogisticsWorkflowCheckpoint,
+) -> Result<DirectRecoveryProgress, String> {
+    if intent.placement_recovery.is_none() || intent.device_codes.len() != 1 {
+        return Ok(DirectRecoveryProgress::NotApplicable);
+    }
+    let code = &intent.device_codes[0];
+    let handle = client
+        .devices()
+        .get(code)
+        .await
+        .map_err(string_error)?
+        .refresh()
+        .await
+        .map_err(string_error)?;
+    let snapshot = handle.snapshot().await.map_err(string_error)?;
+
+    if snapshot.travel.is_none()
+        && snapshot.location.as_ref().is_some_and(|location| {
+            location
+                .id
+                .as_str()
+                .eq_ignore_ascii_case(&intent.destination)
+        })
+    {
+        return Ok(DirectRecoveryProgress::Delivered(DeliveryReport {
+            devices_delivered: vec![code.clone()],
+            ..DeliveryReport::default()
+        }));
+    }
+
+    if let Some(travel) = snapshot.travel.as_ref() {
+        context
+            .advance_to("waiting_for_recovered_device_travel", checkpoint)
+            .map_err(string_error)?;
+        let planned = manifest_travel_destination(travel);
+        if !planned.is_some_and(|destination| destination.eq_ignore_ascii_case(&intent.destination))
+        {
+            context
+                .emit_activity(format!(
+                    "stranded device {code} is already travelling to {:?}; waiting before replanning recovery",
+                    planned
+                ))
+                .map_err(string_error)?;
+        }
+        context.mark_waiting().map_err(string_error)?;
+        return Ok(DirectRecoveryProgress::Waiting);
+    }
+
+    let travel_available = snapshot
+        .available_commands
+        .iter()
+        .any(|command| command.as_str().eq_ignore_ascii_case("travel"));
+    let free = snapshot.relationships.attached_to.is_none()
+        && snapshot.relationships.stowed_in.is_none()
+        && snapshot.relationships.controller.is_none();
+    if !travel_available || !free {
+        return Ok(DirectRecoveryProgress::NotApplicable);
+    }
+
+    let via = client
+        .smart_travel()
+        .route_for_device(code, &intent.destination)
+        .await
+        .map_err(string_error)?
+        .filter(|plan| !plan.is_direct && !plan.intermediate_systems.is_empty())
+        .map(|plan| {
+            Value::Array(
+                plan.explicit_waypoints_for(&intent.destination)
+                    .into_iter()
+                    .map(Value::String)
+                    .collect(),
+            )
+        });
+    let command = replicant_client::raw::devices::DeviceCommand::Travel {
+        destination: intent.destination.clone(),
+        dry_run: None,
+        via,
+    };
+    context
+        .advance_to("dispatching_recovered_device", checkpoint)
+        .map_err(string_error)?;
+    let operation = handle
+        .command_with_id(
+            manifest_operation_id(
+                context.id(),
+                "recover-device-travel",
+                code,
+                &intent.destination,
+            ),
+            command,
+        )
+        .await
+        .map_err(string_error)?;
+    let status = operation.status().await.map_err(string_error)?;
+    if matches!(
+        status,
+        OperationStatus::Cancelled | OperationStatus::Rejected | OperationStatus::Failed
+    ) {
+        return Err(format!(
+            "stranded device {code} could not travel to {}: operation {} ended as {:?}",
+            intent.destination,
+            operation.id(),
+            status
+        ));
+    }
+    context.mark_waiting().map_err(string_error)?;
+    Ok(DirectRecoveryProgress::Waiting)
+}
+
 struct LogisticsManifestWorkflow;
 impl WorkflowExecutor for LogisticsManifestWorkflow {
     fn execute<'a>(&'a mut self, context: &'a mut WorkflowContext) -> BoxWorkflowFuture<'a> {
@@ -5671,6 +6214,56 @@ impl WorkflowExecutor for LogisticsManifestWorkflow {
             let client = managed_client(context)?;
             let mut checkpoint: LogisticsWorkflowCheckpoint =
                 context.checkpoint().map_err(string_error)?;
+
+            // Local-control logistics claims the regional Replicant and its
+            // hosted vessel before touching any payload claim or stale
+            // recovery reservation. This is the authority boundary for
+            // disconnected pickup systems.
+            if manifest_requires_local_control(&intent) {
+                if !claim_manifest_local_control(context, &client, &intent, &mut checkpoint).await?
+                {
+                    context
+                        .advance_to("waiting_for_local_control_worker", &checkpoint)
+                        .map_err(string_error)?;
+                    context
+                        .emit_activity(
+                            "local-control manifest is waiting for an unclaimed regional Replicant with a hosted vessel"
+                                .to_owned(),
+                        )
+                        .map_err(string_error)?;
+                    context.mark_waiting().map_err(string_error)?;
+                    return Ok(());
+                }
+                context
+                    .persist_checkpoint(&checkpoint)
+                    .map_err(string_error)?;
+                if !ensure_manifest_local_control_at_origin(
+                    context,
+                    &client,
+                    &intent,
+                    &mut checkpoint,
+                )
+                .await?
+                {
+                    return Ok(());
+                }
+            }
+
+            // Delivery completion is a durable boundary. A daemon restart
+            // after the payload reached the destination must never replay the
+            // shipment while the local-control Replicant is returning home.
+            if checkpoint.delivery_complete {
+                if manifest_requires_local_control(&intent)
+                    && !checkpoint.local_control_returned
+                    && !ensure_manifest_local_control_returned(context, &client, &mut checkpoint)
+                        .await?
+                {
+                    return Ok(());
+                }
+                let report = checkpoint.delivery_report.clone().unwrap_or_default();
+                return context.mark_succeeded(Some(report)).map_err(string_error);
+            }
+
             let plan =
                 if checkpoint.started {
                     Some(checkpoint.plan.clone().ok_or_else(|| {
@@ -5720,6 +6313,34 @@ impl WorkflowExecutor for LogisticsManifestWorkflow {
             if intent.placement_recovery.is_none() && intent.release_mining_reservations {
                 release_mining_reservation_tags(&client, &intent.device_codes).await?;
             }
+
+            // A travel-capable stranded device does not need a carrier once a
+            // Replicant has established local authority. Prefer its own travel
+            // command and fall back to attachment logistics only when the
+            // device cannot travel independently.
+            match try_direct_placement_recovery(context, &client, &intent, &checkpoint).await? {
+                DirectRecoveryProgress::NotApplicable => {}
+                DirectRecoveryProgress::Waiting => return Ok(()),
+                DirectRecoveryProgress::Delivered(report) => {
+                    checkpoint.delivery_complete = true;
+                    checkpoint.delivery_report = Some(report.clone());
+                    context
+                        .persist_checkpoint(&checkpoint)
+                        .map_err(string_error)?;
+                    if manifest_requires_local_control(&intent)
+                        && !ensure_manifest_local_control_returned(
+                            context,
+                            &client,
+                            &mut checkpoint,
+                        )
+                        .await?
+                    {
+                        return Ok(());
+                    }
+                    return context.mark_succeeded(Some(report)).map_err(string_error);
+                }
+            }
+
             if checkpoint.started {
                 return execute_logistics_manifest_plan(
                     context,
@@ -5851,15 +6472,31 @@ async fn execute_logistics_manifest_plan(
     client: &Client,
     intent: &LogisticsManifestIntent,
     mut checkpoint: LogisticsWorkflowCheckpoint,
-    plan: DeliveryPlan,
+    mut plan: DeliveryPlan,
 ) -> Result<(), String> {
+    // If the Replicant's own hosted vessel is selected as a transport, its
+    // generic transport-return location must be the delivery destination.
+    // Otherwise execute_delivery would carry the payload home and then send
+    // the Replicant's vessel back to the disconnected pickup system.
+    if manifest_requires_local_control(intent)
+        && let Some(vessel) = checkpoint.local_control_vessel.as_ref()
+        && plan
+            .cargo_transports
+            .iter()
+            .chain(plan.device_carriers.iter())
+            .any(|code| code.eq_ignore_ascii_case(vessel))
+    {
+        plan.transport_origins
+            .insert(vessel.clone(), intent.destination.clone());
+    }
+
     checkpoint.plan = Some(plan.clone());
     checkpoint.started = true;
     context
         .advance_to("delivering", &checkpoint)
         .map_err(string_error)?;
     let operation_namespace =
-        if intent.placement_recovery.is_some() {
+        if manifest_requires_local_control(intent) {
             let workflow_id = context.id().to_string();
             Some(uuid::Uuid::parse_str(&workflow_id).map_err(|error| {
                 format!("workflow ID {workflow_id} is not a valid UUID: {error}")
@@ -5882,8 +6519,21 @@ async fn execute_logistics_manifest_plan(
             return Err(string_error(error));
         }
     };
+
+    checkpoint.delivery_complete = true;
+    checkpoint.delivery_report = Some(report.clone());
+    context
+        .persist_checkpoint(&checkpoint)
+        .map_err(string_error)?;
+
+    if manifest_requires_local_control(intent)
+        && !ensure_manifest_local_control_returned(context, client, &mut checkpoint).await?
+    {
+        return Ok(());
+    }
     context.mark_succeeded(Some(report)).map_err(string_error)
 }
+
 /// Derives the stable operation identity used for one workflow's exact
 /// recovery-device configure mutation. Length-prefixing the components keeps
 /// the identity unambiguous even if a future device-code alphabet changes.
@@ -5918,9 +6568,12 @@ fn validate_recovery_device_authority(
         .as_ref()
         .map(|status| status.as_str().to_ascii_lowercase())
         .ok_or_else(|| format!("recovery device {code} has unknown lifecycle status"))?;
-    if !matches!(status.as_str(), "idle" | "inactive" | "deactivated") {
+    if !matches!(
+        status.as_str(),
+        "idle" | "inactive" | "deactivated" | "out_of_range"
+    ) {
         return Err(format!(
-            "recovery device {code} is no longer inactive/deactivated ({status})"
+            "recovery device {code} is no longer recoverably inactive/out-of-range ({status})"
         ));
     }
     if device
@@ -7405,7 +8058,7 @@ impl WorkflowExecutor for EventCampaignWorkflow {
             claim_target(context, "event-campaign", &intent.region)?;
             let replicant = match checkpoint.replicant.clone() {
                 Some(value) => value,
-                None => resolve_replicant(&client, None).await?,
+                None => resolve_replicant(&client, intent.replicant.as_deref()).await?,
             };
             let home = match checkpoint.home.clone() {
                 Some(value) => value,
@@ -10008,6 +10661,7 @@ async fn ensure_trade_payment_ready(
                     "trade-fulfillment:{}:{}:payment",
                     intent.controller, intent.trade_code
                 ),
+                local_control_replicant: None,
             }))
             .map_err(string_error)?;
         for code in &payment_codes {
@@ -11663,6 +12317,7 @@ async fn ensure_shop_trade_criteria(
                     "director:blueprint_shop_criteria:{}:{}:{}:resources",
                     intent.device_type, shop.controller_code, shop.trade_code
                 ),
+                local_control_replicant: None,
             }))
             .map_err(string_error)?;
         checkpoint.criteria_logistics_child = Some(child.id);
@@ -11710,6 +12365,7 @@ async fn ensure_shop_trade_criteria(
                     "director:blueprint_shop_criteria:{}:{}:{}:devices",
                     intent.device_type, shop.controller_code, shop.trade_code
                 ),
+                local_control_replicant: None,
             }))
             .map_err(string_error)?;
         for code in &staged_codes {
@@ -13014,6 +13670,7 @@ async fn ensure_scan_tour_fleet_capacity(
             allow_transport_staging: true,
             region: None,
             purpose: format!("scan-tour-fleet:{}", context.id()),
+            local_control_replicant: None,
         }))
         .map_err(string_error)?;
     for code in &printed_codes {
@@ -13755,10 +14412,8 @@ pub(crate) fn validate_placement_recovery_intent(
                 .to_owned(),
         );
     }
-    if !intent.return_transports || !intent.allow_transport_staging {
-        return Err(
-            "placement recovery requires return_transports and allow_transport_staging".to_owned(),
-        );
+    if !intent.return_transports {
+        return Err("placement recovery requires return_transports".to_owned());
     }
     if intent.device_codes.len() != 1
         || !strictly_sorted_unique(&intent.device_codes)
@@ -13957,6 +14612,15 @@ pub(crate) fn placement_recovery_metadata_matches_snapshot(
 fn validate_regional_dispatch(intent: &RegionalDispatchIntent) -> Result<(), String> {
     if intent.source.trim().is_empty() || intent.destination.trim().is_empty() {
         return Err("regional dispatch requires a source hub and destination".to_owned());
+    }
+    if let Some(tag) = intent.print_tag.as_deref() {
+        let tag = tag.trim();
+        if tag.is_empty() {
+            return Err("regional dispatch print tag must not be blank".to_owned());
+        }
+        if tag.chars().count() > 32 {
+            return Err("regional dispatch print tag must not exceed 32 characters".to_owned());
+        }
     }
     if intent.resources.values().any(|quantity| *quantity <= 0)
         || intent.devices.iter().any(|request| request.quantity <= 0)
@@ -14431,6 +15095,23 @@ fn regional_dispatch_deficit_message(requests: &[PrintRequest]) -> String {
     format!("regional dispatch missing {missing} devices; printing {details}")
 }
 
+fn regional_dispatch_print_tags(
+    intent: &RegionalDispatchIntent,
+    checkpoint: &RegionalDispatchCheckpoint,
+) -> Vec<String> {
+    let mut tags = vec![checkpoint.print_tag.clone()];
+    if let Some(tag) = intent
+        .print_tag
+        .as_deref()
+        .map(str::trim)
+        .filter(|tag| !tag.is_empty())
+        && !tags.iter().any(|current| current == tag)
+    {
+        tags.push(tag.to_owned());
+    }
+    tags
+}
+
 async fn manufacture_regional_dispatch(
     context: &mut WorkflowContext,
     client: &Client,
@@ -14438,8 +15119,9 @@ async fn manufacture_regional_dispatch(
     checkpoint: &mut RegionalDispatchCheckpoint,
 ) -> Result<bool, String> {
     if !checkpoint.print_requests.is_empty() {
+        let print_tags = regional_dispatch_print_tags(intent, checkpoint);
         let mut options = QueueOptions::at(intent.source.clone());
-        options.tags = vec![checkpoint.print_tag.clone()];
+        options.tags = print_tags.clone();
         options.wait_timeout = Duration::from_secs(DEFAULT_WAIT_SECONDS);
         queue_prints_with_components(client, &checkpoint.print_requests, &options)
             .await
@@ -14449,7 +15131,7 @@ async fn manufacture_regional_dispatch(
                 client,
                 &intent.source,
                 &checkpoint.print_requests,
-                std::slice::from_ref(&checkpoint.print_tag),
+                &print_tags,
             )
             .await
             .map_err(string_error)?;
@@ -14731,6 +15413,10 @@ fn manifest_delivery_request(intent: &LogisticsManifestIntent) -> DeliveryReques
         device_codes: intent.device_codes.clone(),
         device_tags: intent.device_tags.clone(),
         carrier: None,
+        // Local-control manifests establish onsite authority before this request
+        // is planned, so normal transport staging is safe after that boundary.
+        // Cargo demand can therefore bring in a cargo freighter and device
+        // recovery can stage an attachment-capable carrier when needed.
         allow_transport_staging: intent.allow_transport_staging,
     }
 }
@@ -17467,6 +18153,7 @@ mod tests {
         }))
         .expect("legacy manifest");
         assert!(legacy.placement_recovery.is_none());
+        assert!(legacy.local_control_replicant.is_none());
 
         let provenance = WorkflowPlacementProvenance {
             workflow_id: WorkflowId::new(),
@@ -17493,6 +18180,8 @@ mod tests {
             ..LogisticsManifestIntent::default()
         };
         validate_placement_recovery_intent(&intent).expect("valid recovery metadata");
+        assert!(manifest_requires_local_control(&intent));
+        assert!(manifest_delivery_request(&intent).allow_transport_staging);
 
         intent.device_codes = vec!["device-1".to_owned()];
         assert!(
@@ -17510,6 +18199,13 @@ mod tests {
         }))
         .expect("legacy logistics checkpoint");
         assert!(checkpoint.placement_recovery_cleanup.is_empty());
+        assert!(checkpoint.local_control_replicant.is_none());
+        assert!(checkpoint.local_control_vessel.is_none());
+        assert!(checkpoint.local_control_home.is_none());
+        assert!(checkpoint.local_control_origin_system.is_none());
+        assert!(!checkpoint.delivery_complete);
+        assert!(checkpoint.delivery_report.is_none());
+        assert!(!checkpoint.local_control_returned);
 
         let checkpoint = LogisticsWorkflowCheckpoint {
             placement_recovery_cleanup: BTreeMap::from([(
@@ -19074,6 +19770,79 @@ mod tests {
         }
     }
 
+    async fn seed_recovery_local_control(
+        server: &MockServer,
+        client: &Client,
+        repository: &WorkflowRepository,
+    ) {
+        const WORKER: &str = "RECOVERY-REP";
+        const VESSEL: &str = "RECOVERY-REP-VESSEL";
+
+        repository
+            .put_document(
+                "director.replicant",
+                WORKER,
+                &serde_json::json!({"region": "alpha"}),
+            )
+            .expect("recovery Replicant region assignment");
+
+        Mock::given(method("GET"))
+            .and(path("/v1/stars"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "generated_at": "2026-09-06T00:00:00Z",
+                "total": 1,
+                "stars": [{
+                    "designation": "ALPHA",
+                    "region": "alpha",
+                    "position": {"x": 0.0, "y": 0.0, "z": 0.0}
+                }]
+            })))
+            .expect(1)
+            .mount(server)
+            .await;
+        client
+            .galaxy()
+            .refresh_catalogue()
+            .await
+            .expect("seed recovery catalogue");
+
+        Mock::given(method("GET"))
+            .and(path(format!("/v1/replicants/{WORKER}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "replicant_code": WORKER,
+                "hosted_device_code": VESSEL,
+                "location": "ALPHA-BELT-1",
+                "status": "stationary"
+            })))
+            .expect(1)
+            .mount(server)
+            .await;
+        client
+            .replicants()
+            .get_owned(WORKER)
+            .await
+            .expect("seed recovery Replicant");
+
+        Mock::given(method("GET"))
+            .and(path(format!("/v1/devices/{VESSEL}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "device_code": VESSEL,
+                "device_type": "heaven_vessel",
+                "replicant_code": WORKER,
+                "hosting_replicant": WORKER,
+                "location": "ALPHA-BELT-1",
+                "status": "idle"
+            })))
+            .expect(1)
+            .mount(server)
+            .await;
+        client
+            .devices()
+            .get(VESSEL)
+            .await
+            .expect("seed recovery vessel");
+    }
+
     fn recovery_test_intent(
         provenance: WorkflowPlacementProvenance,
         tag: &str,
@@ -19298,6 +20067,7 @@ mod tests {
 
         let client = test_client_at(&server).await;
         let repository = Arc::new(WorkflowRepository::open_in_memory().expect("repository"));
+        seed_recovery_local_control(&server, &client, &repository).await;
         let provenance = seed_failed_recovery_source(&repository, "mine-m:DEVICE-1");
         let workflow = repository
             .create(NewWorkflow {
@@ -19400,6 +20170,7 @@ mod tests {
         std::fs::create_dir_all(&directory).expect("recovery cleanup test directory");
         let database = directory.join("workflow.sqlite");
         let repository = Arc::new(WorkflowRepository::open(&database).expect("repository"));
+        seed_recovery_local_control(&server, &client, &repository).await;
         let provenance = seed_failed_recovery_source(&repository, "mine-m:DEVICE-1");
         let workflow = repository
             .create(NewWorkflow {
@@ -19551,6 +20322,8 @@ mod tests {
                 .status,
             WorkflowStatus::Failed
         );
+
+        seed_recovery_local_control(&server, &client, &repository).await;
 
         let failed_provenance = WorkflowPlacementProvenance {
             workflow_id: failed.id,
@@ -19758,6 +20531,25 @@ mod tests {
                 "racing_vessel",
                 "heaven_vessel",
                 "cargo_vessel"
+            ]
+        );
+    }
+
+    #[test]
+    fn regional_dispatch_prints_keep_internal_and_operator_tags() {
+        let intent = RegionalDispatchIntent {
+            print_tag: Some("regional-stock:delta".to_owned()),
+            ..RegionalDispatchIntent::default()
+        };
+        let checkpoint = RegionalDispatchCheckpoint {
+            print_tag: "dispatch:12345678".to_owned(),
+            ..RegionalDispatchCheckpoint::default()
+        };
+        assert_eq!(
+            regional_dispatch_print_tags(&intent, &checkpoint),
+            vec![
+                "dispatch:12345678".to_owned(),
+                "regional-stock:delta".to_owned()
             ]
         );
     }

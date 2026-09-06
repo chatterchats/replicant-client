@@ -3603,6 +3603,7 @@ h1 {
 
 .manifest-builder {
   display: grid;
+  min-width: 0;
   gap: 10px;
   margin: 0 0 18px;
   padding: 14px;
@@ -3614,6 +3615,11 @@ h1 {
   color: rgba(255, 255, 255, 0.8);
   font-weight: 700;
 }
+.form-grid > .manifest-builder {
+  grid-column: 1 / -1;
+  width: 100%;
+  margin-bottom: 0;
+}
 .manifest-row {
   display: grid;
   grid-template-columns:
@@ -3621,6 +3627,9 @@ h1 {
     auto;
   gap: 8px;
   align-items: center;
+}
+.manifest-parameter-row {
+  grid-template-columns: minmax(0, 1fr) minmax(88px, 120px) auto;
 }
 .manifest-row input,
 .manifest-row select {

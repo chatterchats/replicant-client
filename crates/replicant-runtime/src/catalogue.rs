@@ -1645,6 +1645,19 @@ fn validate_regional_dispatch_parameters(
         }
     }
     let intent = decode::<RegionalDispatchIntent>(values.clone())?;
+    if let Some(tag) = intent.print_tag.as_deref() {
+        let tag = tag.trim();
+        if tag.is_empty() {
+            return Err(CatalogueError::Invalid(
+                "regional dispatch print tag must not be blank".to_owned(),
+            ));
+        }
+        if tag.chars().count() > 32 {
+            return Err(CatalogueError::Invalid(
+                "regional dispatch print tag must not exceed 32 characters".to_owned(),
+            ));
+        }
+    }
     if intent.resources.values().any(|quantity| *quantity <= 0) {
         return Err(CatalogueError::Invalid(
             "resource quantities must be positive integers".to_owned(),
@@ -3225,6 +3238,15 @@ fn workflow_descriptors() -> Vec<WorkflowDescriptor> {
                     ParameterKind::DeviceManifest,
                     serde_json::json!([]),
                 ),
+                {
+                    let mut parameter =
+                        optional("print_tag", "Print tag", ParameterKind::Tag);
+                    parameter.description =
+                        "Optional tag applied at print time to every device manufactured for this dispatch. Existing reused stock is left unchanged."
+                            .to_owned();
+                    parameter.validation.max_length = Some(32);
+                    parameter
+                },
             ],
             supported_triggers: all_trigger_kinds(),
         },
@@ -4850,6 +4872,7 @@ mod tests {
             Some(&&ParameterKind::ResourceManifest)
         );
         assert_eq!(kinds.get("devices"), Some(&&ParameterKind::DeviceManifest));
+        assert_eq!(kinds.get("print_tag"), Some(&&ParameterKind::Tag));
         for name in ["racing_vessels", "heaven_vessels", "cargo_vessels"] {
             assert_eq!(kinds.get(name), Some(&&ParameterKind::Integer));
         }
@@ -4870,12 +4893,35 @@ mod tests {
                         "devices".to_owned(),
                         serde_json::json!([{"device_type": "mining_drone", "quantity": 2}]),
                     ),
+                    (
+                        "print_tag".to_owned(),
+                        serde_json::json!("regional-stock:delta"),
+                    ),
                 ]),
                 false,
             )
             .expect("structured regional dispatch should validate");
         assert_eq!(validated["heaven_vessels"], serde_json::json!(0));
         assert_eq!(validated["cargo_vessels"], serde_json::json!(0));
+        assert_eq!(
+            validated["print_tag"],
+            serde_json::json!("regional-stock:delta")
+        );
+
+        let error = catalogue
+            .validate(
+                OperationClass::Workflow,
+                regional_dispatch_workflow_kind().as_str(),
+                BTreeMap::from([
+                    ("source".to_owned(), serde_json::json!("HUB-1")),
+                    ("destination".to_owned(), serde_json::json!("TARGET-1")),
+                    ("racing_vessels".to_owned(), serde_json::json!(1)),
+                    ("print_tag".to_owned(), serde_json::json!("x".repeat(33))),
+                ]),
+                false,
+            )
+            .expect_err("overlong print tag should be rejected");
+        assert!(error.to_string().contains("must not exceed 32 characters"));
     }
 
     #[test]

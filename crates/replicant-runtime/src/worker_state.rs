@@ -8,15 +8,15 @@ pub(crate) const OPERATIONAL_REGIONAL_WORKER_CAPABILITY: &str = "operational_reg
 /// Current reason a regional worker cannot be dispatched.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum WorkerState {
-    /// Assigned, unclaimed, stationary, and physically located with its racing vessel.
+    /// Assigned, unclaimed, stationary, and physically located with a supported worker vessel.
     Operational,
-    /// The Replicant or its racing vessel is currently travelling.
+    /// The Replicant or its hosted worker vessel is currently travelling.
     InTransit,
     /// A durable workflow already owns the Replicant.
     Busy,
     /// The assignment does not match the requested region.
     WrongRegion,
-    /// No hosted racing vessel is known.
+    /// No supported hosted worker vessel is known.
     MissingVessel,
     /// The hosted vessel lacks an authoritative current location.
     UnknownLocation,

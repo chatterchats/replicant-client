@@ -252,9 +252,12 @@ The initial standing goals are intentionally batch-oriented rather than one-goal
   non-hub mining systems receive System Wards, prioritized dense over moderate over sparse and then
   by distance, while active System Hubs satisfy protection without consuming those ward slots.
   Existing in-range sites are audited for missing hardware, controller directives, adoption
-  relationships, and protection. When a hub makes a ward redundant or a higher-density belt
-  displaces a lower-density allocation, the Director reuses the existing ward before launching the
-  repair/expansion campaign.
+  relationships, protection, and AMI transport service back to the exact regional hub. Mining-site
+  deployment/repair takes precedence over transport-service repair; once a producing site is healthy,
+  missing compatible `AmiTransportRouteIntent` service is adopted or launched through the existing
+  durable `mining.campaign` machinery. Transport-service authority is resolved before optional ward
+  relocation. When a hub makes a ward redundant or a higher-density belt displaces a lower-density
+  allocation, the Director reuses the existing ward before launching the repair/expansion campaign.
 - **Event Completion** batches active regional events into campaign planning, staging, routing,
   and completion.
 - **Expand FTL Network** prioritizes strategic event, mining, and explicit connectivity targets
@@ -263,6 +266,28 @@ The initial standing goals are intentionally batch-oriented rather than one-goal
 - **Establish Beacons** remains disabled by default until its autonomous placement/scoring policy
   is implemented. Explicit frontier, relay, event, and bootstrap workflows remain available in the
   meantime.
+- **Asteroid Diversion** remains disabled by default while its event-driven diversion mechanics are
+  operator-proven. A diversion reserves the regional Autofactory and occurrence resources actually
+  required by the campaign rather than parking a regional Replicant for the life of the asteroid.
+  Propulsor print tags use a compact deterministic `ast-div:` identity that fits the server tag limit.
+  Propulsor sizing is an explicitly versioned Director planning heuristic, and completion still
+  requires terminal occurrence evidence rather than merely observing deployed hardware.
+- **Stranded Device Recovery** remains disabled by default and retains the conservative failed-placement
+  provenance/census checks used to prove that an exact device is safe to recover. Its execution path is
+  Replicant-first: a local-control `logistics.manifest` claims a region-assigned Replicant and hosted
+  vessel, travels that authority to the disconnected origin before cleanup or pickup, re-reads the exact
+  device, then either commands a travel-capable device home directly or uses normal carrier logistics.
+  Once local authority is established, ordinary transport staging is allowed: non-travel-capable device
+  recovery can bring in an attachment-capable carrier rather than requiring the Replicant's cradle vessel
+  to carry the payload. Delivery completion is checkpointed before the Replicant returns so restart
+  recovery cannot replay the shipment.
+- **Unserviced Resources** remains disabled by default and means one-shot recovery of positive regional
+  resource stock outside the regional hub system and outside systems already in the managed mining
+  footprint. Candidates are prioritized by recoverable quantity and dispatched through a Replicant-led
+  local-control `logistics.manifest`. After the Replicant establishes authority at the source, the normal
+  transport planner stages cargo-capable transport (for example a cargo freighter) to collect the stock,
+  deliver it to the exact regional hub, and return borrowed transport while the Replicant returns home.
+  Persistent AMI transport-route maintenance belongs to **Expand Mining Ops**, not this goal.
 
 ### Regions and worker ownership
 
@@ -270,7 +295,10 @@ A Replicant may be permanently assigned to an operating region. The Director aut
 an initial assignment from live location when a Replicant has no saved assignment, but it never
 automatically moves or clears an existing assignment. Regional campaign planners only consume
 workers assigned to that region, preventing normal automation from sending an Alpha worker across
-the galaxy to service Beta work merely because it is momentarily idle.
+the galaxy to service Beta work merely because it is momentarily idle. `racing_vessel` and
+`heaven_vessel` cradles both qualify as operational regional worker vessels. General/event and
+local-control work prefers an idle Heaven vessel when available so the faster Racing vessels remain
+free for catalogue, survey, FTL, and other speed-sensitive work that explicitly requires them.
 
 Cross-region movement remains an explicit workflow/operator concern. Region aliases are
 canonicalized at the Director boundary, while previously unknown future region names remain valid

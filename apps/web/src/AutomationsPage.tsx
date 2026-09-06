@@ -410,7 +410,7 @@ function ManifestField({
     <fieldset className="manifest-builder">
       <legend>{parameter.label}</legend>
       {entries.map((entry) => (
-        <div className="manifest-row" key={entry.id}>
+        <div className="manifest-row manifest-parameter-row" key={entry.id}>
           <input
             aria-label={devices ? "Device type" : "Resource type"}
             list={

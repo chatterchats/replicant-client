@@ -32,8 +32,6 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::worker_state::OPERATIONAL_REGIONAL_WORKER_CAPABILITY;
-
 const WORKFLOW_NAME: &str = "asteroid.diversion";
 const OBJECTIVE: &str = "Divert incoming asteroids threatening regional systems";
 const PRIORITY: u64 = 800;
@@ -233,6 +231,22 @@ pub fn asteroid_occurrence_id(
         impact_target,
         impact_eta,
     )
+}
+
+/// Builds the deterministic manufacturing tag for one asteroid occurrence.
+/// Replicant Space device tags are capped at 32 characters.
+fn asteroid_print_tag(occurrence_id: &str) -> String {
+    const PREFIX: &str = "ast-div:";
+    const HASH_CHARS: usize = 32 - PREFIX.len();
+    let mut hasher = Sha256::new();
+    hasher.update(b"replicant.asteroid-diversion.print-tag.v1\0");
+    hasher.update(occurrence_id.trim().as_bytes());
+    let digest = hasher.finalize();
+    let suffix = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("{PREFIX}{}", &suffix[..HASH_CHARS])
 }
 
 /// Computes an occurrence identity using the frozen length-delimited tuple.
@@ -660,7 +674,11 @@ pub async fn observe_asteroid(
     })
 }
 
-/// Computes required active plates under the explicit one-propulsor/one-plate policy.
+/// Versioned Director planning heuristic used to size active propulsors.
+/// This is operational policy, not a protocol-level physical law.
+pub const ASTEROID_SIZING_POLICY_VERSION: &str = "strength-per-hour-plus-two-v1";
+
+/// Computes required active plates under the versioned Director planning heuristic.
 pub fn required_active_plates(
     observation: &AsteroidObservation,
     now_ms: i64,
@@ -777,24 +795,14 @@ pub(crate) fn asteroid_diversion_item_specs(
                     "impact_eta": occurrence.impact_eta,
                 }),
                 preconditions_json: json!([]),
-                requirements_json: serde_json::to_value([
-                    ResourceRequirement {
-                        key: "worker".into(),
-                        kind: "replicant".into(),
-                        capabilities: vec![OPERATIONAL_REGIONAL_WORKER_CAPABILITY.into()],
-                        scope: RequirementScope::Region(region.to_owned()),
-                        count: 1,
-                        quantity: 1,
-                    },
-                    ResourceRequirement {
-                        key: "autofactory".into(),
-                        kind: "autofactory".into(),
-                        capabilities: Vec::new(),
-                        scope: RequirementScope::Region(region.to_owned()),
-                        count: 1,
-                        quantity: 1,
-                    },
-                ])
+                requirements_json: serde_json::to_value([ResourceRequirement {
+                    key: "autofactory".into(),
+                    kind: "autofactory".into(),
+                    capabilities: Vec::new(),
+                    scope: RequirementScope::Region(region.to_owned()),
+                    count: 1,
+                    quantity: 1,
+                }])
                 .unwrap_or_else(|_| json!([])),
                 deadline_at_ms: eta,
             })
@@ -1003,6 +1011,7 @@ async fn execute_asteroid_item(
             .map_err(|error| error.to_string())?;
         let result = json!({
             "occurrence_id": occurrence.occurrence_id,
+            "sizing_policy": ASTEROID_SIZING_POLICY_VERSION,
             "lifecycle": lifecycle,
             "proof": match lifecycle {
                 AsteroidLifecycle::Diverted => Some("diversion.diverted"),
@@ -1073,15 +1082,6 @@ async fn execute_asteroid_item(
         .acquire_claim(occurrence_claim.clone())
         .map_err(|error| error.to_string())?;
 
-    let worker = allocations
-        .by_requirement
-        .get("worker")
-        .and_then(|rows| rows.first())
-        .and_then(|allocation| match &allocation.resource {
-            ResourceKey::Replicant(code) => Some(code.clone()),
-            _ => None,
-        })
-        .ok_or_else(|| "asteroid item omitted worker allocation".to_owned())?;
     let factory_codes = allocations
         .by_requirement
         .get("autofactory")
@@ -1092,13 +1092,13 @@ async fn execute_asteroid_item(
             _ => None,
         })
         .collect::<BTreeSet<_>>();
-    let assignment = format!("diversion:{}:{worker}", occurrence.occurrence_id);
+    let assignment = format!("diversion:{}", occurrence.occurrence_id);
     repository
         .assign_work_item(
             item.id,
             item.state.revision,
             &assignment,
-            &ResourceKey::Replicant(worker.clone()),
+            &occurrence_claim,
             unix_millis(),
         )
         .map_err(|error| error.to_string())?;
@@ -1106,7 +1106,7 @@ async fn execute_asteroid_item(
         .start_work_item(
             item.id,
             item.state.revision,
-            &worker,
+            "asteroid-diversion",
             &assignment,
             unix_millis(),
         )
@@ -1119,6 +1119,7 @@ async fn execute_asteroid_item(
     if observation.impact_eta_ms <= now_ms {
         let result = json!({
             "occurrence_id": occurrence.occurrence_id,
+            "sizing_policy": ASTEROID_SIZING_POLICY_VERSION,
             "lifecycle": AsteroidLifecycle::Expired,
         });
         checkpoint
@@ -1229,7 +1230,7 @@ async fn execute_asteroid_item(
         item_checkpoint.stage = AsteroidDiversionStage::Printing;
         let tag = item_checkpoint
             .print_tag
-            .get_or_insert_with(|| format!("asteroid-diversion:{}", occurrence.occurrence_id))
+            .get_or_insert_with(|| asteroid_print_tag(&occurrence.occurrence_id))
             .clone();
         checkpoint
             .print_tags
@@ -1536,6 +1537,7 @@ async fn execute_asteroid_item(
         AsteroidLifecycle::Diverted => {
             let result = json!({
                 "occurrence_id": occurrence.occurrence_id,
+                "sizing_policy": ASTEROID_SIZING_POLICY_VERSION,
                 "proof": "diversion.diverted",
                 "devices": active,
             });
@@ -1555,6 +1557,7 @@ async fn execute_asteroid_item(
         AsteroidLifecycle::Impacted | AsteroidLifecycle::Expired => {
             let result = json!({
                 "occurrence_id": occurrence.occurrence_id,
+                "sizing_policy": ASTEROID_SIZING_POLICY_VERSION,
                 "lifecycle": lifecycle,
                 "devices": active,
             });
@@ -2282,7 +2285,7 @@ mod tests {
     }
 
     #[test]
-    fn work_items_require_an_operational_regional_worker() {
+    fn work_items_require_only_the_autofactory_the_mechanics_use() {
         let detections = vec![detection(
             "1000-0",
             "2026-07-30T12:00:00Z",
@@ -2296,10 +2299,26 @@ mod tests {
             asteroid_diversion_item_specs(WorkflowId::new(), &occurrences, "alpha", "SCEPTURUM-7")
                 .expect("asteroid work item");
 
-        assert_eq!(
-            specs[0].requirements_json[0]["capabilities"],
-            json!([OPERATIONAL_REGIONAL_WORKER_CAPABILITY])
-        );
+        let requirements = specs[0]
+            .requirements_json
+            .as_array()
+            .expect("requirements array");
+        assert_eq!(requirements.len(), 1);
+        assert_eq!(requirements[0]["kind"], json!("autofactory"));
+        assert_eq!(requirements[0]["capabilities"], json!([]));
+    }
+
+    #[test]
+    fn asteroid_print_tag_is_compact_and_deterministic() {
+        let occurrence = "very-long-occurrence-identity-that-would-never-fit-in-a-device-tag";
+        let first = asteroid_print_tag(occurrence);
+        let second = asteroid_print_tag(occurrence);
+        let different = asteroid_print_tag("another-occurrence");
+
+        assert_eq!(first, second);
+        assert_ne!(first, different);
+        assert!(first.starts_with("ast-div:"));
+        assert!(first.chars().count() <= 32);
     }
 
     #[test]
