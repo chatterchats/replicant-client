@@ -434,7 +434,7 @@ export function MessagesContent({
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
   const [markingRead, setMarkingRead] = useState(false);
   const [markReadError, setMarkReadError] = useState<string | null>(null);
-  const inbox = data?.inbox ?? [];
+  const inbox = useMemo(() => data?.inbox ?? [], [data?.inbox]);
 
   const messageTypes = useMemo(
     () =>
