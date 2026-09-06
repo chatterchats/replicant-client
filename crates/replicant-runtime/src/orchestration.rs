@@ -3934,12 +3934,7 @@ fn reconcile_maintain_system_hubs(
     let mut hubs = devices
         .iter()
         .filter(|device| device.device_type.as_ref() == Some(&DeviceType::SystemHub))
-        .filter(|device| {
-            device
-                .status
-                .as_ref()
-                .is_some_and(|status| status.as_str() == "active")
-        })
+        .filter(|device| relay_device_is_active(device))
         .filter_map(|device| {
             let system = device_system(device, location_systems)?;
             let belongs = system_regions
@@ -10295,6 +10290,55 @@ mod tests {
         assert_eq!(
             shop_opportunities_for(&snapshot, &DeviceType::from("system_hub")).count(),
             0
+        );
+    }
+
+    #[test]
+    fn maintain_system_hubs_counts_relaying_hub_as_operational() {
+        let repository = WorkflowRepository::open_in_memory().expect("workflow repository");
+        let workflows = Vec::new();
+        let controls = GoalControls::default();
+        let context = GoalReconcileContext {
+            repository: &repository,
+            workflows: &workflows,
+            controls: &controls,
+            automatic: true,
+            now: 0,
+        };
+        let region = RegionView {
+            region: "alpha".to_owned(),
+            status: DirectorRegionStatus::Established,
+            hub_system: Some("SCEPTURUM".to_owned()),
+            hub_location: Some("SCEPTURUM-BELT-1".to_owned()),
+            known_systems: BTreeSet::from(["SCEPTURUM".to_owned()]),
+        };
+        let regions = BTreeMap::from([("alpha".to_owned(), region.clone())]);
+        let mut hub = test_hub_device();
+        hub.status = Some(replicant_client::DeviceStatus::from("relaying"));
+        let location_systems =
+            BTreeMap::from([("SCEPTURUM-7-L4".to_owned(), "SCEPTURUM".to_owned())]);
+        let system_regions =
+            BTreeMap::from([("SCEPTURUM".to_owned(), "alpha".to_owned())]);
+
+        let summary = reconcile_maintain_system_hubs(
+            &context,
+            &region,
+            &regions,
+            &[hub],
+            &[],
+            &[],
+            &BTreeMap::new(),
+            &location_systems,
+            &system_regions,
+        )
+        .expect("reconcile System Hub maintenance");
+
+        assert_eq!(summary.status, DirectorGoalStatus::Satisfied);
+        assert_eq!(summary.progress_current, 1);
+        assert_eq!(summary.progress_total, 1);
+        assert_eq!(
+            summary.next_action.as_deref(),
+            Some("Keep observing reported hub upkeep requirements")
         );
     }
 
