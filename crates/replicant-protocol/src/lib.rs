@@ -404,6 +404,54 @@ pub struct DirectorMiningPolicySummary {
     pub expand_sparse: bool,
 }
 
+/// Observed backlog at one exact mining collection belt.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DirectorMiningBacklogSummary {
+    /// Exact collection location.
+    pub location: String,
+    /// Resource units awaiting collection.
+    pub quantity: i64,
+}
+
+/// Observed regional Mining Ops health, separate from expansion policy.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DirectorMiningOpsSummary {
+    /// Canonical Director region.
+    pub region: String,
+    /// Operational exact-belt managed mining sites.
+    pub healthy_sites: usize,
+    /// Managed exact-belt sites within the regional footprint.
+    pub total_sites: usize,
+    /// Structurally healthy routes with required FTL connectivity.
+    pub healthy_routes: usize,
+    /// Required routes from managed sites to the regional hub.
+    pub total_routes: usize,
+    /// Distinct usable Cargo Freighters adopted by these routes.
+    pub active_cargo_freighters: usize,
+    /// Routes with positive observed collection inventory.
+    pub backlogged_routes: usize,
+    /// Largest observed collection inventory; absent when none is known.
+    pub worst_backlog: Option<DirectorMiningBacklogSummary>,
+    /// Whether every route has authoritative collection inventory.
+    pub backlog_known: bool,
+    /// Remote sites with healthy patrol maintenance, not due for rotation.
+    pub healthy_remote_maintenance: usize,
+    /// Managed sites outside the exact manufacturing/home belt.
+    pub total_remote_sites: usize,
+    /// Unclaimed replacement-ready hub patrol drones; absent without an exact home.
+    pub hub_ready: Option<usize>,
+    /// Client-policy hard minimum for the healthy hub patrol pool.
+    pub hub_minimum: usize,
+    /// Client-policy target for the healthy hub patrol pool.
+    pub hub_target: usize,
+    /// Selected priority systems currently protected by a System Ward.
+    pub priority_protected: usize,
+    /// Selected priority systems under the existing regional ward policy.
+    pub priority_target: usize,
+    /// Eligible unmanaged systems considered for expansion.
+    pub expansion_candidates: usize,
+}
+
 /// Parallelism policy for one region's Enhance Star Catalogue goal.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DirectorCataloguePolicySummary {
@@ -592,6 +640,9 @@ pub struct DirectorSnapshot {
     /// Per-region density policy for the mining-expansion goal.
     #[serde(default)]
     pub mining_policies: Vec<DirectorMiningPolicySummary>,
+    /// Observed regional Mining Ops health; absent in legacy snapshots.
+    #[serde(default)]
+    pub mining_ops: Vec<DirectorMiningOpsSummary>,
     /// Per-region parallelism policy for Enhance Star Catalogue.
     #[serde(default)]
     pub catalogue_policies: Vec<DirectorCataloguePolicySummary>,

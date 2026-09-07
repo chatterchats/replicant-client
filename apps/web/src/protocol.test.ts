@@ -407,6 +407,7 @@ describe("parseDirectorResponse", () => {
     });
     expect(legacy.payload.goals).toEqual([]);
     expect(legacy.payload.mining_policies).toEqual([]);
+    expect(legacy.payload.mining_ops).toEqual([]);
     expect(legacy.payload.catalogue_policies).toEqual([]);
     expect(legacy.payload.requirements).toEqual([]);
     expect(legacy.payload.workforce).toMatchObject({
@@ -437,6 +438,40 @@ describe("parseDirectorResponse", () => {
       },
     });
     expect(legacyWithGoal.payload.goals[0]?.kind).toBe("expand_mining_ops");
+    const miningHealth = {
+      region: "beta",
+      healthy_sites: 6,
+      total_sites: 6,
+      healthy_routes: 5,
+      total_routes: 6,
+      active_cargo_freighters: 9,
+      backlogged_routes: 1,
+      worst_backlog: { location: "KHIKHKUWU-BELT-1", quantity: 54979 },
+      backlog_known: true,
+      healthy_remote_maintenance: 5,
+      total_remote_sites: 6,
+      hub_ready: null,
+      hub_minimum: 2,
+      hub_target: 3,
+      priority_protected: 4,
+      priority_target: 4,
+      expansion_candidates: 3,
+    };
+    const withHealth = parseDirectorResponse({
+      protocol_version: 1,
+      payload: { ...base, mining_ops: [miningHealth] },
+    });
+    expect(withHealth.payload.mining_ops).toEqual([miningHealth]);
+    expect(withHealth.payload.mining_policies).toEqual([]);
+    expect(() =>
+      parseDirectorResponse({
+        protocol_version: 1,
+        payload: {
+          ...base,
+          mining_ops: [{ ...miningHealth, healthy_routes: "5" }],
+        },
+      }),
+    ).toThrow("healthy mining routes");
 
     const parsed = parseDirectorResponse({
       protocol_version: 1,

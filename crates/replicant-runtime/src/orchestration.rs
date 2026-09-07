@@ -235,6 +235,8 @@ struct GoalRuntime {
     launch_records: Vec<GoalLaunchRecord>,
     #[serde(default)]
     prospect_exhausted_signature: Option<String>,
+    #[serde(default)]
+    mining_priority: Option<MiningOpsPriority>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -696,6 +698,7 @@ pub fn cached_director_snapshot(
                 regions: Vec::new(),
                 goals,
                 mining_policies: Vec::new(),
+                mining_ops: Vec::new(),
                 catalogue_policies: Vec::new(),
                 replicants: Vec::new(),
                 requirements: load_requirement_summaries(repository)?,
@@ -1743,6 +1746,22 @@ pub async fn reconcile_director(
         repository.as_ref(),
         region_summaries.iter().map(|region| region.region.as_str()),
     )?;
+    let mining_ops = established_regions
+        .iter()
+        .map(|region| {
+            mining_ops_summary(
+                repository.as_ref(),
+                region,
+                &devices,
+                &catalogue,
+                &locations,
+                &inventories,
+                &location_systems,
+                &system_regions,
+                resource_authority_complete,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let requirement_summaries = requirements.persist(&repository)?;
 
     tracing::info!(
@@ -1768,6 +1787,7 @@ pub async fn reconcile_director(
         regions: region_summaries,
         goals,
         mining_policies,
+        mining_ops,
         catalogue_policies,
         replicants: workers
             .into_iter()
@@ -6402,7 +6422,7 @@ impl MiningTransportCapacityPriority {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
 enum MiningOpsPriority {
     ActiveWorkflow,
     BrokenProductiveStack,
@@ -7212,9 +7232,29 @@ async fn reconcile_expand_mining(
         quiet_time_optimization: capacity_priority
             == Some(MiningTransportCapacityPriority::QuietOptimization),
     });
+    let critical_backlog = !critical_backlogs.is_empty()
+        || capacity_priority == Some(MiningTransportCapacityPriority::CriticalBacklog);
+    if enabled && runtime.mining_priority != Some(priority) {
+        tracing::info!(
+            region = %region.region,
+            priority = ?priority,
+            healthy_hub_pool = ?hub_pool_available_healthy,
+            expansion_candidates = pending_expansion.len(),
+            expansion_suppression_reason = if critical_backlog {
+                "critical_backlog"
+            } else if higher_priority_mining_faults {
+                "existing_operations_unhealthy"
+            } else if priority == MiningOpsPriority::ConnectivityProtection {
+                "connectivity_or_priority_protection"
+            } else { "none" },
+            critical_backlog,
+            "Mining Ops priority changed"
+        );
+        runtime.mining_priority = Some(priority);
+    }
     let recently_launched = launch_is_recent(&runtime, now, DEFAULT_RETRY_COOLDOWN_MS);
     let mut blocker = None;
-    let next_action;
+    let mut next_action;
 
     let status = if !enabled {
         next_action = Some(
@@ -7223,10 +7263,13 @@ async fn reconcile_expand_mining(
         );
         DirectorGoalStatus::Waiting
     } else if priority == MiningOpsPriority::ActiveWorkflow {
-        next_action = Some(
-            "Continue the compatible active Mining Ops workflow instead of creating duplicate work"
-                .to_owned(),
-        );
+        next_action = active
+            .iter()
+            .filter_map(|id| workflows.iter().find(|workflow| workflow.id == *id))
+            .find_map(mining_workflow_next_action)
+            .or_else(|| {
+                Some("Continue the active Mining Ops repair or deployment campaign".to_owned())
+            });
         DirectorGoalStatus::Active
     } else if matches!(
         priority,
@@ -7634,6 +7677,11 @@ async fn reconcile_expand_mining(
                 collect = %capacity.route.collect,
                 deliver = %capacity.route.deliver,
                 target_freighters = capacity.target_freighters,
+                current_freighters = current,
+                backlog_loads = loads,
+                autoscale_action = if capacity.target_freighters > current { "scale_up" } else { "scale_down" },
+                autoscale_reason = ?capacity.priority,
+                throughput_insufficient = capacity.throughput_insufficient,
                 backlog_units = capacity.backlog_units,
                 created = result.created,
                 "Director reconciled AMI mining transport capacity"
@@ -7731,6 +7779,13 @@ async fn reconcile_expand_mining(
         });
         DirectorGoalStatus::Satisfied
     };
+    if enabled
+        && critical_backlog
+        && (!pending_expansion.is_empty() || !incomplete_expansion_evidence.is_empty())
+        && let Some(action) = next_action.as_mut()
+    {
+        action.push_str("; expansion deferred by critical backlog");
+    }
     save_goal_runtime(repository, &id, &runtime)?;
 
     let mut density_scope = vec!["dense"];
@@ -7759,24 +7814,308 @@ async fn reconcile_expand_mining(
     })
 }
 
+fn mining_workflow_next_action(workflow: &WorkflowInstance) -> Option<String> {
+    if workflow.kind == crate::automation::mining_campaign_workflow_kind() {
+        return mining_campaign_next_action(workflow);
+    }
+    let step = workflow.current_step.as_deref().unwrap_or_default();
+    if workflow.kind == mining_maintenance_rotation_workflow_kind() {
+        let intent = workflow.config::<MiningMaintenanceRotationIntent>().ok()?;
+        let action = match step {
+            "provisioning_replacement" => "Provision replacement maintenance for",
+            "delivering_replacement" | "verifying_replacement_delivery" => {
+                "Deliver replacement maintenance to"
+            }
+            "waiting_for_replacement_patrol" | "waiting_for_replacement_patrol_repair" => {
+                "Verify replacement patrol before removing worn maintenance at"
+            }
+            "recovering_worn_drone" | "verifying_worn_return" => "Return worn maintenance from",
+            "repair_pending" => {
+                return Some(format!(
+                    "Wait for returned drone {} at {} to reach >=95% operational capacity",
+                    intent.worn_drone, intent.hub_belt,
+                ));
+            }
+            "waiting_for_worn_hub_evidence" | "configuring_hub_patrol" => {
+                return Some(format!(
+                    "Confirm returned drone {} on maintenance patrol at {}",
+                    intent.worn_drone, intent.hub_belt,
+                ));
+            }
+            _ => "Rotate worn maintenance at",
+        };
+        return Some(format!("{action} {}", intent.site_belt));
+    }
+    if workflow.kind == mining_transport_capacity_workflow_kind() {
+        let intent = workflow.config::<MiningTransportCapacityIntent>().ok()?;
+        let action = match step {
+            "releasing_excess_capacity"
+            | "returning_released_capacity"
+            | "waiting_for_released_capacity"
+            | "waiting_for_released_capacity_location" => {
+                "Return excess Cargo Freighters to regional stock from"
+            }
+            "provisioning_capacity" => "Provision additional Cargo Freighters for",
+            "staging_reusable_capacity" => "Deliver reusable Cargo Freighters to",
+            "adopting_capacity" => "Adopt additional Cargo Freighters for",
+            _ => "Confirm Cargo Freighter capacity for",
+        };
+        return Some(format!(
+            "{action} {} ferry (target {})",
+            intent.collect, intent.target_freighters
+        ));
+    }
+    if workflow.kind == mining_maintenance_pool_workflow_kind() {
+        let intent = workflow.config::<MiningMaintenancePoolIntent>().ok()?;
+        return Some(format!(
+            "Restore maintenance patrol at {} to {} replacement-ready drones",
+            intent.hub_belt, intent.target_healthy,
+        ));
+    }
+    None
+}
+
+fn mining_campaign_next_action(workflow: &WorkflowInstance) -> Option<String> {
+    use crate::mining::{MissionPhase, RoutePhase, SitePhase};
+
+    let intent = workflow.config::<MiningCampaignIntent>().ok()?;
+    let mission = workflow
+        .checkpoint::<crate::automation::MiningCampaignCheckpoint>()
+        .ok()
+        .and_then(|checkpoint| checkpoint.mission);
+    let Some(mission) = mission else {
+        return Some(if let Some(route) = intent.transport_routes.first() {
+            format!(
+                "Audit and repair AMI transport adoption and directives from {} to {}",
+                route.collect, route.deliver
+            )
+        } else {
+            format!(
+                "Audit mining-site equipment, adoption and directives in {}",
+                intent.systems.join(", ")
+            )
+        });
+    };
+    if matches!(
+        mission.phase,
+        MissionPhase::ManufacturingSites | MissionPhase::ManufacturingRoutes
+    ) {
+        return Some(format!(
+            "Provision {} equipment at {}",
+            if mission.phase == MissionPhase::ManufacturingSites {
+                "mining-site"
+            } else {
+                "AMI transport"
+            },
+            mission.hub_location,
+        ));
+    }
+    if let Some(site) = mission
+        .sites
+        .iter()
+        .find(|site| site.phase != SitePhase::Operational)
+    {
+        let action = match site.phase {
+            SitePhase::Planned | SitePhase::Ready if !site.missing.is_empty() => {
+                "Provision missing mining-site equipment for"
+            }
+            SitePhase::Outbound => "Deliver mining-site equipment to",
+            SitePhase::Deploying => "Deploy mining-site equipment at",
+            SitePhase::Adopting => "Repair mining and survey drone adoption at",
+            _ => "Repair and verify mining-site adoption and directives at",
+        };
+        return Some(format!("{action} {}", site.belt));
+    }
+    if let Some(route) = mission
+        .routes
+        .iter()
+        .find(|route| route.phase != RoutePhase::Active)
+    {
+        return Some(format!(
+            "Repair and verify AMI transport controller adoption and directives from {} to {}",
+            route.belt, mission.hub_location,
+        ));
+    }
+    Some(if mission.phase == MissionPhase::ReturningCarriers {
+        format!(
+            "Return mining deployment carriers to {}",
+            mission.hub_location
+        )
+    } else {
+        format!(
+            "Verify completed mining sites and AMI routes in {}",
+            intent.region
+        )
+    })
+}
+
+/// Observe managed belts in the Director footprint even when a fault preempts planning.
+#[allow(clippy::too_many_arguments)]
+fn mining_ops_summary(
+    repository: &WorkflowRepository,
+    region: &RegionView,
+    devices: &[Device],
+    catalogue: &[Star],
+    locations: &[Location],
+    inventories: &[Inventory],
+    location_systems: &BTreeMap<String, String>,
+    system_regions: &BTreeMap<String, String>,
+    inventory_authority_complete: bool,
+) -> Result<replicant_protocol::DirectorMiningOpsSummary, ApplicationError> {
+    let policy = mining_expansion_policy(repository, &region.region)?;
+    let belts = known_belt_systems(locations, location_systems, system_regions, &region.region);
+    let density = belt_density_priorities(locations, location_systems);
+    let designations = known_belt_designations(locations, location_systems);
+    let managed = managed_mining_systems(devices, location_systems)
+        .intersection(&belts)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let hub_system = region.hub_system.as_deref().or_else(|| {
+        region
+            .hub_location
+            .as_ref()
+            .and_then(|location| location_systems.get(location).map(String::as_str))
+    });
+    let desired = desired_mining_systems(&belts, &managed, &density, hub_system, catalogue, policy);
+    let hubs = owned_mining_hub_systems(devices, catalogue, location_systems);
+    let priority = selected_mining_ward_systems(
+        &belts, &managed, &hubs, &density, hub_system, catalogue, policy,
+    );
+    let wards = owned_mining_wards_by_system(devices, location_systems);
+    let hub_belt = mining_regional_hub_belt(region, &designations);
+    let hub_ready = hub_belt
+        .as_ref()
+        .map(|belt| {
+            unclaimed_hub_maintenance_healthy_count(
+                repository,
+                &crate::mining::maintenance_hub_pool_audit(devices, belt),
+            )
+        })
+        .transpose()?;
+    let mut summary = replicant_protocol::DirectorMiningOpsSummary {
+        region: region.region.clone(),
+        healthy_sites: 0,
+        total_sites: 0,
+        healthy_routes: 0,
+        total_routes: 0,
+        active_cargo_freighters: 0,
+        backlogged_routes: 0,
+        worst_backlog: None,
+        backlog_known: inventory_authority_complete,
+        healthy_remote_maintenance: 0,
+        total_remote_sites: 0,
+        hub_ready,
+        hub_minimum: crate::mining::HUB_MAINTENANCE_MIN_HEALTHY,
+        hub_target: crate::mining::HUB_MAINTENANCE_TARGET_HEALTHY,
+        priority_protected: priority
+            .iter()
+            .filter(|system| wards.contains_key(*system))
+            .count(),
+        priority_target: priority.len(),
+        expansion_candidates: desired.difference(&managed).count(),
+    };
+    let relays = relay_device_systems(devices, location_systems);
+    let mut freighters = BTreeSet::new();
+    for system in desired.intersection(&managed) {
+        for belt in designations.get(system).into_iter().flatten() {
+            if !devices.iter().any(|device| {
+                is_managed_mining_asset(device)
+                    && device
+                        .location
+                        .as_ref()
+                        .is_some_and(|location| location.id.as_str() == belt)
+            }) {
+                continue;
+            }
+            let audit = crate::mining::audit_site(devices, system, belt);
+            summary.total_sites += 1;
+            summary.healthy_sites += usize::from(audit.operational);
+            if hub_belt.as_ref() != Some(belt) {
+                summary.total_remote_sites += 1;
+                let healthy = audit.assets.maintenance_drone.as_ref().is_some_and(|code| {
+                    devices
+                        .iter()
+                        .find(|device| device.key.id.as_str() == code)
+                        .is_some_and(|device| {
+                            device.operational_capacity.is_some_and(|capacity| {
+                                capacity.percent()
+                                    >= crate::mining::MINING_MAINTENANCE_ROTATION_THRESHOLD_PCT
+                            }) && device
+                                .active_directive
+                                .as_ref()
+                                .and_then(|active| active.directive.as_ref())
+                                .is_some_and(|directive| directive.as_str() == "patrol")
+                        })
+                });
+                summary.healthy_remote_maintenance += usize::from(healthy);
+            }
+            // Stock already at the delivery hub needs no ferry and is not cargo backlog.
+            if region.hub_location.as_deref() == Some(belt.as_str()) {
+                continue;
+            }
+            summary.total_routes += 1;
+            if let Some(deliver) = region.hub_location.as_ref() {
+                let route = crate::mining::AmiTransportRouteIntent {
+                    system: system.clone(),
+                    collect: belt.clone(),
+                    deliver: deliver.clone(),
+                    desired_freighters: crate::mining::MIN_TRANSPORT_FREIGHTERS,
+                };
+                let transport =
+                    crate::mining::transport_service_present(devices, system, belt, deliver);
+                summary.healthy_routes += usize::from(
+                    transport.state == crate::mining::EvidenceState::Present
+                        && mining_route_connectivity_target(&route, &relays, location_systems)
+                            .is_none(),
+                );
+                freighters.extend(transport.usable_freighters);
+            }
+            if let Some(quantity) = mining_collection_backlog_units(inventories, belt)
+                .filter(|_| inventory_authority_complete)
+            {
+                if quantity > 0 {
+                    summary.backlogged_routes += 1;
+                    if summary
+                        .worst_backlog
+                        .as_ref()
+                        .is_none_or(|worst| quantity > worst.quantity)
+                    {
+                        summary.worst_backlog =
+                            Some(replicant_protocol::DirectorMiningBacklogSummary {
+                                location: belt.clone(),
+                                quantity,
+                            });
+                    }
+                }
+            } else {
+                summary.backlog_known = false;
+            }
+        }
+    }
+    summary.active_cargo_freighters = freighters.len();
+    Ok(summary)
+}
+
+fn is_managed_mining_asset(device: &Device) -> bool {
+    device.device_type.as_ref().is_some_and(|device_type| {
+        matches!(
+            device_type,
+            DeviceType::MiningController
+                | DeviceType::MiningDrone
+                | DeviceType::SurveyController
+                | DeviceType::SurveyDrone
+        ) || (device_type == &DeviceType::MaintenanceDrone
+            && device.tags.iter().any(|tag| tag.starts_with("mine-s:")))
+    })
+}
+
 fn managed_mining_systems(
     devices: &[Device],
     location_systems: &BTreeMap<String, String>,
 ) -> BTreeSet<String> {
     devices
         .iter()
-        .filter(|device| {
-            device.device_type.as_ref().is_some_and(|device_type| {
-                matches!(
-                    device_type,
-                    DeviceType::MiningController
-                        | DeviceType::MiningDrone
-                        | DeviceType::SurveyController
-                        | DeviceType::SurveyDrone
-                ) || (device_type == &DeviceType::MaintenanceDrone
-                    && device.tags.iter().any(|tag| tag.starts_with("mine-s:")))
-            })
-        })
+        .filter(|device| is_managed_mining_asset(device))
         .filter_map(|device| device_system(device, location_systems))
         .collect()
 }
@@ -11200,6 +11539,276 @@ mod tests {
         );
     }
 
+    #[test]
+    fn mining_ops_summary_keeps_independent_health_and_unknown_inventory() {
+        let repository = WorkflowRepository::open_in_memory().expect("repository");
+        let region = mining_ops_region();
+        let locations = vec![
+            mining_ops_location("REMOTE-BELT-1", "REMOTE"),
+            mining_ops_location("HUB-BELT-1", "HUB"),
+        ];
+        let location_systems = location_system_map(&locations);
+        let system_regions = BTreeMap::from([
+            ("REMOTE".to_owned(), "alpha".to_owned()),
+            ("HUB".to_owned(), "hub".to_owned()),
+        ]);
+        let catalogue = vec![
+            positioned_star("HUB", 0.0, Some("hub")),
+            positioned_star("REMOTE", 5.0, Some("alpha")),
+        ];
+        let mut devices = mining_ops_healthy_site("REMOTE", "REMOTE-BELT-1");
+        devices.extend(mining_ops_transport_devices(
+            "REMOTE",
+            "REMOTE-BELT-1",
+            "HUB-BELT-1",
+            2,
+        ));
+        devices.extend(mining_ops_hub_devices());
+        let inventories = vec![Inventory {
+            owner: InventoryOwner::Location(replicant_client::LocationKey::live(
+                "REMOTE-BELT-1".into(),
+            )),
+            location: Some(replicant_client::LocationKey::live("REMOTE-BELT-1".into())),
+            items: vec![replicant_client::domain::InventoryItem {
+                resource: "rares".to_owned(),
+                quantity: 54_979,
+            }],
+        }];
+        let observe = |devices: &[Device], inventories: &[Inventory]| {
+            mining_ops_summary(
+                &repository,
+                &region,
+                devices,
+                &catalogue,
+                &locations,
+                inventories,
+                &location_systems,
+                &system_regions,
+                true,
+            )
+            .expect("Mining Ops observations")
+        };
+        let healthy = observe(&devices, &inventories);
+        assert_eq!((healthy.healthy_sites, healthy.total_sites), (1, 1));
+        assert_eq!(
+            (
+                healthy.healthy_remote_maintenance,
+                healthy.total_remote_sites
+            ),
+            (1, 1)
+        );
+        assert_eq!(healthy.hub_ready, Some(3));
+        assert_eq!(healthy.active_cargo_freighters, 2);
+        assert_eq!(
+            healthy.healthy_routes, 0,
+            "missing FTL is not healthy transport"
+        );
+        assert_eq!(healthy.total_routes, 1);
+        assert_eq!(healthy.backlogged_routes, 1);
+        assert_eq!(
+            healthy.worst_backlog.as_ref().expect("backlog").quantity,
+            54_979
+        );
+        assert_eq!(healthy.priority_target, 1);
+        assert_eq!(healthy.priority_protected, 0);
+
+        for device in &mut devices {
+            match device.key.id.as_str() {
+                "MC" => device.active_directive = None,
+                "MD" => {
+                    device.operational_capacity =
+                        replicant_client::domain::OperationalCapacity::new(29.0)
+                }
+                "HMD-0" => {
+                    device.operational_capacity =
+                        replicant_client::domain::OperationalCapacity::new(94.9)
+                }
+                _ => {}
+            }
+        }
+        let broken = observe(&devices, &inventories);
+        assert_eq!((broken.healthy_sites, broken.total_sites), (0, 1));
+        assert_eq!(broken.healthy_remote_maintenance, 0);
+        assert_eq!(broken.hub_ready, Some(2));
+        assert_eq!(
+            broken.active_cargo_freighters, 2,
+            "site repair must not hide transport capacity"
+        );
+        assert_eq!(
+            broken.worst_backlog, healthy.worst_backlog,
+            "site repair must not hide critical backlog"
+        );
+        let unknown = observe(&devices, &[]);
+        assert!(!unknown.backlog_known);
+        assert_eq!(unknown.worst_backlog, None);
+
+        let home_region = RegionView {
+            region: "hub".to_owned(),
+            ..region.clone()
+        };
+        let home_inventory = Inventory {
+            owner: InventoryOwner::Location(replicant_client::LocationKey::live(
+                "HUB-BELT-1".into(),
+            )),
+            location: Some(replicant_client::LocationKey::live("HUB-BELT-1".into())),
+            items: inventories[0].items.clone(),
+        };
+        let at_home = mining_ops_summary(
+            &repository,
+            &home_region,
+            &mining_ops_healthy_site("HUB", "HUB-BELT-1"),
+            &catalogue,
+            &locations,
+            &[home_inventory],
+            &location_systems,
+            &system_regions,
+            true,
+        )
+        .expect("home mining observations");
+        assert_eq!(at_home.total_sites, 1);
+        assert_eq!(
+            at_home.total_routes, 0,
+            "home stock needs no transport route"
+        );
+        assert_eq!(at_home.total_remote_sites, 0);
+        assert_eq!(
+            at_home.worst_backlog, None,
+            "delivered hub stock is not backlog"
+        );
+    }
+
+    #[test]
+    fn mining_ops_summary_uses_the_existing_thirty_ly_footprint() {
+        let repository = WorkflowRepository::open_in_memory().expect("repository");
+        let region = mining_ops_region();
+        let locations = vec![mining_ops_location("REMOTE-BELT-1", "REMOTE")];
+        let location_systems = location_system_map(&locations);
+        let system_regions = BTreeMap::from([("REMOTE".to_owned(), "alpha".to_owned())]);
+        let devices = mining_ops_healthy_site("REMOTE", "REMOTE-BELT-1");
+        for (distance, expected_sites) in [(30.0, 1), (30.1, 0)] {
+            let catalogue = vec![
+                positioned_star("HUB", 0.0, Some("hub")),
+                positioned_star("REMOTE", distance, Some("alpha")),
+            ];
+            let summary = mining_ops_summary(
+                &repository,
+                &region,
+                &devices,
+                &catalogue,
+                &locations,
+                &[],
+                &location_systems,
+                &system_regions,
+                true,
+            )
+            .expect("regional health");
+            assert_eq!(summary.total_sites, expected_sites, "distance {distance}");
+            assert_eq!(summary.healthy_sites, expected_sites, "distance {distance}");
+            assert_eq!(summary.total_routes, expected_sites, "distance {distance}");
+        }
+    }
+
+    #[test]
+    fn mining_ops_active_campaign_describes_adoption_directives_and_route_repair() {
+        use crate::mining::{
+            MiningMission, MissionPhase, RouteMission, RoutePhase, SiteAssets, SiteMission,
+            SitePhase,
+        };
+
+        let repository = WorkflowRepository::open_in_memory().expect("repository");
+        for (phase, expected_action, expected_target) in [
+            (
+                SitePhase::Adopting,
+                "Repair mining and survey drone adoption",
+                "REMOTE-BELT-1",
+            ),
+            (
+                SitePhase::Verifying,
+                "Repair and verify mining-site adoption and directives",
+                "REMOTE-BELT-1",
+            ),
+            (
+                SitePhase::Operational,
+                "Repair and verify AMI transport controller adoption and directives",
+                "HUB-BELT-1",
+            ),
+        ] {
+            let mut request = new_mining_campaign_workflow(MiningCampaignIntent {
+                systems: vec!["REMOTE".to_owned()],
+                region: "alpha".to_owned(),
+                hub: "HUB-BELT-1".to_owned(),
+                max_concurrency: 1,
+                transport_routes: Vec::new(),
+            });
+            request.current_step = Some("executing".to_owned());
+            request.checkpoint.mission = Some(MiningMission {
+                version: 1,
+                mission_id: "mining-health".to_owned(),
+                mission_tag: "mine-m:HUB".to_owned(),
+                legacy_mission_tags: Vec::new(),
+                phase: MissionPhase::DeployingSites,
+                selected_replicant: "R1".to_owned(),
+                hub_location: "HUB-BELT-1".to_owned(),
+                sites: vec![SiteMission {
+                    system: "REMOTE".to_owned(),
+                    belt: "REMOTE-BELT-1".to_owned(),
+                    density: "dense".to_owned(),
+                    tag: "mine-s:REMOTE".to_owned(),
+                    phase,
+                    assets: SiteAssets::default(),
+                    missing: BTreeMap::new(),
+                    carrier: None,
+                }],
+                routes: vec![RouteMission {
+                    system: "REMOTE".to_owned(),
+                    belt: "REMOTE-BELT-1".to_owned(),
+                    tag: "mine-s:REMOTE".to_owned(),
+                    phase: RoutePhase::Activating,
+                    controller: Some("TC".to_owned()),
+                    freighter: Some("CF".to_owned()),
+                    additional_freighters: Vec::new(),
+                    desired_freighters: 1,
+                }],
+                print_batches: Vec::new(),
+                site_print_requirements: BTreeMap::new(),
+                route_print_requirements: BTreeMap::new(),
+                total_material_cost: BTreeMap::new(),
+                warnings: Vec::new(),
+            });
+            let workflow = repository.create(request).expect("campaign");
+            let action = mining_workflow_next_action(&workflow).expect("campaign action");
+            assert!(action.contains(expected_action), "{action}");
+            assert!(action.contains(expected_target), "{action}");
+        }
+    }
+
+    #[test]
+    fn mining_ops_active_rotation_distinguishes_delivery_from_hub_repair() {
+        let repository = WorkflowRepository::open_in_memory().expect("repository");
+        let mut workflow = repository
+            .create(new_mining_maintenance_rotation_workflow(
+                MiningMaintenanceRotationIntent {
+                    region: "alpha".to_owned(),
+                    system: "REMOTE".to_owned(),
+                    site_belt: "REMOTE-BELT-1".to_owned(),
+                    hub_belt: "HUB-BELT-1".to_owned(),
+                    worn_drone: "MD-OLD".to_owned(),
+                    replacement_candidates: Vec::new(),
+                },
+            ))
+            .expect("rotation workflow");
+        workflow.current_step = Some("delivering_replacement".to_owned());
+        let delivery = mining_workflow_next_action(&workflow).expect("delivery action");
+        assert!(delivery.contains("Deliver replacement"));
+        assert!(delivery.contains("REMOTE-BELT-1"));
+        workflow.current_step = Some("repair_pending".to_owned());
+        let repair = mining_workflow_next_action(&workflow).expect("repair action");
+        assert!(repair.contains("MD-OLD"));
+        assert!(repair.contains("HUB-BELT-1"));
+        assert!(repair.contains(">=95%"));
+        assert!(!repair.contains("Deliver replacement"));
+    }
+
     #[tokio::test]
     async fn established_mining_ferry_without_ftl_reach_raises_connectivity_without_rewrite() {
         let server = MockServer::start().await;
@@ -13171,6 +13780,7 @@ mod tests {
                 identity: identity.clone(),
             }],
             prospect_exhausted_signature: None,
+            ..GoalRuntime::default()
         };
 
         let initial_rows = repository.list().expect("initial workflows").len();
@@ -13212,6 +13822,7 @@ mod tests {
                     identity: identity.clone(),
                 }],
                 prospect_exhausted_signature: None,
+                ..GoalRuntime::default()
             };
             prune_runtime_workflows(&mut runtime, std::slice::from_ref(&failed));
             assert!(runtime.launch_records.is_empty());
@@ -13303,6 +13914,7 @@ mod tests {
                     identity,
                 }],
                 prospect_exhausted_signature: None,
+                ..GoalRuntime::default()
             },
         )
         .expect("save goal runtime");
@@ -13406,6 +14018,7 @@ mod tests {
                     identity,
                 }],
                 prospect_exhausted_signature: None,
+                ..GoalRuntime::default()
             },
         )
         .expect("save goal runtime");
@@ -13641,6 +14254,7 @@ mod tests {
                         identity,
                     }],
                     prospect_exhausted_signature: None,
+                    ..GoalRuntime::default()
                 },
             )
             .expect("save goal runtime");

@@ -222,6 +222,26 @@ export interface DirectorMiningPolicySummary {
   expand_sparse: boolean;
 }
 
+export interface DirectorMiningOpsSummary {
+  region: string;
+  healthy_sites: number;
+  total_sites: number;
+  healthy_routes: number;
+  total_routes: number;
+  active_cargo_freighters: number;
+  backlogged_routes: number;
+  worst_backlog: { location: string; quantity: number } | null;
+  backlog_known: boolean;
+  healthy_remote_maintenance: number;
+  total_remote_sites: number;
+  hub_ready: number | null;
+  hub_minimum: number;
+  hub_target: number;
+  priority_protected: number;
+  priority_target: number;
+  expansion_candidates: number;
+}
+
 export interface DirectorCataloguePolicySummary {
   region: string;
   default_parallel_worker_cap: number;
@@ -296,6 +316,7 @@ export interface DirectorSnapshot {
   regions: DirectorRegionSummary[];
   goals: DirectorGoalSummary[];
   mining_policies: DirectorMiningPolicySummary[];
+  mining_ops?: DirectorMiningOpsSummary[];
   catalogue_policies: DirectorCataloguePolicySummary[];
   replicants: DirectorReplicantAssignment[];
   requirements: DirectorRequirementSummary[];
@@ -4842,6 +4863,73 @@ export function parseDirectorResponse(
           expand_sparse: boolean(policy.expand_sparse, "expand sparse belts"),
         };
       }),
+      mining_ops: array(item.mining_ops ?? [], "Director Mining Ops").map(
+        (value) => {
+          const health = record(value, "Mining Ops health");
+          const backlog =
+            health.worst_backlog == null
+              ? null
+              : record(health.worst_backlog, "Mining Ops backlog");
+          return {
+            region: requiredString(health.region, "Mining Ops region"),
+            healthy_sites: number(health.healthy_sites, "healthy mining sites"),
+            total_sites: number(health.total_sites, "managed mining sites"),
+            healthy_routes: number(
+              health.healthy_routes,
+              "healthy mining routes",
+            ),
+            total_routes: number(health.total_routes, "mining routes"),
+            active_cargo_freighters: number(
+              health.active_cargo_freighters,
+              "active mining freighters",
+            ),
+            backlogged_routes: number(
+              health.backlogged_routes,
+              "backlogged mining routes",
+            ),
+            worst_backlog:
+              backlog === null
+                ? null
+                : {
+                    location: requiredString(
+                      backlog.location,
+                      "backlog location",
+                    ),
+                    quantity: number(backlog.quantity, "backlog quantity"),
+                  },
+            backlog_known: boolean(
+              health.backlog_known,
+              "mining backlog known",
+            ),
+            healthy_remote_maintenance: number(
+              health.healthy_remote_maintenance,
+              "healthy remote maintenance",
+            ),
+            total_remote_sites: number(
+              health.total_remote_sites,
+              "remote mining sites",
+            ),
+            hub_ready:
+              health.hub_ready == null
+                ? null
+                : number(health.hub_ready, "ready hub maintenance pool"),
+            hub_minimum: number(health.hub_minimum, "hub maintenance minimum"),
+            hub_target: number(health.hub_target, "hub maintenance target"),
+            priority_protected: number(
+              health.priority_protected,
+              "protected priority systems",
+            ),
+            priority_target: number(
+              health.priority_target,
+              "priority protection target",
+            ),
+            expansion_candidates: number(
+              health.expansion_candidates,
+              "mining expansion candidates",
+            ),
+          };
+        },
+      ),
       catalogue_policies: array(
         item.catalogue_policies ?? [],
         "Director catalogue policies",

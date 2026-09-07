@@ -694,6 +694,157 @@ describe("Director goal controls", () => {
     container.remove();
   });
 
+  it.each(["critical backlog", "maintenance rotation", "legacy"] as const)(
+    "renders Mining Ops with %s without deriving health from prose",
+    async (scenario) => {
+      vi.useFakeTimers();
+      const nextAction =
+        scenario === "maintenance rotation"
+          ? "Wait for returned drone MD-OLD at HUB-BELT-1 to reach >=95% operational capacity"
+          : "Add 2 Cargo Freighters to KHIKHKUWU-BELT-1 ferry";
+      const health = {
+        region: "Beta",
+        healthy_sites: 6,
+        total_sites: 6,
+        healthy_routes: 5,
+        total_routes: 6,
+        active_cargo_freighters: 9,
+        backlogged_routes: scenario === "critical backlog" ? 1 : 0,
+        worst_backlog:
+          scenario === "critical backlog"
+            ? { location: "KHIKHKUWU-BELT-1", quantity: 54979 }
+            : null,
+        backlog_known: true,
+        healthy_remote_maintenance: scenario === "maintenance rotation" ? 5 : 6,
+        total_remote_sites: 6,
+        hub_ready: scenario === "maintenance rotation" ? 2 : 3,
+        hub_minimum: 2,
+        hub_target: 3,
+        priority_protected: 4,
+        priority_target: 4,
+        expansion_candidates: 3,
+      };
+      const director = {
+        metadata: { revision: 1, generated_at_ms: 10 },
+        mode: "advisory",
+        regions: [
+          {
+            region: "Beta",
+            status: "established",
+            hub_system: "HUB",
+            hub_location: "HUB-BELT-1",
+            replicants: [],
+            known_systems: 9,
+          },
+        ],
+        goals: [
+          {
+            id: "expand_mining_ops:beta",
+            kind: "expand_mining_ops",
+            region: "Beta",
+            status: "active",
+            objective: "Steady-state management, not a health encoding",
+            blocker:
+              scenario === "critical backlog"
+                ? "Expansion deferred by critical backlog"
+                : null,
+            next_action: nextAction,
+            progress_current: 1,
+            progress_total: 9,
+            active_workflows: [],
+            enabled: true,
+          },
+        ],
+        ...(scenario === "legacy" ? {} : { mining_ops: [health] }),
+        mining_policies: [
+          { region: "Beta", expand_moderate: true, expand_sparse: false },
+        ],
+        replicants: [],
+        workforce: {
+          total: 0,
+          busy: 0,
+          idle: 0,
+          idle_ratio: 1,
+          pending_worker_demand: 0,
+          scale_up_recommended: false,
+          scale_reason: null,
+        },
+      };
+      vi.stubGlobal(
+        "fetch",
+        vi.fn((input: RequestInfo | URL) =>
+          Promise.resolve({
+            ok: true,
+            json: () =>
+              Promise.resolve({
+                protocol_version: 1,
+                payload:
+                  input === "/api/descriptors"
+                    ? { reports: [], actions: [], workflows: [] }
+                    : director,
+              }),
+          }),
+        ),
+      );
+      const container = document.createElement("div");
+      document.body.appendChild(container);
+      const root = createRoot(container);
+      try {
+        await act(async () => {
+          root.render(<AutomationsPage workflows={[]} entities={{}} />);
+          await vi.runAllTimersAsync();
+        });
+        const card = container.querySelector(".director-regional-goal");
+        expect(card?.textContent).toContain("Mining Ops — Beta");
+        expect(card?.textContent).toContain(`Next: ${nextAction}`);
+        expect(card?.textContent).toContain("Expansion policy");
+        expect(
+          card?.querySelector<HTMLInputElement>(
+            'input[aria-label="Expand mining to moderate belts in Beta"]',
+          )?.checked,
+        ).toBe(true);
+        expect(
+          card?.querySelector<HTMLInputElement>(
+            'input[aria-label="Expand mining to sparse belts in Beta"]',
+          )?.checked,
+        ).toBe(false);
+        const summary = card?.querySelector("dl");
+        if (scenario === "legacy") {
+          expect(summary).toBeNull();
+          expect(card?.textContent).toContain("active · 1 / 9");
+        } else {
+          expect(card?.textContent).toContain("active · 6 / 6 sites");
+          const metric = (label: string) =>
+            Array.from(summary?.querySelectorAll("dt") ?? []).find(
+              (term) => term.textContent === label,
+            )?.nextElementSibling?.textContent;
+          expect(metric("Transport")).toBe("5 / 6 healthy");
+          expect(metric("Cargo freighters")).toBe("9 active");
+          expect(metric("Protection")).toBe("4 / 4 priority systems");
+          expect(metric("Expansion")).toBe("3 candidates");
+          if (scenario === "critical backlog") {
+            expect(metric("Cargo backlog")).toContain(
+              "54,979 at KHIKHKUWU-BELT-1",
+            );
+            expect(card?.textContent).toContain(
+              "Expansion deferred by critical backlog",
+            );
+            expect(metric("Hub reserve")).toBe("3 / 3 ready · minimum 2");
+          } else {
+            expect(metric("Maintenance")).toBe("5 / 6 healthy");
+            expect(metric("Hub reserve")).toBe("2 / 3 ready · minimum 2");
+            expect(metric("Cargo backlog")).toBe("None");
+          }
+        }
+      } finally {
+        act(() => {
+          root.unmount();
+        });
+        container.remove();
+      }
+    },
+  );
+
   it("renders advisory actions, blockers, and satisfied recovery states", async () => {
     vi.useFakeTimers();
     const region = (name: string) => ({
@@ -804,6 +955,93 @@ describe("Director goal controls", () => {
       root?.unmount();
     });
     container.remove();
+  });
+
+  it("describes the registered mining campaign rather than nonexistent site workflows", async () => {
+    vi.useFakeTimers();
+    const workflow = {
+      id: "WF-MINING",
+      kind: "mining.campaign",
+      status: "waiting" as const,
+      current_step: "executing",
+      revision: 1,
+      updated_at_ms: 10,
+    };
+    const detail = {
+      summary: workflow,
+      schema_version: 3,
+      parameters: { systems: ["REMOTE"] },
+      wait_reason: null,
+      parent_id: null,
+      claims: [],
+      created_at_ms: 10,
+      finished_at_ms: null,
+      error: null,
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((input: RequestInfo | URL) => {
+        const url =
+          typeof input === "string"
+            ? input
+            : input instanceof URL
+              ? input.href
+              : input.url;
+        const payload =
+          url === "/api/descriptors"
+            ? { reports: [], actions: [], workflows: [] }
+            : url === "/api/workflows/WF-MINING"
+              ? detail
+              : url === "/api/director"
+                ? {
+                    metadata: { revision: 1, generated_at_ms: 10 },
+                    mode: "advisory",
+                    regions: [],
+                    goals: [],
+                    replicants: [],
+                    workforce: {
+                      total: 0,
+                      busy: 0,
+                      idle: 0,
+                      idle_ratio: 1,
+                      pending_worker_demand: 0,
+                      scale_up_recommended: false,
+                      scale_reason: null,
+                    },
+                  }
+                : { activity: [] };
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({ protocol_version: 1, payload }),
+        });
+      }),
+    );
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    try {
+      await act(async () => {
+        root.render(
+          <AutomationsPage
+            workflows={[workflow]}
+            entities={{}}
+            selectedWorkflowId={workflow.id}
+          />,
+        );
+        await vi.runAllTimersAsync();
+      });
+      expect(container.querySelector(".workflow-step")?.textContent).toContain(
+        "Executing mining site and AMI transport work",
+      );
+      expect(container.textContent).toContain(
+        "Waiting for mining site or AMI transport work to complete; see the Director next action.",
+      );
+    } finally {
+      act(() => {
+        root.unmount();
+      });
+      container.remove();
+    }
   });
 
   it("opens the active recovery workflow ID from a selected workflow", async () => {

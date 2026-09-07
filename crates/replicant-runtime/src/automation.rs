@@ -6375,6 +6375,12 @@ impl WorkflowExecutor for MiningTransportCapacityWorkflow {
                         .persist_checkpoint(&checkpoint)
                         .map_err(string_error)?;
                 } else {
+                    tracing::info!(
+                        region = %intent.region, system = %intent.system, belt = %intent.collect,
+                        current_freighters = current, desired_freighters = intent.target_freighters,
+                        reused_capacity = staged_available, provision_shortfall = needed,
+                        "Mining transport capacity reuses staged stock before provisioning the shortfall"
+                    );
                     let quantity = i64::try_from(needed)
                         .map_err(|_| "capacity deficit is too large".to_owned())?;
                     let child = context
@@ -6826,6 +6832,15 @@ async fn select_rotation_replacement(
             continue;
         }
         checkpoint.replacement = Some(code.clone());
+        tracing::info!(
+            region = %intent.region, system = %intent.system, belt = %intent.site_belt,
+            worn_drone = %intent.worn_drone, replacement_drone = %code,
+            worn_capacity = ?devices.iter().find(|device| device.key.id.as_str() == intent.worn_drone)
+                .and_then(|device| device.operational_capacity.map(|capacity| capacity.percent())),
+            replacement_capacity = ?device.operational_capacity.map(|capacity| capacity.percent()),
+            healthy_hub_pool = available_hub_healthy, reused = true,
+            "Mining maintenance rotation selected reusable replacement"
+        );
         return Ok(true);
     }
     Ok(false)
@@ -6860,6 +6875,11 @@ async fn provision_rotation_replacement(
             .map_err(string_error)?;
         return Ok(true);
     }
+    tracing::info!(
+        region = %intent.region, system = %intent.system, belt = %intent.site_belt,
+        worn_drone = %intent.worn_drone, reused = false,
+        "Mining maintenance rotation requests replacement provisioning after reusable stock selection"
+    );
     let child = context
         .create_child(new_regional_dispatch_workflow(RegionalDispatchIntent {
             source: intent.hub_belt.clone(),
@@ -7228,6 +7248,12 @@ async fn finish_worn_maintenance_repair(
         context.mark_waiting().map_err(string_error)?;
         return Ok(());
     }
+    tracing::info!(
+        region = %intent.region, system = %intent.system, belt = %intent.hub_belt,
+        worn_drone = %intent.worn_drone, replacement_drone = ?checkpoint.replacement,
+        returned_capacity = ?refreshed.operational_capacity.map(|capacity| capacity.percent()),
+        "Returned mining maintenance drone is replacement-ready"
+    );
     context
         .mark_succeeded(Some(serde_json::json!({
             "site": intent.site_belt,

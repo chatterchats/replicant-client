@@ -278,6 +278,21 @@ The initial standing goals are intentionally batch-oriented rather than one-goal
   Connectivity requirement instead of rewriting their Transport Controller. Up to four non-hub
   mining systems receive System Wards by density and distance; a donor ward is never stripped
   before destination connectivity is authoritative.
+  These thresholds (30 LY, 500 units per planning load, 10/30-load backlog bands,
+  one-to-six route freighters, 30% remote rotation, 95% replacement readiness,
+  hub minimum two/target three, and four priority wards) are **client policy**,
+  not Replicant Space API contract guarantees.
+  `DirectorSnapshot.mining_ops` reports independent regional observations:
+  exact-belt site health, route health including FTL reach, usable adopted Cargo
+  Freighters, known backlog, remote maintenance, unclaimed replacement-ready hub
+  patrol stock, priority ward coverage, and expansion candidates. It defaults to
+  an empty collection for legacy snapshots; unknown inventory or an unresolved
+  hub is not presented as a healthy zero. `mining_policies` remains operator
+  expansion-density policy only. The UI never derives health by parsing prose
+  and does not combine these dimensions into a health percentage.
+  These site and route totals use the existing Director footprint: known managed
+  sites beyond 30 LY are excluded, while in-range managed sites remain included
+  regardless of disabled expansion-density classes. They are not an all-owned-assets census.
 - **Maintain System Hubs** keeps each operational hub stocked at its exact location. The
   `quantity_per_20pct` value is the authoritative material cost of one 20% repair tranche: when
   every upkeep resource has at least two complete tranches on hand, no shipment is launched; when

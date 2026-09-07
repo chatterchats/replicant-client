@@ -8,6 +8,7 @@ import type {
   AutomationTrigger,
   DirectorGoalKind,
   DirectorGoalSummary,
+  DirectorMiningOpsSummary,
   DirectorRequirementKind,
   DirectorSnapshot,
   EntityKind,
@@ -1379,12 +1380,15 @@ const workflowDisplayNames: Record<string, string> = {
   "logistics.delivery": "Deliver Cargo or Devices",
   "logistics.manifest": "Deliver Manifest",
   "logistics.regional_dispatch": "Provision Regional Dispatch",
-  "mining.campaign": "Expand Mining Operations",
+  "mining.campaign": "Manage Mining Ops",
   "mining.deploy": "Deploy Mining Operation",
   "mining.expansion": "Expand Mining Operations",
   "mining.route": "Deploy Mining Route",
   "mining.site": "Deploy Mining Site",
   "mining.stage": "Stage Mining Equipment",
+  "mining.transport_capacity": "Adjust Mining Transport Capacity",
+  "mining.maintenance_rotation": "Rotate Mining Maintenance Drone",
+  "mining.maintenance_pool": "Restore Hub Maintenance Reserve",
   "observatory.search": "Search with Observatory",
   "region.establish": "Establish Region",
   "relay.expansion": "Expand Relay Network",
@@ -1403,6 +1407,33 @@ const workflowDisplayNames: Record<string, string> = {
 };
 
 const workflowStepNames: Record<string, string> = {
+  adopting_capacity: "Adopting additional Cargo Freighters",
+  releasing_excess_capacity:
+    "Releasing excess Cargo Freighters to regional stock",
+  returning_released_capacity: "Returning released Cargo Freighters to the hub",
+  waiting_for_released_capacity: "Confirming released Cargo Freighters",
+  waiting_for_released_capacity_location:
+    "Waiting for released Cargo Freighter location",
+  waiting_for_route_evidence: "Waiting for authoritative AMI route health",
+  provisioning_capacity: "Provisioning the Cargo Freighter shortfall",
+  staging_reusable_capacity: "Delivering reusable Cargo Freighters",
+  waiting_for_capacity_adoption_evidence: "Confirming Cargo Freighter adoption",
+  waiting_for_capacity_inventory:
+    "Waiting for Cargo Freighters at the controller",
+  waiting_for_staged_capacity_evidence: "Confirming delivered Cargo Freighters",
+  provisioning_replacement: "Provisioning a replacement maintenance drone",
+  delivering_replacement: "Delivering the replacement maintenance drone",
+  verifying_replacement_delivery: "Confirming replacement maintenance delivery",
+  waiting_for_replacement_patrol: "Confirming replacement maintenance patrol",
+  waiting_for_replacement_patrol_repair:
+    "Repairing replacement maintenance patrol before worn-drone return",
+  recovering_worn_drone: "Returning the worn maintenance drone to the hub",
+  verifying_worn_return: "Confirming the worn drone has returned to the hub",
+  waiting_for_worn_hub_evidence:
+    "Confirming returned drone capacity at the hub",
+  repair_pending: "Waiting for returned drone to reach >=95% capacity",
+  configuring_hub_patrol: "Configuring the hub maintenance patrol",
+  provisioning_hub_pool: "Provisioning the hub maintenance reserve",
   awaiting_available_resources: "Waiting for available resources",
   awaiting_blueprint_control_replicant:
     "Waiting for blueprint control Replicant",
@@ -1473,8 +1504,10 @@ function workflowDisplayName(
   );
 }
 
-function workflowStepName(step: string | null) {
+function workflowStepName(step: string | null, kind: string) {
   if (!step) return "Not started";
+  if (kind === "mining.campaign" && step === "executing")
+    return "Executing mining site and AMI transport work";
   const curated = workflowStepNames[step];
   if (curated) return curated;
   return step
@@ -1617,6 +1650,9 @@ function workflowWaitReason(
       return "Waiting for required resources or claimed devices to become available.";
     if (step?.startsWith("printing_"))
       return "Waiting for the current print job to finish.";
+    if (workflow.kind === "mining.campaign" && step === "executing")
+      return "Waiting for mining site or AMI transport work to complete; see the Director next action.";
+    if (step && workflowStepNames[step]) return workflowStepNames[step];
     return "Waiting for a workflow dependency or resource to become ready.";
   }
   if (workflow.status === "paused") return "Paused by operator.";
@@ -1660,7 +1696,7 @@ function WorkflowRow({
         </span>
         <span className="workflow-step">
           <small>Current step</small>
-          <span>{workflowStepName(workflow.current_step)}</span>
+          <span>{workflowStepName(workflow.current_step, workflow.kind)}</span>
         </span>
         <span className="workflow-scope">
           <small>Scope</small>
@@ -1881,6 +1917,56 @@ const requirementLabels: Record<DirectorRequirementKind, string> = {
 function goalProgress(goal: DirectorGoalSummary) {
   if (goal.progress_total === 0) return null;
   return `${String(goal.progress_current)} / ${String(goal.progress_total)}`;
+}
+
+function MiningOpsHealth({ health }: { health: DirectorMiningOpsSummary }) {
+  return (
+    <dl
+      className="director-mining-health"
+      aria-label={`Mining Ops health in ${health.region}`}
+    >
+      <dt>Sites</dt>
+      <dd>
+        {health.healthy_sites} / {health.total_sites} healthy
+      </dd>
+      <dt>Transport</dt>
+      <dd>
+        {health.healthy_routes} / {health.total_routes} healthy
+      </dd>
+      <dt>Cargo freighters</dt>
+      <dd>{health.active_cargo_freighters} active</dd>
+      <dt>Cargo backlog</dt>
+      <dd>
+        {health.worst_backlog
+          ? `${health.worst_backlog.quantity.toLocaleString("en-US")} at ${health.worst_backlog.location}`
+          : health.backlog_known
+            ? "None"
+            : "Unknown"}
+        {health.backlogged_routes > 0
+          ? ` · ${String(health.backlogged_routes)} backlogged route(s)`
+          : ""}
+        {!health.backlog_known && health.worst_backlog
+          ? " · incomplete inventory"
+          : ""}
+      </dd>
+      <dt>Maintenance</dt>
+      <dd>
+        {health.healthy_remote_maintenance} / {health.total_remote_sites}{" "}
+        healthy
+      </dd>
+      <dt>Hub reserve</dt>
+      <dd>
+        {health.hub_ready ?? "Unknown"} / {health.hub_target} ready · minimum{" "}
+        {health.hub_minimum}
+      </dd>
+      <dt>Protection</dt>
+      <dd>
+        {health.priority_protected} / {health.priority_target} priority systems
+      </dd>
+      <dt>Expansion</dt>
+      <dd>{health.expansion_candidates} candidates</dd>
+    </dl>
+  );
 }
 
 function DirectorView({
@@ -2267,6 +2353,12 @@ function DirectorView({
             <div className="director-regional-goals">
               {(grouped[region.region] ?? []).map((goal) => {
                 const progress = goalProgress(goal);
+                const miningHealth =
+                  goal.kind === "expand_mining_ops"
+                    ? data.mining_ops?.find(
+                        (health) => health.region === region.region,
+                      )
+                    : undefined;
                 const miningPolicy = miningPolicies.get(region.region) ?? {
                   region: region.region,
                   expand_moderate: true,
@@ -2281,11 +2373,16 @@ function DirectorView({
                 };
                 return (
                   <div
-                    className={`director-regional-goal ${goal.status}`}
+                    className={`director-regional-goal ${goal.status}${goal.kind === "expand_mining_ops" ? " director-mining-goal" : ""}`}
                     key={goal.id}
                   >
                     <div>
-                      <strong>{goalLabels[goal.kind]}</strong>
+                      <strong>
+                        {goalLabels[goal.kind]}
+                        {goal.kind === "expand_mining_ops"
+                          ? ` — ${region.region}`
+                          : ""}
+                      </strong>
                       <label className="director-toggle">
                         <input
                           type="checkbox"
@@ -2303,15 +2400,22 @@ function DirectorView({
                           }
                         />
                         {goal.status}
-                        {progress ? ` · ${progress}` : ""}
+                        {miningHealth
+                          ? ` · ${String(miningHealth.healthy_sites)} / ${String(miningHealth.total_sites)} sites`
+                          : progress
+                            ? ` · ${progress}`
+                            : ""}
                       </label>
                     </div>
+                    {miningHealth ? (
+                      <MiningOpsHealth health={miningHealth} />
+                    ) : null}
                     {goal.kind === "expand_mining_ops" ? (
                       <div
                         className="director-mining-policy"
-                        aria-label={`Mining expansion density in ${region.region}`}
+                        aria-label={`Mining Ops Expansion policy in ${region.region}`}
                       >
-                        <span>New expansion · 4 ward-backed belts</span>
+                        <span>Expansion policy</span>
                         <strong>Dense</strong>
                         <label>
                           <input

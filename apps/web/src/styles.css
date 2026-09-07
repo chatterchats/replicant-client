@@ -3441,6 +3441,23 @@ h1 {
   font-size: 0.88rem;
   color: var(--muted);
 }
+.director-mining-goal > div:first-child {
+  flex-wrap: wrap;
+}
+.director-mining-health {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 0.3rem 0.75rem;
+  margin: 0.65rem 0;
+  font-size: 0.85rem;
+}
+.director-mining-health dt {
+  color: var(--muted);
+}
+.director-mining-health dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
 .director-regional-goal > .director-mining-policy,
 .director-regional-goal > .director-catalogue-policy {
   margin-top: 0.55rem;
