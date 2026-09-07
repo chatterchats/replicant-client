@@ -258,6 +258,12 @@ The initial standing goals are intentionally batch-oriented rather than one-goal
   durable `mining.campaign` machinery. Transport-service authority is resolved before optional ward
   relocation. When a hub makes a ward redundant or a higher-density belt displaces a lower-density
   allocation, the Director reuses the existing ward before launching the repair/expansion campaign.
+- **Maintain System Hubs** keeps each operational hub stocked at its exact location. The
+  `quantity_per_20pct` value is the authoritative material cost of one 20% repair tranche: when
+  every upkeep resource has at least two complete tranches on hand, no shipment is launched; when
+  any resource falls below two, the Director replenishes every upkeep resource to five tranches.
+  Explicit missing/deficit fields are used only as a legacy fallback when no tranche rate is
+  available, and generic total requirement fields are never treated as deficits.
 - **Event Completion** batches active regional events into campaign planning, staging, routing,
   and completion.
 - **Expand FTL Network** prioritizes strategic event, mining, and explicit connectivity targets

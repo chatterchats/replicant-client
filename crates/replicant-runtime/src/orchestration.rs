@@ -4075,7 +4075,8 @@ fn reconcile_maintain_system_hubs(
             ));
             continue;
         }
-        let deficits = match exact_upkeep_deficits(hub) {
+        let hub_stock = stock_at_location(&stocks, &location);
+        let deficits = match hub_upkeep_replenishment(hub, &hub_stock) {
             Ok(deficits) => deficits,
             Err(error) => {
                 tracing::warn!(
@@ -4099,8 +4100,8 @@ fn reconcile_maintain_system_hubs(
                 region = %region.region,
                 hub = %code,
                 location = %location,
-                missing = "none",
-                "System Hub has no reported upkeep deficit"
+                reserve = "healthy",
+                "System Hub upkeep reserve is above the two-tranche low-water mark"
             );
             if degraded && !patrol_available {
                 blockers.push(format!(
@@ -4117,13 +4118,13 @@ fn reconcile_maintain_system_hubs(
             hub = %code,
             location = %location,
             grace_period_remaining = ?hub.grace_period_remaining,
-            missing = %manifest,
-            "System Hub requires upkeep supply"
+            replenishment = %manifest,
+            "System Hub upkeep reserve requires replenishment"
         );
 
         if !patrol_available {
             blockers.push(format!(
-                "{code} @ {location} needs {manifest}, and {system} has no maintenance drone on patrol"
+                "{code} @ {location} needs reserve replenishment ({manifest}), and {system} has no maintenance drone on patrol"
             ));
         }
 
@@ -4134,7 +4135,9 @@ fn reconcile_maintain_system_hubs(
             if !runtime.active_workflows.contains(&workflow_id) {
                 runtime.active_workflows.push(workflow_id);
             }
-            actions.push(format!("finish supplying {code} @ {location}: {manifest}"));
+            actions.push(format!(
+                "finish replenishing {code} @ {location}: {manifest}"
+            ));
             continue;
         }
 
@@ -4147,7 +4150,7 @@ fn reconcile_maintain_system_hubs(
         };
         let Some(source) = choose_hub_supply_source(&view, region, &stocks) else {
             blockers.push(format!(
-                "{code} @ {location} is missing {manifest}, but no {} source can supply the complete manifest",
+                "{code} @ {location} needs reserve replenishment ({manifest}), but no {} source can supply the complete manifest",
                 if hub_at_risk(&view) { "reachable" } else { "regional" }
             ));
             continue;
@@ -4184,8 +4187,8 @@ fn reconcile_maintain_system_hubs(
                 region = %region.region,
                 hub = %code,
                 location = %location,
-                missing = %manifest,
-                "Director launched System Hub supply manifest"
+                replenishment = %manifest,
+                "Director launched System Hub reserve replenishment manifest"
             );
             runtime.active_workflows.push(workflow.id);
             active_count += 1;
@@ -4209,7 +4212,7 @@ fn reconcile_maintain_system_hubs(
     } else if total == 0 {
         Some("Wait for an operational regional System Hub".to_owned())
     } else if supplied == total && blocker.is_none() {
-        Some("Keep observing reported hub upkeep requirements".to_owned())
+        Some("Keep at least two repair tranches stocked at each System Hub".to_owned())
     } else if recently_launched {
         Some("Wait briefly before retrying failed hub supply work".to_owned())
     } else {
@@ -4247,8 +4250,16 @@ fn reconcile_maintain_system_hubs(
     })
 }
 
-fn exact_upkeep_deficits(device: &Device) -> Result<ResourceMap, String> {
-    let mut deficits = ResourceMap::new();
+const HUB_STOCK_LOW_WATER_TRANCHES: i64 = 2;
+const HUB_STOCK_TARGET_TRANCHES: i64 = 5;
+
+fn hub_upkeep_replenishment(
+    device: &Device,
+    current_stock: &ResourceMap,
+) -> Result<ResourceMap, String> {
+    let mut tranche_rates = ResourceMap::new();
+    let mut explicit_deficits = ResourceMap::new();
+
     for requirement in &device.upkeep_requirements {
         let resource = ["resource_type", "resource"]
             .into_iter()
@@ -4261,6 +4272,27 @@ fn exact_upkeep_deficits(device: &Device) -> Result<ResourceMap, String> {
                     requirement.keys().cloned().collect::<Vec<_>>().join(", ")
                 )
             })?;
+        if let Some(quantity_per_20pct) = requirement
+            .get("quantity_per_20pct")
+            .and_then(json_integral_i64)
+        {
+            if quantity_per_20pct < 0 {
+                return Err(format!(
+                    "upkeep requirement for {resource} reports negative quantity_per_20pct {quantity_per_20pct}"
+                ));
+            }
+            if quantity_per_20pct > 0 {
+                let current = tranche_rates.get(resource).copied().unwrap_or(0);
+                let total = current.checked_add(quantity_per_20pct).ok_or_else(|| {
+                    format!(
+                        "upkeep requirement for {resource} overflows while summing tranche rates"
+                    )
+                })?;
+                tranche_rates.insert(resource.to_owned(), total);
+            }
+            continue;
+        }
+
         let missing = [
             "missing",
             "remaining",
@@ -4272,7 +4304,7 @@ fn exact_upkeep_deficits(device: &Device) -> Result<ResourceMap, String> {
         .find_map(|key| requirement.get(key).and_then(json_integral_i64))
         .ok_or_else(|| {
             format!(
-                "upkeep requirement for {resource} has no explicit deficit field; refusing to infer from total requirement"
+                "upkeep requirement for {resource} has neither quantity_per_20pct nor an explicit deficit field"
             )
         })?;
         if missing < 0 {
@@ -4281,10 +4313,72 @@ fn exact_upkeep_deficits(device: &Device) -> Result<ResourceMap, String> {
             ));
         }
         if missing > 0 {
-            *deficits.entry(resource.to_owned()).or_default() += missing;
+            let current = explicit_deficits.get(resource).copied().unwrap_or(0);
+            let total = current.checked_add(missing).ok_or_else(|| {
+                format!(
+                    "upkeep requirement for {resource} overflows while summing explicit deficits"
+                )
+            })?;
+            explicit_deficits.insert(resource.to_owned(), total);
         }
     }
-    Ok(deficits)
+
+    if tranche_rates.is_empty() {
+        return Ok(explicit_deficits);
+    }
+
+    let below_low_water = tranche_rates.iter().any(|(resource, quantity_per_20pct)| {
+        let low_water = quantity_per_20pct
+            .checked_mul(HUB_STOCK_LOW_WATER_TRANCHES)
+            .unwrap_or(i64::MAX);
+        resource_quantity(current_stock, resource) < low_water
+    });
+    if !below_low_water {
+        return Ok(ResourceMap::new());
+    }
+
+    let mut replenishment = ResourceMap::new();
+    for (resource, quantity_per_20pct) in tranche_rates {
+        let target = quantity_per_20pct
+            .checked_mul(HUB_STOCK_TARGET_TRANCHES)
+            .ok_or_else(|| {
+                format!(
+                    "upkeep requirement for {resource} overflows while sizing the five-tranche reserve"
+                )
+            })?;
+        let current = resource_quantity(current_stock, &resource);
+        if target > current {
+            replenishment.insert(resource, target - current);
+        }
+    }
+    Ok(replenishment)
+}
+
+fn resource_quantity(resources: &ResourceMap, resource: &str) -> i64 {
+    resources
+        .iter()
+        .filter(|(candidate, _)| candidate.eq_ignore_ascii_case(resource))
+        .fold(0, |total, (_, quantity)| total.saturating_add(*quantity))
+}
+
+fn stock_at_location(stocks: &[StockLocation], location: &str) -> ResourceMap {
+    let mut resources = ResourceMap::new();
+    for stock in stocks
+        .iter()
+        .filter(|stock| stock.location.eq_ignore_ascii_case(location))
+    {
+        for (resource, quantity) in &stock.resources {
+            if let Some((_, current)) = resources
+                .iter_mut()
+                .find(|(candidate, _)| candidate.eq_ignore_ascii_case(resource))
+            {
+                *current = current.saturating_add(*quantity);
+            } else {
+                resources.insert(resource.clone(), *quantity);
+            }
+        }
+    }
+    resources
 }
 
 fn json_integral_i64(value: &Value) -> Option<i64> {
@@ -10468,12 +10562,12 @@ mod tests {
         assert_eq!(summary.progress_total, 1);
         assert_eq!(
             summary.next_action.as_deref(),
-            Some("Keep observing reported hub upkeep requirements")
+            Some("Keep at least two repair tranches stocked at each System Hub")
         );
     }
 
     #[test]
-    fn hub_upkeep_parser_uses_only_explicit_deficits() {
+    fn hub_upkeep_replenishment_uses_explicit_deficits_as_legacy_fallback() {
         let mut hub = test_hub_device();
         hub.upkeep_requirements = vec![
             BTreeMap::from([
@@ -10487,7 +10581,8 @@ mod tests {
             ]),
         ];
 
-        let deficits = exact_upkeep_deficits(&hub).expect("parse explicit deficits");
+        let deficits =
+            hub_upkeep_replenishment(&hub, &ResourceMap::new()).expect("parse explicit deficits");
         assert_eq!(deficits.get("structural"), Some(&120));
         assert_eq!(deficits.get("carbon"), Some(&80));
 
@@ -10495,8 +10590,74 @@ mod tests {
             ("resource".to_owned(), Value::from("structural")),
             ("required".to_owned(), Value::from(400)),
         ])];
-        let error = exact_upkeep_deficits(&hub).expect_err("total alone is ambiguous");
-        assert!(error.contains("refusing to infer"));
+        let error = hub_upkeep_replenishment(&hub, &ResourceMap::new())
+            .expect_err("total alone is ambiguous");
+        assert!(error.contains("neither quantity_per_20pct nor an explicit deficit"));
+    }
+
+    #[test]
+    fn hub_upkeep_replenishment_uses_two_to_five_tranche_hysteresis() {
+        let mut hub = test_hub_device();
+        hub.upkeep_requirements = vec![
+            BTreeMap::from([
+                ("resource_type".to_owned(), Value::from("carbon")),
+                ("quantity_per_20pct".to_owned(), Value::from(80)),
+            ]),
+            BTreeMap::from([
+                ("resource".to_owned(), Value::from("structural")),
+                ("quantity_per_20pct".to_owned(), Value::from(128)),
+            ]),
+        ];
+
+        let healthy = BTreeMap::from([("carbon".to_owned(), 160), ("structural".to_owned(), 256)]);
+        assert!(
+            hub_upkeep_replenishment(&hub, &healthy)
+                .expect("exact low-water stock is healthy")
+                .is_empty()
+        );
+
+        let low = BTreeMap::from([("carbon".to_owned(), 159), ("structural".to_owned(), 500)]);
+        let replenishment =
+            hub_upkeep_replenishment(&hub, &low).expect("replenish balanced reserve");
+        assert_eq!(replenishment.get("carbon"), Some(&241));
+        assert_eq!(replenishment.get("structural"), Some(&140));
+
+        let replenishment = hub_upkeep_replenishment(&hub, &ResourceMap::new())
+            .expect("fill empty reserve to five tranches");
+        assert_eq!(replenishment.get("carbon"), Some(&400));
+        assert_eq!(replenishment.get("structural"), Some(&640));
+    }
+
+    #[test]
+    fn hub_stock_at_location_aggregates_exact_location_only() {
+        let stocks = vec![
+            StockLocation {
+                location: "SCEPTURUM-7-L4".to_owned(),
+                system: "SCEPTURUM".to_owned(),
+                region: Some("alpha".to_owned()),
+                is_belt: false,
+                resources: BTreeMap::from([(String::from("carbon"), 80)]),
+            },
+            StockLocation {
+                location: "SCEPTURUM-7-L4".to_owned(),
+                system: "SCEPTURUM".to_owned(),
+                region: Some("alpha".to_owned()),
+                is_belt: false,
+                resources: BTreeMap::from([(String::from("carbon"), 40)]),
+            },
+            StockLocation {
+                location: "SCEPTURUM-BELT-1".to_owned(),
+                system: "SCEPTURUM".to_owned(),
+                region: Some("alpha".to_owned()),
+                is_belt: true,
+                resources: BTreeMap::from([(String::from("carbon"), 1_000)]),
+            },
+        ];
+
+        assert_eq!(
+            stock_at_location(&stocks, "SCEPTURUM-7-L4").get("carbon"),
+            Some(&120)
+        );
     }
 
     #[test]
