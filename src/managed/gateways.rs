@@ -944,6 +944,7 @@ pub struct AutofactoryPrintOptions {
     oncomplete: Option<raw::JsonObject>,
     tags: Vec<String>,
     flatpack: Option<bool>,
+    operation_id: Option<OperationId>,
 }
 
 impl AutofactoryPrintOptions {
@@ -956,6 +957,7 @@ impl AutofactoryPrintOptions {
             oncomplete: None,
             tags: Vec::new(),
             flatpack: None,
+            operation_id: None,
         }
     }
 
@@ -988,6 +990,13 @@ impl AutofactoryPrintOptions {
     #[must_use]
     pub fn flatpacked(mut self) -> Self {
         self.flatpack = Some(true);
+        self
+    }
+
+    /// Uses an existing durable identity so a restarted print cannot be submitted twice.
+    #[must_use]
+    pub fn operation_id(mut self, operation_id: OperationId) -> Self {
+        self.operation_id = Some(operation_id);
         self
     }
 }
@@ -1177,6 +1186,7 @@ impl DeviceHandle {
             oncomplete,
             tags,
             flatpack,
+            operation_id,
         } = options;
         if quantity < 1 {
             return Err(Error::Configuration {
@@ -1193,15 +1203,18 @@ impl DeviceHandle {
                 ),
             });
         }
-        self.command(raw::devices::DeviceCommand::EnqueuePrint {
+        let command = raw::devices::DeviceCommand::EnqueuePrint {
             device_type: device_type.into(),
             quantity: Some(quantity),
             controller,
             oncomplete,
             tags: (!tags.is_empty()).then_some(tags),
             flatpack,
-        })
-        .await
+        };
+        match operation_id {
+            Some(id) => self.command_with_id(id, command).await,
+            None => self.command(command).await,
+        }
     }
 
     /// Dispatches any known device command as a durable operation. The

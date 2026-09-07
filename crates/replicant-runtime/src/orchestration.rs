@@ -6096,6 +6096,19 @@ fn mining_transport_route_identity_matches(
         && left.collect.eq_ignore_ascii_case(&right.collect)
         && left.deliver.eq_ignore_ascii_case(&right.deliver)
 }
+
+fn mining_transport_campaign_matches(
+    intent: &MiningCampaignIntent,
+    region: &str,
+    route: &crate::mining::AmiTransportRouteIntent,
+) -> bool {
+    canonical_region(&intent.region) == canonical_region(region)
+        && intent
+            .transport_routes
+            .iter()
+            .any(|candidate| mining_transport_route_identity_matches(candidate, route))
+}
+
 fn active_regional_mining_campaign_ids(
     workflows: &[WorkflowInstance],
     region: &str,
@@ -6848,11 +6861,8 @@ async fn reconcile_expand_mining(
                         })
                         .filter_map(|workflow| {
                             let intent = workflow.config::<MiningCampaignIntent>().ok()?;
-                            (crate::canonical_region(&intent.region) == region.region
-                                && intent.transport_routes.iter().any(|candidate| {
-                                    mining_transport_route_identity_matches(candidate, &route)
-                                }))
-                            .then_some(workflow.id)
+                            mining_transport_campaign_matches(&intent, &region.region, &route)
+                                .then_some(workflow.id)
                         })
                         .collect::<Vec<_>>();
                     structural_workflows.sort();
@@ -7558,10 +7568,11 @@ async fn reconcile_expand_mining(
                     let Ok(existing) = workflow.config::<MiningCampaignIntent>() else {
                         return Ok(false);
                     };
-                    Ok(crate::canonical_region(&existing.region) == region.region
-                        && existing.transport_routes.iter().any(|candidate| {
-                            mining_transport_route_identity_matches(candidate, &route)
-                        }))
+                    Ok(mining_transport_campaign_matches(
+                        &existing,
+                        &region.region,
+                        &route,
+                    ))
                 },
             )?;
             tracing::info!(
@@ -11807,6 +11818,88 @@ mod tests {
         assert!(repair.contains("HUB-BELT-1"));
         assert!(repair.contains(">=95%"));
         assert!(!repair.contains("Deliver replacement"));
+    }
+
+    #[test]
+    fn mining_restart_legacy_director_documents_preserve_policy_without_runtime_history() {
+        let settings: DirectorSettings = serde_json::from_value(serde_json::json!({
+            "mode": "automatic", "idle_target": 0.4
+        }))
+        .expect("legacy settings");
+        assert_eq!(settings.mode, DirectorMode::Automatic);
+        assert_eq!(settings.idle_target, 0.4);
+        assert_eq!(settings.scale_up_hold_ms, DirectorSettings::default().scale_up_hold_ms);
+
+        let policy: MiningExpansionPolicy = serde_json::from_value(serde_json::json!({
+            "expand_moderate": false
+        }))
+        .expect("legacy mining policy");
+        assert!(!policy.expand_moderate);
+        assert!(policy.expand_sparse);
+
+        let runtime: GoalRuntime = serde_json::from_value(serde_json::json!({
+            "last_launch_at_ms": 42
+        }))
+        .expect("legacy goal runtime");
+        assert_eq!(runtime.last_launch_at_ms, Some(42));
+        assert!(runtime.active_workflows.is_empty());
+        assert!(runtime.launch_records.is_empty());
+        assert!(runtime.prospect_exhausted_signature.is_none());
+        assert!(runtime.mining_priority.is_none());
+    }
+
+    #[test]
+    fn mining_restart_reconcile_adopts_legacy_route_without_mutating_its_intent() {
+        let repository = WorkflowRepository::open_in_memory().expect("repository");
+        let legacy_config = serde_json::json!({
+            "region": " alpha ", "systems": ["REMOTE"], "hub": "HUB-BELT-1",
+            "max_concurrency": 1,
+            "transport_routes": [{
+                "system": "REMOTE", "collect": "REMOTE-BELT-1", "deliver": "HUB-BELT-1"
+            }]
+        });
+        let legacy = repository
+            .create(replicant_workflow::NewWorkflow {
+                kind: crate::automation::mining_campaign_workflow_kind(),
+                schema_version: 3,
+                config: legacy_config.clone(),
+                checkpoint: crate::automation::MiningDeployCheckpoint::default(),
+                current_step: Some("adopting".into()),
+                parent_id: None,
+            })
+            .expect("legacy active workflow");
+        let route = crate::mining::AmiTransportRouteIntent {
+            system: "remote".into(),
+            collect: "remote-belt-1".into(),
+            deliver: "hub-belt-1".into(),
+            desired_freighters: 3,
+        };
+        for _ in 0..2 {
+            let reused = repository
+                .create_or_reuse_active(
+                    new_mining_campaign_workflow(MiningCampaignIntent {
+                        region: " ALPHA ".into(),
+                        systems: vec!["REMOTE".into()],
+                        hub: "HUB-BELT-1".into(),
+                        max_concurrency: 1,
+                        transport_routes: vec![route.clone()],
+                    }),
+                    |workflow| {
+                        Ok(workflow
+                            .config::<MiningCampaignIntent>()
+                            .is_ok_and(|intent| {
+                                mining_transport_campaign_matches(&intent, " ALPHA ", &route)
+                            }))
+                    },
+                )
+                .expect("reconcile");
+            assert_eq!(reused.instance.id, legacy.id);
+            assert_eq!(
+                reused.instance.config::<Value>().expect("immutable config"),
+                legacy_config
+            );
+        }
+        assert_eq!(repository.list().expect("workflows").len(), 1);
     }
 
     #[tokio::test]

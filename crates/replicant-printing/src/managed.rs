@@ -7,7 +7,8 @@ use std::{
 };
 
 use replicant_client::{
-    AutofactoryPrintOptions, Client, DeviceType, Operation, OperationStatus, domain::Device, raw,
+    AutofactoryPrintOptions, Client, DeviceType, Operation, OperationId, OperationStatus,
+    domain::Device, raw,
 };
 use serde::Serialize;
 use serde_json::{Map, Value};
@@ -199,6 +200,8 @@ pub struct TrackedPrintRequest {
     pub flatpack: bool,
     /// Whether to force a targeted live factory read immediately before submission.
     pub authoritative_factory_check: bool,
+    /// Stable durable identity supplied by a checkpointed caller before submission.
+    pub operation_id: Option<OperationId>,
 }
 
 impl TrackedPrintRequest {
@@ -210,6 +213,7 @@ impl TrackedPrintRequest {
             quantity,
             flatpack: false,
             authoritative_factory_check: false,
+            operation_id: None,
         }
     }
 
@@ -966,6 +970,9 @@ where
         };
         let handle = client.devices().get(&assignment.factory_code).await?;
         let mut print_options = AutofactoryPrintOptions::new(assignment.quantity).tags(tags);
+        if let Some(operation_id) = &request.operation_id {
+            print_options = print_options.operation_id(operation_id.clone());
+        }
         if assignment.flatpack {
             print_options = print_options.flatpacked();
         }

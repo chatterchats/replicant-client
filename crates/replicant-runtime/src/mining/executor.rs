@@ -428,7 +428,9 @@ async fn reconcile_print_batches(client: &Client, mission: &mut MiningMission) -
                             && tags.contains(&batch.batch_tag)
                     })
                 });
-        if queued || i64::try_from(batch.produced_codes.len())? == batch.quantity {
+        // Partial output from a legacy multi-unit batch also proves acceptance.
+        // Reprinting its full quantity would duplicate the devices already produced.
+        if queued || !batch.produced_codes.is_empty() {
             batch.submission_started = true;
             batch.submitted = true;
             continue;
@@ -549,8 +551,14 @@ async fn submit_print_batches(
             .iter()
             .map(|index| {
                 let batch = &mission.print_batches[*index];
-                TrackedPrintRequest::new(batch.device_type.clone(), batch.quantity)
-                    .authoritative_factory_check()
+                let mut request =
+                    TrackedPrintRequest::new(batch.device_type.clone(), batch.quantity)
+                        .authoritative_factory_check();
+                request.operation_id = Some(OperationId::from(format!(
+                    "mining:{}:print:{}",
+                    mission.mission_id, batch.batch_tag
+                )));
+                request
             })
             .collect::<Vec<_>>();
         let report = queue_tracked_prints_once(
@@ -1112,11 +1120,85 @@ async fn deploy_sites(
     }
 }
 
+fn site_delivery_namespace(mission: &MiningMission, index: usize) -> uuid::Uuid {
+    use sha2::{Digest, Sha256};
+
+    let mut digest = Sha256::new();
+    let site = &mission.sites[index];
+    for value in std::iter::once(&mission.mission_id)
+        .chain(std::iter::once(&site.belt))
+        .chain(site.assets.codes().iter())
+    {
+        digest.update((value.len() as u64).to_be_bytes());
+        digest.update(value.as_bytes());
+    }
+    let hash = digest.finalize();
+    let mut bytes = [0; 16];
+    bytes.copy_from_slice(&hash[..16]);
+    uuid::Uuid::from_bytes(bytes)
+}
+
+async fn resume_site_delivery(
+    client: &Client,
+    config: &Config,
+    mission: &mut MiningMission,
+    index: usize,
+) -> AnyResult<()> {
+    let site = &mission.sites[index];
+    let carrier = site.carrier.as_ref().ok_or_else(|| {
+        app_error(
+            io::ErrorKind::InvalidData,
+            "outbound mining site lost its carrier",
+        )
+    })?;
+    let mut payload = Vec::new();
+    for code in site.assets.codes() {
+        if site.missing.contains_key(SYSTEM_WARD)
+            && site.assets.system_ward.as_deref() == Some(code.as_str())
+        {
+            continue;
+        }
+        let snapshot = validation::device(client, &code, ValidationReason::Mutation).await?;
+        payload.push(PayloadDevice {
+            code,
+            device_type: device_type(&snapshot).unwrap_or_default().to_owned(),
+            origin: mission.hub_location.clone(),
+        });
+    }
+    deliver_devices_with(
+        client,
+        &site.belt,
+        &payload,
+        std::slice::from_ref(carrier),
+        DeliveryOptions {
+            wait_timeout: config.wait_timeout,
+            poll_interval: POLL_INTERVAL,
+            unfurl_modular_payload: false,
+            return_transports: true,
+            operation_namespace: Some(site_delivery_namespace(mission, index)),
+            ..DeliveryOptions::default()
+        },
+    )
+    .await?;
+    mission.sites[index].phase = SitePhase::Deploying;
+    save_plan(&config.plan_path, mission)
+}
+
 async fn dispatch_ready_sites(
     client: &Client,
     config: &Config,
     mission: &mut MiningMission,
 ) -> AnyResult<()> {
+    // An Outbound checkpoint owns the exact payload and carrier even if delivery
+    // completed before the phase write. Transport reconciles arrived/attached
+    // devices and resumes the same managed operations, never a new shipment.
+    for index in 0..mission.sites.len() {
+        if mission.sites[index].phase != SitePhase::Outbound {
+            continue;
+        }
+        resume_site_delivery(client, config, mission, index).await?;
+        configure_site(client, config, mission, index).await?;
+    }
     let devices = device_snapshots(client).await?;
     let in_flight = mission
         .sites
@@ -1219,7 +1301,7 @@ async fn dispatch_ready_sites(
         .await?;
         deliveries.push((index, carrier, payload, mission.sites[index].belt.clone()));
     }
-    let results = join_all(deliveries.iter().map(|(_, carrier, payload, belt)| {
+    let results = join_all(deliveries.iter().map(|(index, carrier, payload, belt)| {
         deliver_devices_with(
             client,
             belt,
@@ -1230,6 +1312,7 @@ async fn dispatch_ready_sites(
                 poll_interval: POLL_INTERVAL,
                 unfurl_modular_payload: false,
                 return_transports: true,
+                operation_namespace: Some(site_delivery_namespace(mission, *index)),
                 ..DeliveryOptions::default()
             },
         )
@@ -1336,12 +1419,24 @@ async fn configure_site(
         site.assets.mining_controller.as_deref().ok_or_else(|| {
             app_error(io::ErrorKind::InvalidData, "site has no mining controller")
         })?;
-    ensure_adoption(client, mining_controller, &site.assets.mining_drones).await?;
+    ensure_adoption(
+        client,
+        &mission.mission_id,
+        mining_controller,
+        &site.assets.mining_drones,
+    )
+    .await?;
     let survey_controller =
         site.assets.survey_controller.as_deref().ok_or_else(|| {
             app_error(io::ErrorKind::InvalidData, "site has no survey controller")
         })?;
-    ensure_adoption(client, survey_controller, &site.assets.survey_drones).await?;
+    ensure_adoption(
+        client,
+        &mission.mission_id,
+        survey_controller,
+        &site.assets.survey_drones,
+    )
+    .await?;
     mission.sites[index].phase = SitePhase::Verifying;
     save_plan(&config.plan_path, mission)?;
     let mining_controller = site.assets.mining_controller.as_deref().unwrap_or_default();
@@ -1484,7 +1579,12 @@ async fn ensure_site_protection(client: &Client, site: &super::SiteMission) -> A
     Ok(())
 }
 
-async fn ensure_adoption(client: &Client, controller: &str, devices: &[String]) -> AnyResult<()> {
+async fn ensure_adoption(
+    client: &Client,
+    mission_id: &str,
+    controller: &str,
+    devices: &[String],
+) -> AnyResult<()> {
     let snapshots = device_snapshots(client).await?;
     let missing = devices
         .iter()
@@ -1505,10 +1605,16 @@ async fn ensure_adoption(client: &Client, controller: &str, devices: &[String]) 
         Some(handle) => handle,
         None => client.devices().get(controller).await?,
     };
-    let operation = handle
-        .command(api_raw::devices::DeviceCommand::Adopt(targets(&missing)))
-        .await?;
-    ensure_operation_accepted(&operation).await
+    for code in &missing {
+        let operation = handle
+            .command_with_id(
+                OperationId::from(format!("mining:{mission_id}:adopt:{controller}:{code}")),
+                api_raw::devices::DeviceCommand::Adopt(targets(std::slice::from_ref(code))),
+            )
+            .await?;
+        ensure_operation_accepted(&operation).await?;
+    }
+    Ok(())
 }
 
 async fn allocate_route_assets(
@@ -1603,14 +1709,25 @@ async fn activate_routes(
         }
         mission.routes[index].phase = RoutePhase::Activating;
         save_plan(&config.plan_path, mission)?;
-        configure_route(client, &mission.routes[index], &mission.hub_location).await?;
+        configure_route(
+            client,
+            &mission.mission_id,
+            &mission.routes[index],
+            &mission.hub_location,
+        )
+        .await?;
         mission.routes[index].phase = RoutePhase::Active;
         save_plan(&config.plan_path, mission)?;
     }
     Ok(())
 }
 
-async fn configure_route(client: &Client, route: &super::RouteMission, hub: &str) -> AnyResult<()> {
+async fn configure_route(
+    client: &Client,
+    mission_id: &str,
+    route: &super::RouteMission,
+    hub: &str,
+) -> AnyResult<()> {
     let controller = route.controller.as_deref().ok_or_else(|| {
         app_error(
             io::ErrorKind::InvalidData,
@@ -1628,7 +1745,7 @@ async fn configure_route(client: &Client, route: &super::RouteMission, hub: &str
             ),
         ));
     }
-    ensure_adoption(client, controller, &freighters).await?;
+    ensure_adoption(client, mission_id, controller, &freighters).await?;
     let handle = match client.devices().cached(controller) {
         Some(handle) => handle,
         None => client.devices().get(controller).await?,
@@ -2185,5 +2302,153 @@ mod tests {
             "mission",
             &["plain".to_owned()].into_iter().collect()
         ));
+    }
+
+    #[tokio::test]
+    async fn mining_restart_print_acceptance_uses_queue_or_partial_output_without_resubmission() {
+        use replicant_client::{SecretString, StartupPolicy, raw::Url};
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+
+        for evidence in ["queue", "partial_output", "ambiguous"] {
+            let server = MockServer::start().await;
+            let queue = if evidence == "queue" {
+                serde_json::json!([{"tags": ["mine-m:sol", "mine-b:one"]}])
+            } else {
+                serde_json::json!([])
+            };
+            Mock::given(method("GET"))
+                .and(path("/v1/devices/AF"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "device_code": "AF", "device_type": "autofactory",
+                    "location": "SOL-BELT-1", "status": "idle", "print_queue": queue
+                })))
+                .mount(&server)
+                .await;
+            let client = Client::builder()
+                .base_url(Url::parse(&server.uri()).expect("URL"))
+                .authentication_token(SecretString::from("fixture"))
+                .in_memory()
+                .startup_policy(StartupPolicy::RestoreOnly)
+                .start()
+                .await
+                .expect("client");
+            let mut mission: MiningMission = serde_json::from_value(serde_json::json!({
+                "version": 1, "mission_id": "legacy", "mission_tag": "mine-m:sol",
+                "phase": "deploying_sites", "selected_replicant": "WORKER",
+                "hub_location": "SOL-BELT-1", "sites": [], "routes": [],
+                "print_batches": [{
+                    "purpose": "site", "factory_code": "AF", "device_type": "mining_drone",
+                    "quantity": 2, "projected_finish_seconds": 10.0,
+                    "batch_tag": "mine-b:one", "submission_started": true, "submitted": false,
+                    "operation_id": null,
+                    "produced_codes": if evidence == "partial_output" { vec!["OUTPUT"] } else { vec![] }
+                }],
+                "site_print_requirements": {}, "route_print_requirements": {},
+                "total_material_cost": {}, "warnings": []
+            })).expect("legacy print checkpoint");
+            for _ in 0..2 {
+                let result = reconcile_print_batches(&client, &mut mission).await;
+                if evidence == "ambiguous" {
+                    assert!(result.is_err());
+                    assert!(!mission.print_batches[0].submitted);
+                } else {
+                    result.expect("reconcile accepted print");
+                    assert!(mission.print_batches[0].submitted);
+                }
+            }
+            assert!(
+                server
+                    .received_requests()
+                    .await
+                    .expect("requests")
+                    .iter()
+                    .all(|request| request.method == "GET")
+            );
+            client.close().await.expect("close");
+        }
+    }
+
+    #[tokio::test]
+    async fn mining_restart_outbound_delivery_already_arrived_advances_without_shipping_again() {
+        use replicant_client::{SecretString, StartupPolicy, raw::Url};
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+
+        let server = MockServer::start().await;
+        for (code, kind, location) in [
+            ("MD", "maintenance_drone", "REMOTE-BELT-1"),
+            ("CARRIER", "surge_carrier", "HUB-BELT-1"),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(format!("/v1/devices/{code}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "device_code": code, "device_type": kind, "location": location, "status": "idle"
+                })))
+                .mount(&server)
+                .await;
+        }
+        let client = Client::builder()
+            .base_url(Url::parse(&server.uri()).expect("URL"))
+            .authentication_token(SecretString::from("fixture"))
+            .in_memory()
+            .startup_policy(StartupPolicy::RestoreOnly)
+            .start()
+            .await
+            .expect("client");
+        let mut mission: MiningMission = serde_json::from_value(serde_json::json!({
+            "version": 1, "mission_id": "legacy", "mission_tag": "mine-m:remote",
+            "phase": "deploying_sites", "selected_replicant": "WORKER",
+            "hub_location": "HUB-BELT-1", "routes": [], "print_batches": [],
+            "sites": [{
+                "system": "REMOTE", "belt": "REMOTE-BELT-1", "density": "dense",
+                "tag": "mine-s:remote", "phase": "outbound", "carrier": "CARRIER",
+                "assets": {"mining_drones": [], "survey_drones": [], "maintenance_drone": "MD"},
+                "missing": {}
+            }],
+            "site_print_requirements": {}, "route_print_requirements": {},
+            "total_material_cost": {}, "warnings": []
+        }))
+        .expect("outbound checkpoint");
+        let plan_path =
+            std::env::temp_dir().join(format!("mining-outbound-{}.json", uuid::Uuid::new_v4()));
+        let config = Config {
+            systems: vec!["REMOTE".into()],
+            replicant: Some("WORKER".into()),
+            hub: "HUB-BELT-1".into(),
+            transport_routes: Vec::new(),
+            plan_path: plan_path.clone(),
+            replace_plan: false,
+            wait_timeout: Duration::from_secs(1),
+            max_concurrency: 1,
+        };
+        save_plan(&plan_path, &mission).expect("persist outbound intent");
+        mission = serde_json::from_slice(&std::fs::read(&plan_path).expect("checkpoint"))
+            .expect("restart");
+        resume_site_delivery(&client, &config, &mut mission, 0)
+            .await
+            .expect("reconcile delivery");
+        let restored: MiningMission =
+            serde_json::from_slice(&std::fs::read(&plan_path).expect("checkpoint"))
+                .expect("persisted arrival");
+        assert_eq!(restored.sites[0].phase, SitePhase::Deploying);
+        assert_eq!(
+            restored.sites[0].assets.maintenance_drone.as_deref(),
+            Some("MD")
+        );
+        assert!(
+            server
+                .received_requests()
+                .await
+                .expect("requests")
+                .iter()
+                .all(|request| request.method == "GET")
+        );
+        client.close().await.expect("close");
+        std::fs::remove_file(plan_path).expect("remove checkpoint");
     }
 }

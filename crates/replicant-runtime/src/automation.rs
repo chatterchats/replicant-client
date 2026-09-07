@@ -5888,6 +5888,9 @@ fn recover_mining_transport_capacity_children(
                 && !checkpoint.staging_children.contains_key(code)
             {
                 checkpoint.staging_children.insert(code.clone(), child.id);
+                if !checkpoint.selected_freighters.contains(code) {
+                    checkpoint.selected_freighters.push(code.clone());
+                }
                 changed = true;
                 continue;
             }
@@ -5951,7 +5954,15 @@ async fn release_mining_transport_capacity(
                 .get(&intent.controller)
                 .await
                 .map_err(string_error)?
-                .command(mining_transport_release_command(code))
+                .command_with_id(
+                    manifest_operation_id(
+                        context.id(),
+                        "capacity-release",
+                        code,
+                        &intent.controller,
+                    ),
+                    mining_transport_release_command(code),
+                )
                 .await
                 .map_err(string_error)?;
             await_success(&operation).await?;
@@ -5989,14 +6000,6 @@ async fn finish_mining_transport_scale_down(
             context.mark_waiting().map_err(string_error)?;
             return Ok(());
         }
-        return context
-            .mark_succeeded(Some(serde_json::json!({
-                "route": mining_transport_capacity_route_key(intent),
-                "target_freighters": intent.target_freighters,
-                "released_freighter": code,
-                "decommissioned": false,
-            })))
-            .map_err(string_error);
     }
 
     let snapshot = client
@@ -6007,7 +6010,11 @@ async fn finish_mining_transport_scale_down(
         .snapshot()
         .await
         .map_err(string_error)?;
-    if snapshot.relationships.controller.is_some() || snapshot.travel.is_some() {
+    if snapshot.relationships.controller.is_some()
+        || snapshot.relationships.attached_to.is_some()
+        || snapshot.relationships.stowed_in.is_some()
+        || snapshot.travel.is_some()
+    {
         context
             .advance_to("waiting_for_released_capacity", checkpoint)
             .map_err(string_error)?;
@@ -6034,6 +6041,13 @@ async fn finish_mining_transport_scale_down(
                 "decommissioned": false,
             })))
             .map_err(string_error);
+    }
+    if checkpoint.return_child.is_some() {
+        context
+            .advance_to("verifying_released_capacity_return", checkpoint)
+            .map_err(string_error)?;
+        context.mark_waiting().map_err(string_error)?;
+        return Ok(());
     }
     context
         .release_claim(&ResourceKey::Device(code.clone()))
@@ -6497,27 +6511,34 @@ impl WorkflowExecutor for MiningTransportCapacityWorkflow {
                 .get(&intent.controller)
                 .await
                 .map_err(string_error)?;
-            let operation = controller
-                .command(replicant_client::raw::devices::DeviceCommand::Adopt(
-                    replicant_client::raw::devices::TargetsCommand {
-                        devices: Some(serde_json::json!(&adopt)),
-                        ..Default::default()
-                    },
-                ))
-                .await
-                .map_err(string_error)?;
-            await_success(&operation).await?;
+            for code in &adopt {
+                let operation = controller
+                    .command_with_id(
+                        manifest_operation_id(
+                            context.id(),
+                            "capacity-adopt",
+                            code,
+                            &intent.controller,
+                        ),
+                        replicant_client::raw::devices::DeviceCommand::Adopt(
+                            replicant_client::raw::devices::TargetsCommand {
+                                target: Some(code.clone()),
+                                ..Default::default()
+                            },
+                        ),
+                    )
+                    .await
+                    .map_err(string_error)?;
+                await_success(&operation).await?;
+            }
             for code in &adopt {
                 configure_mining_transport_freighter_tags(&client, code, &intent.system, true)
                     .await?;
             }
             context
-                .mark_succeeded(Some(serde_json::json!({
-                    "route": mining_transport_capacity_route_key(&intent),
-                    "target_freighters": intent.target_freighters,
-                    "added_freighters": adopt,
-                })))
-                .map_err(string_error)
+                .advance_to("verifying_capacity_adoption", &checkpoint)
+                .map_err(string_error)?;
+            context.mark_waiting().map_err(string_error)
         })
     }
 }
@@ -6638,6 +6659,13 @@ async fn reconcile_maintenance_tags(
     await_success(&operation).await
 }
 
+fn mining_device_delivered(device: &Device, destination: &str) -> bool {
+    device_at(device, destination)
+        && device.travel.is_none()
+        && device.relationships.attached_to.is_none()
+        && device.relationships.stowed_in.is_none()
+}
+
 async fn ensure_maintenance_patrol(
     context: &WorkflowContext,
     client: &Client,
@@ -6646,14 +6674,14 @@ async fn ensure_maintenance_patrol(
 ) -> Result<bool, String> {
     let handle = client.devices().get(code).await.map_err(string_error)?;
     let snapshot = handle.snapshot().await.map_err(string_error)?;
-    if !device_at(&snapshot, expected_location) {
+    if !mining_device_delivered(&snapshot, expected_location) {
         return Ok(false);
     }
     if maintenance_has_directive(&snapshot, "patrol")
         && snapshot
             .status
             .as_ref()
-            .is_none_or(|status| !matches!(status.as_str(), "offline" | "deactivated"))
+            .is_some_and(|status| !matches!(status.as_str(), "offline" | "deactivated"))
     {
         return Ok(true);
     }
@@ -6673,12 +6701,12 @@ async fn ensure_maintenance_patrol(
         .map_err(string_error)?;
     await_success(&operation).await?;
     let refreshed = handle.snapshot().await.map_err(string_error)?;
-    Ok(device_at(&refreshed, expected_location)
+    Ok(mining_device_delivered(&refreshed, expected_location)
         && maintenance_has_directive(&refreshed, "patrol")
         && refreshed
             .status
             .as_ref()
-            .is_none_or(|status| !matches!(status.as_str(), "offline" | "deactivated")))
+            .is_some_and(|status| !matches!(status.as_str(), "offline" | "deactivated")))
 }
 
 fn recover_mining_maintenance_rotation_children(
@@ -6972,7 +7000,7 @@ async fn deliver_rotation_replacement(
     if devices
         .iter()
         .find(|device| device.key.id.as_str().eq_ignore_ascii_case(&code))
-        .is_some_and(|device| device_at(device, &intent.site_belt))
+        .is_some_and(|device| mining_device_delivered(device, &intent.site_belt))
     {
         checkpoint.replacement_delivered = true;
         context
@@ -7109,7 +7137,7 @@ async fn recover_worn_maintenance(
             .map_err(string_error)?;
         return Ok(true);
     }
-    if device_at(worn, &intent.hub_belt) {
+    if mining_device_delivered(worn, &intent.hub_belt) {
         checkpoint.worn_returned = true;
         context
             .persist_checkpoint(checkpoint)
@@ -7202,7 +7230,7 @@ async fn finish_worn_maintenance_repair(
             })))
             .map_err(string_error);
     };
-    if !device_at(worn, &intent.hub_belt) {
+    if !mining_device_delivered(worn, &intent.hub_belt) {
         context
             .advance_to("waiting_for_worn_hub_evidence", checkpoint)
             .map_err(string_error)?;
@@ -7299,7 +7327,9 @@ impl WorkflowExecutor for MiningMaintenanceRotationWorkflow {
             }
             let devices = dispatch_owned_device_snapshots(&client).await?;
             if checkpoint.replacement.is_none()
-                && !select_rotation_replacement(context, &intent, &mut checkpoint, &devices).await?
+                && (checkpoint.provision_child.is_some()
+                    || !select_rotation_replacement(context, &intent, &mut checkpoint, &devices)
+                        .await?)
             {
                 if !provision_rotation_replacement(context, &intent, &mut checkpoint).await? {
                     return Ok(());
@@ -21081,15 +21111,6 @@ mod tests {
     }
 
     #[test]
-    fn mining_transport_scale_down_releases_without_decommissioning() {
-        let command = mining_transport_release_command("CF-EXTRA");
-        assert!(matches!(
-            command,
-            replicant_client::raw::devices::DeviceCommand::Release(_)
-        ));
-    }
-
-    #[test]
     fn mining_transport_reuse_rejects_foreign_route_or_role_tags() {
         let mut candidate = dispatch_test_device("CF-FREE", "cargo_freighter", "ALPHA-HUB");
         assert!(mining_transport_candidate_is_safe(&candidate, "ALPHA"));
@@ -21102,25 +21123,6 @@ mod tests {
             replicant_mining_planner::role_tag("survey-drone"),
         ];
         assert!(!mining_transport_candidate_is_safe(&candidate, "ALPHA"));
-    }
-
-    #[test]
-    fn maintenance_rotation_checkpoint_survives_restart_between_delivery_and_recovery() {
-        let checkpoint = MiningMaintenanceRotationCheckpoint {
-            replacement: Some("READY".to_owned()),
-            replacement_delivered: true,
-            replacement_patrol_verified: true,
-            ..MiningMaintenanceRotationCheckpoint::default()
-        };
-        let restored: MiningMaintenanceRotationCheckpoint = serde_json::from_value(
-            serde_json::to_value(&checkpoint).expect("serialize maintenance checkpoint"),
-        )
-        .expect("restore maintenance checkpoint");
-
-        assert_eq!(restored.replacement.as_deref(), Some("READY"));
-        assert!(restored.replacement_delivered);
-        assert!(maintenance_rotation_recovery_allowed(&restored));
-        assert!(restored.recovery_child.is_none());
     }
 
     #[test]
@@ -21164,32 +21166,6 @@ mod tests {
             &intent,
             HUB_MAINTENANCE_MIN_HEALTHY,
         ));
-    }
-
-    #[test]
-    fn maintenance_rotation_uses_logistics_manifests_for_delivery_and_hub_return() {
-        let intent = MiningMaintenanceRotationIntent {
-            region: "Alpha".to_owned(),
-            system: "REMOTE".to_owned(),
-            site_belt: "REMOTE-BELT-1".to_owned(),
-            hub_belt: "ALPHA-BELT-1".to_owned(),
-            worn_drone: "WORN".to_owned(),
-            replacement_candidates: vec!["READY".to_owned()],
-        };
-        let delivery = maintenance_delivery_manifest(&intent, "READY", "ALPHA-BELT-1".to_owned());
-        assert_eq!(delivery.destination, "REMOTE-BELT-1");
-        assert_eq!(delivery.device_codes, ["READY"]);
-        assert_eq!(delivery.pre_deactivate_device_codes, ["READY"]);
-        assert!(delivery.allow_transport_staging);
-        assert!(delivery.return_transports);
-
-        let recovery = maintenance_recovery_manifest(&intent, "REMOTE-BELT-1".to_owned());
-        assert_eq!(recovery.destination, "ALPHA-BELT-1");
-        assert_eq!(recovery.device_codes, ["WORN"]);
-        assert_eq!(recovery.pre_deactivate_device_codes, ["WORN"]);
-        assert!(recovery.allow_transport_staging);
-        assert!(recovery.return_transports);
-        assert_ne!(delivery.purpose, recovery.purpose);
     }
 
     #[test]
@@ -22983,3 +22959,7 @@ mod tests {
         assert!(regional_dispatch_delivery_request(&intent, &checkpoint).is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "mining_restart_tests.rs"]
+mod mining_restart_tests;

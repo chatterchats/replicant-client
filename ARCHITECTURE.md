@@ -184,6 +184,17 @@ workflow-owned temporary directory from its checkpoint immediately before callin
 and writes the resulting state back into `checkpoint_json`. A missing durable checkpoint deletes
 any stale temporary adapter file rather than trusting it after restart.
 
+Mining Ops print submissions additionally derive a managed operation identity from the persisted
+mission and batch, so losing a temporary adapter checkpoint cannot submit the print again.
+Legacy interrupted submissions without an operation identity or queue/output evidence remain
+blocked rather than being retried. Partial output is evidence of acceptance, not permission to
+reprint the original quantity. Adoption and capacity release use stable per-device operation
+identities; capacity adoption remains nonterminal until the route projection verifies its target.
+Provisioning and delivery children are rediscovered through their persisted parent and purpose.
+A maintenance rotation resumes its existing provisioning child before considering fresh stock.
+Scale-down retains one exact selected freighter, and a successful return child alone does not
+prove arrival: the device must be stationary and detached at the exact hub location.
+
 ### Parent and child work
 
 `WorkflowContext::create_child` persists `parent_id` automatically, and

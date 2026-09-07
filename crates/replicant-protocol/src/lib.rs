@@ -3843,10 +3843,15 @@ mod tests {
         let decoded: DirectorSnapshot =
             serde_json::from_value(legacy).expect("deserialize legacy Director snapshot");
         assert!(decoded.mining_policies.is_empty());
+        assert!(decoded.mining_ops.is_empty());
         assert!(decoded.catalogue_policies.is_empty());
         assert!(decoded.requirements.is_empty());
         assert!(decoded.urgency.is_empty());
         assert!(decoded.workforce.regions.is_empty());
+        assert_eq!(
+            serde_json::to_value(DirectorGoalKind::ExpandMiningOps).expect("persisted goal identity"),
+            serde_json::json!("expand_mining_ops")
+        );
     }
     #[test]
     fn director_goal_kind_serializes_unserviced_resources() {
