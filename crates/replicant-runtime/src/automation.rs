@@ -65,7 +65,13 @@ use crate::{
         reconcile_event_stock, restore_event_campaign,
     },
     failure::{FailureClass, failure_class, failure_class_from_message, failure_disposition},
-    mining::{AmiTransportRouteIntent, MiningExpansionRequest, MiningMission, execute_expansion},
+    mining::{
+        AmiTransportRouteIntent, EvidenceState, HUB_MAINTENANCE_MIN_HEALTHY,
+        HUB_MAINTENANCE_READY_PCT, HUB_MAINTENANCE_ROLE, MAX_TRANSPORT_FREIGHTERS,
+        MIN_TRANSPORT_FREIGHTERS, MaintenanceHubPoolAudit, MiningExpansionRequest, MiningMission,
+        execute_expansion, maintenance_hub_pool_audit, maintenance_replacement_ready,
+        transport_service_present,
+    },
     observatory::auto_prospect,
     relay::{
         RelayExecutionState, RelayExpansionRequest, execute_relay_workflow,
@@ -159,6 +165,21 @@ pub fn mining_campaign_workflow_kind() -> WorkflowKind {
     WorkflowKind::new("mining.campaign").expect("static workflow kind is valid")
 }
 
+/// Internal durable workflow that changes Cargo Freighter capacity on one healthy AMI route.
+pub fn mining_transport_capacity_workflow_kind() -> WorkflowKind {
+    WorkflowKind::new("mining.transport_capacity").expect("static workflow kind is valid")
+}
+
+/// Internal durable workflow that rotates one worn remote mining maintenance drone.
+pub fn mining_maintenance_rotation_workflow_kind() -> WorkflowKind {
+    WorkflowKind::new("mining.maintenance_rotation").expect("static workflow kind is valid")
+}
+
+/// Internal durable workflow that restores the regional hub maintenance patrol pool.
+pub fn mining_maintenance_pool_workflow_kind() -> WorkflowKind {
+    WorkflowKind::new("mining.maintenance_pool").expect("static workflow kind is valid")
+}
+
 /// Intent-native point-to-point logistics workflow.
 pub fn logistics_workflow_kind() -> WorkflowKind {
     WorkflowKind::new("logistics.delivery").expect("static workflow kind is valid")
@@ -235,6 +256,9 @@ pub fn register(registry: &mut WorkflowRegistry) -> Result<(), RegistryError> {
     registry.register(Arc::new(SalvageRecoveryWorkflowFactory::new()))?;
     registry.register(Arc::new(MiningDeployWorkflowFactory::new()))?;
     registry.register(Arc::new(MiningCampaignWorkflowFactory::new()))?;
+    registry.register(Arc::new(MiningTransportCapacityWorkflowFactory::new()))?;
+    registry.register(Arc::new(MiningMaintenanceRotationWorkflowFactory::new()))?;
+    registry.register(Arc::new(MiningMaintenancePoolWorkflowFactory::new()))?;
     registry.register(Arc::new(LogisticsWorkflowFactory::new()))?;
     registry.register(Arc::new(RegionalDispatchWorkflowFactory::new()))?;
     registry.register(Arc::new(LogisticsManifestWorkflowFactory::new()))?;
@@ -478,6 +502,127 @@ pub struct MiningCampaignIntent {
     /// Scheduler ceiling for simultaneously runnable items.
     #[serde(default = "default_mining_concurrency")]
     pub max_concurrency: usize,
+}
+
+/// Durable Mining Ops request to change Cargo Freighter capacity on one healthy AMI route.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct MiningTransportCapacityIntent {
+    /// Canonical Director region owning the route.
+    pub region: String,
+    /// Mining system served by the route.
+    pub system: String,
+    /// Exact mining belt collection inventory/location.
+    pub collect: String,
+    /// Exact regional delivery/hub location.
+    pub deliver: String,
+    /// Existing AMI Transport Controller that must remain in service.
+    pub controller: String,
+    /// Desired usable Cargo Freighter count after this mutation.
+    pub target_freighters: usize,
+    /// Safe idle regional stock candidates selected by the Director before printing.
+    #[serde(default)]
+    pub reuse_candidates: Vec<String>,
+}
+
+/// Restart-safe capacity mutation state for one AMI route.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct MiningTransportCapacityCheckpoint {
+    /// Reusable freighters already selected for scale-up.
+    #[serde(default)]
+    pub selected_freighters: Vec<String>,
+    /// Logistics children staging reusable regional stock to the controller.
+    #[serde(default)]
+    pub staging_children: BTreeMap<String, WorkflowId>,
+    /// Regional-dispatch child that reuses hub stock and prints only the remaining deficit.
+    #[serde(default)]
+    pub dispatch_child: Option<WorkflowId>,
+    /// Extra adopted freighter selected for scale-down.
+    #[serde(default)]
+    pub release_freighter: Option<String>,
+    /// Whether the selected scale-down freighter has been released from the AMI controller.
+    #[serde(default)]
+    pub release_complete: bool,
+    /// Logistics child returning released capacity to regional hub stock.
+    #[serde(default)]
+    pub return_child: Option<WorkflowId>,
+}
+
+/// Durable request to rotate one worn maintenance drone at a remote mining site.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct MiningMaintenanceRotationIntent {
+    /// Canonical Director region owning the site.
+    pub region: String,
+    /// Mining system whose one remote maintenance slot is being rotated.
+    pub system: String,
+    /// Exact remote mining belt.
+    pub site_belt: String,
+    /// Exact regional manufacturing/home belt and maintenance-pool location.
+    pub hub_belt: String,
+    /// Exact worn maintenance drone that triggered this rotation.
+    pub worn_drone: String,
+    /// Ordered safe replacement candidates: hub-pool spare first, then idle regional stock.
+    #[serde(default)]
+    pub replacement_candidates: Vec<String>,
+}
+
+/// Restart-safe lifecycle state for one remote maintenance rotation.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct MiningMaintenanceRotationCheckpoint {
+    /// Exact replacement identity selected or provisioned for this rotation.
+    #[serde(default)]
+    pub replacement: Option<String>,
+    /// Regional-dispatch child used when no safe reusable replacement exists.
+    #[serde(default)]
+    pub provision_child: Option<WorkflowId>,
+    /// Logistics child delivering a selected reusable replacement to the remote belt.
+    #[serde(default)]
+    pub delivery_child: Option<WorkflowId>,
+    /// Replacement has been authoritatively observed at the remote belt.
+    #[serde(default)]
+    pub replacement_delivered: bool,
+    /// Replacement patrol directive and remote mining tags are verified.
+    #[serde(default)]
+    pub replacement_patrol_verified: bool,
+    /// Logistics child recovering the worn drone to the exact regional hub belt.
+    #[serde(default)]
+    pub recovery_child: Option<WorkflowId>,
+    /// Authoritative owned-device refresh proved the worn drone disappeared before recovery.
+    #[serde(default)]
+    pub worn_missing: bool,
+    /// The worn drone still exists but authoritative status proves physical recovery is no longer viable.
+    #[serde(default)]
+    pub worn_unrecoverable: bool,
+    /// Worn drone has been observed back at the exact regional hub belt.
+    #[serde(default)]
+    pub worn_returned: bool,
+    /// Worn drone is tagged for the hub maintenance pool and back on patrol.
+    #[serde(default)]
+    pub hub_patrol_configured: bool,
+}
+
+/// Durable request to restore/configure the regional hub maintenance patrol pool.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct MiningMaintenancePoolIntent {
+    /// Canonical Director region owning the pool.
+    pub region: String,
+    /// Exact regional manufacturing/home belt.
+    pub hub_belt: String,
+    /// Healthy patrol count to restore to for this decision (hard minimum or target).
+    pub target_healthy: usize,
+    /// Safe ready idle drones that should be configured before provisioning hardware.
+    #[serde(default)]
+    pub reuse_candidates: Vec<String>,
+}
+
+/// Restart-safe state for one hub maintenance-pool restoration decision.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct MiningMaintenancePoolCheckpoint {
+    /// Exact existing/new drones selected for patrol configuration.
+    #[serde(default)]
+    pub selected_drones: Vec<String>,
+    /// Regional-dispatch child that reuses stock and prints only the remaining deficit.
+    #[serde(default)]
+    pub provision_child: Option<WorkflowId>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -2228,6 +2373,97 @@ fn region_establish_placement(
     )
 }
 
+fn mining_transport_capacity_placement(
+    instance: &replicant_workflow::WorkflowInstance,
+    items: &[WorkItem],
+) -> Result<WorkflowPlacementIntentProjection, String> {
+    let intent: MiningTransportCapacityIntent = instance.config().map_err(string_error)?;
+    workflow_placement_projection(
+        instance,
+        items,
+        |intents| {
+            if let Some(subject) = placement_device(&intent.controller) {
+                intents.push(placement_intent(
+                    subject,
+                    WorkflowPlacementIntentRelation::Claimed,
+                    None,
+                    None,
+                ));
+            }
+            for code in &intent.reuse_candidates {
+                if let Some(subject) = placement_device(code) {
+                    intents.push(placement_intent(
+                        subject,
+                        WorkflowPlacementIntentRelation::Claimed,
+                        None,
+                        None,
+                    ));
+                }
+            }
+        },
+        |_, _| {},
+    )
+}
+
+fn mining_maintenance_rotation_placement(
+    instance: &replicant_workflow::WorkflowInstance,
+    items: &[WorkItem],
+) -> Result<WorkflowPlacementIntentProjection, String> {
+    let intent: MiningMaintenanceRotationIntent = instance.config().map_err(string_error)?;
+    let checkpoint: MiningMaintenanceRotationCheckpoint =
+        instance.checkpoint().map_err(string_error)?;
+    workflow_placement_projection(
+        instance,
+        items,
+        |intents| {
+            for code in std::iter::once(&intent.worn_drone)
+                .chain(intent.replacement_candidates.iter())
+                .chain(checkpoint.replacement.iter())
+            {
+                if let Some(subject) = placement_device(code) {
+                    intents.push(placement_intent(
+                        subject,
+                        WorkflowPlacementIntentRelation::Claimed,
+                        None,
+                        None,
+                    ));
+                }
+            }
+        },
+        |_, _| {},
+    )
+}
+
+fn mining_maintenance_pool_placement(
+    instance: &replicant_workflow::WorkflowInstance,
+    items: &[WorkItem],
+) -> Result<WorkflowPlacementIntentProjection, String> {
+    let intent: MiningMaintenancePoolIntent = instance.config().map_err(string_error)?;
+    let checkpoint: MiningMaintenancePoolCheckpoint =
+        instance.checkpoint().map_err(string_error)?;
+    workflow_placement_projection(
+        instance,
+        items,
+        |intents| {
+            for code in intent
+                .reuse_candidates
+                .iter()
+                .chain(checkpoint.selected_drones.iter())
+            {
+                if let Some(subject) = placement_device(code) {
+                    intents.push(placement_intent(
+                        subject,
+                        WorkflowPlacementIntentRelation::Claimed,
+                        None,
+                        None,
+                    ));
+                }
+            }
+        },
+        |_, _| {},
+    )
+}
+
 fn service_intents_for_factory(
     kind: &str,
     instance: &replicant_workflow::WorkflowInstance,
@@ -2250,6 +2486,7 @@ fn service_intents_for_factory(
                                 system: route.system,
                                 collect: route.belt,
                                 deliver: destination.clone(),
+                                desired_freighters: route.desired_freighters,
                             }
                             .workflow_service_intent()
                         })
@@ -2258,6 +2495,31 @@ fn service_intents_for_factory(
             }
             Ok(WorkflowServiceIntentProjection::unknown([
                 WorkflowServiceScope::System(intent.system.trim().to_ascii_uppercase()),
+            ]))
+        }
+        "mining.transport_capacity" => {
+            let intent: MiningTransportCapacityIntent = instance.config().map_err(string_error)?;
+            Ok(WorkflowServiceIntentProjection::complete(vec![
+                AmiTransportRouteIntent {
+                    system: intent.system,
+                    collect: intent.collect,
+                    deliver: intent.deliver,
+                    desired_freighters: intent.target_freighters,
+                }
+                .workflow_service_intent(),
+            ]))
+        }
+        "mining.maintenance_rotation" => {
+            let intent: MiningMaintenanceRotationIntent =
+                instance.config().map_err(string_error)?;
+            Ok(WorkflowServiceIntentProjection::unknown([
+                WorkflowServiceScope::System(intent.system.trim().to_ascii_uppercase()),
+            ]))
+        }
+        "mining.maintenance_pool" => {
+            let intent: MiningMaintenancePoolIntent = instance.config().map_err(string_error)?;
+            Ok(WorkflowServiceIntentProjection::unknown([
+                WorkflowServiceScope::Region(canonical_region(&intent.region)),
             ]))
         }
         "region.establish" => {
@@ -2535,6 +2797,7 @@ impl WorkflowFactory for MiningCampaignWorkflowFactory {
                         system: route.system,
                         collect: route.belt,
                         deliver: destination.clone(),
+                        desired_freighters: route.desired_freighters,
                     }
                     .workflow_service_intent()
                 })
@@ -2575,6 +2838,24 @@ impl WorkflowFactory for MiningCampaignWorkflowFactory {
         mining_campaign_placement(instance, work_items)
     }
 }
+workflow_factory!(
+    MiningTransportCapacityWorkflowFactory,
+    MiningTransportCapacityWorkflow,
+    mining_transport_capacity_workflow_kind,
+    mining_transport_capacity_placement
+);
+workflow_factory!(
+    MiningMaintenanceRotationWorkflowFactory,
+    MiningMaintenanceRotationWorkflow,
+    mining_maintenance_rotation_workflow_kind,
+    mining_maintenance_rotation_placement
+);
+workflow_factory!(
+    MiningMaintenancePoolWorkflowFactory,
+    MiningMaintenancePoolWorkflow,
+    mining_maintenance_pool_workflow_kind,
+    mining_maintenance_pool_placement
+);
 workflow_factory!(
     SalvageRecoveryWorkflowFactory,
     SalvageRecoveryWorkflow,
@@ -5479,6 +5760,1753 @@ impl WorkflowExecutor for MiningCampaignWorkflow {
     }
 }
 
+fn mining_transport_capacity_route_key(intent: &MiningTransportCapacityIntent) -> String {
+    format!(
+        "{}|{}|{}",
+        canonical_region(&intent.region),
+        intent.collect.trim().to_ascii_uppercase(),
+        intent.deliver.trim().to_ascii_uppercase()
+    )
+}
+
+fn mining_transport_remaining_deficit(
+    target_freighters: usize,
+    current_freighters: usize,
+    selected_reusable: usize,
+) -> usize {
+    target_freighters
+        .saturating_sub(current_freighters)
+        .saturating_sub(selected_reusable)
+}
+
+fn mining_transport_release_command(code: &str) -> replicant_client::raw::devices::DeviceCommand {
+    replicant_client::raw::devices::DeviceCommand::Release(
+        replicant_client::raw::devices::TargetsCommand {
+            target: Some(code.to_owned()),
+            ..Default::default()
+        },
+    )
+}
+
+fn mining_transport_candidate_is_safe(device: &Device, system: &str) -> bool {
+    let expected_site_tag = replicant_mining_planner::site_tag(system);
+    let expected_role_tag = replicant_mining_planner::role_tag("cargo-freighter");
+    device.access == AccessScope::Owned
+        && device_is_type(device, "cargo_freighter")
+        && device.relationships.controller.is_none()
+        && device.relationships.attached_to.is_none()
+        && device.relationships.stowed_in.is_none()
+        && device.travel.is_none()
+        && device
+            .status
+            .as_ref()
+            .is_some_and(|status| status.as_str() == "idle")
+        && !device.tags.iter().any(|tag| {
+            (tag.starts_with("mine-s:") && tag != &expected_site_tag)
+                || (tag.starts_with("mine-r:") && tag != &expected_role_tag)
+                || tag.starts_with("evt-")
+                || tag.starts_with("evt_")
+                || tag.starts_with("relay-")
+                || tag.starts_with("mine-m:")
+                || tag.starts_with("mine-b:")
+        })
+}
+
+async fn configure_mining_transport_freighter_tags(
+    client: &Client,
+    code: &str,
+    system: &str,
+    add: bool,
+) -> Result<(), String> {
+    let site_tag = replicant_mining_planner::site_tag(system);
+    let role_tag = replicant_mining_planner::role_tag("cargo-freighter");
+    let handle = client.devices().get(code).await.map_err(string_error)?;
+    let snapshot = handle.snapshot().await.map_err(string_error)?;
+    let tags = [site_tag, role_tag]
+        .into_iter()
+        .filter(|tag| add != snapshot.tags.contains(tag))
+        .collect::<Vec<_>>();
+    if tags.is_empty() {
+        return Ok(());
+    }
+    let configuration = if add {
+        replicant_client::raw::devices::DeviceConfiguration {
+            add_tags: Some(tags),
+            ..Default::default()
+        }
+    } else {
+        replicant_client::raw::devices::DeviceConfiguration {
+            remove_tags: Some(tags),
+            ..Default::default()
+        }
+    };
+    let operation = handle
+        .configure(configuration)
+        .await
+        .map_err(string_error)?;
+    await_success(&operation).await
+}
+
+fn mining_transport_child_pending(
+    context: &WorkflowContext,
+    child_id: WorkflowId,
+    label: &str,
+) -> Result<bool, String> {
+    let Some(child) = context.repository().read(child_id).map_err(string_error)? else {
+        return Err(format!("{label} child {child_id} disappeared"));
+    };
+    match child.status {
+        WorkflowStatus::Succeeded => Ok(false),
+        WorkflowStatus::Failed | WorkflowStatus::Cancelled => Err(format!(
+            "{label} child {child_id} ended as {:?}: {}",
+            child.status,
+            child.last_error.unwrap_or_default()
+        )),
+        _ => Ok(true),
+    }
+}
+
+fn recover_mining_transport_capacity_children(
+    context: &WorkflowContext,
+    intent: &MiningTransportCapacityIntent,
+    checkpoint: &mut MiningTransportCapacityCheckpoint,
+) -> Result<bool, String> {
+    let route_key = mining_transport_capacity_route_key(intent);
+    let stage_prefix = format!("mining-transport-capacity:stage:{route_key}:");
+    let return_prefix = format!("mining-transport-capacity:return:{route_key}:");
+    let mut children = context.child_workflows().map_err(string_error)?;
+    children.sort_by_key(|workflow| std::cmp::Reverse(workflow.created_at));
+    let mut changed = false;
+
+    for child in children {
+        if child.kind == logistics_manifest_workflow_kind() {
+            let Ok(config) = child.config::<LogisticsManifestIntent>() else {
+                continue;
+            };
+            if config.purpose.starts_with(&stage_prefix)
+                && let Some(code) = config.device_codes.first()
+                && !checkpoint.staging_children.contains_key(code)
+            {
+                checkpoint.staging_children.insert(code.clone(), child.id);
+                changed = true;
+                continue;
+            }
+            if config.purpose.starts_with(&return_prefix) && checkpoint.return_child.is_none() {
+                checkpoint.return_child = Some(child.id);
+                changed = true;
+            }
+            continue;
+        }
+        if child.kind == regional_dispatch_workflow_kind() && checkpoint.dispatch_child.is_none() {
+            let Ok(config) = child.config::<RegionalDispatchIntent>() else {
+                continue;
+            };
+            let capacity_dispatch = config.source.eq_ignore_ascii_case(&intent.deliver)
+                && config.devices.len() == 1
+                && config.devices[0]
+                    .device_type
+                    .eq_ignore_ascii_case("cargo_freighter")
+                && config.devices[0].quantity > 0;
+            if capacity_dispatch {
+                checkpoint.dispatch_child = Some(child.id);
+                changed = true;
+            }
+        }
+    }
+    Ok(changed)
+}
+
+async fn release_mining_transport_capacity(
+    context: &mut WorkflowContext,
+    client: &Client,
+    intent: &MiningTransportCapacityIntent,
+    checkpoint: &mut MiningTransportCapacityCheckpoint,
+    code: &str,
+) -> Result<(), String> {
+    claim_device(context, code)?;
+    checkpoint.release_freighter = Some(code.to_owned());
+    context
+        .persist_checkpoint(checkpoint)
+        .map_err(string_error)?;
+    context
+        .advance_to("releasing_excess_capacity", checkpoint)
+        .map_err(string_error)?;
+    let snapshot = client
+        .devices()
+        .get(code)
+        .await
+        .map_err(string_error)?
+        .snapshot()
+        .await
+        .map_err(string_error)?;
+    match snapshot
+        .relationships
+        .controller
+        .as_ref()
+        .map(|controller| controller.id.as_str())
+    {
+        Some(controller) if controller.eq_ignore_ascii_case(&intent.controller) => {
+            let operation = client
+                .devices()
+                .get(&intent.controller)
+                .await
+                .map_err(string_error)?
+                .command(mining_transport_release_command(code))
+                .await
+                .map_err(string_error)?;
+            await_success(&operation).await?;
+        }
+        Some(controller) => {
+            return Err(format!(
+                "Cargo Freighter {code} moved under controller {controller} while scale-down was in progress"
+            ));
+        }
+        None => {}
+    }
+    configure_mining_transport_freighter_tags(client, code, &intent.system, false).await?;
+    checkpoint.release_complete = true;
+    context
+        .persist_checkpoint(checkpoint)
+        .map_err(string_error)?;
+    finish_mining_transport_scale_down(context, client, intent, checkpoint).await
+}
+
+async fn finish_mining_transport_scale_down(
+    context: &mut WorkflowContext,
+    client: &Client,
+    intent: &MiningTransportCapacityIntent,
+    checkpoint: &mut MiningTransportCapacityCheckpoint,
+) -> Result<(), String> {
+    let code = checkpoint
+        .release_freighter
+        .clone()
+        .ok_or_else(|| "capacity checkpoint lost its released freighter".to_owned())?;
+    if let Some(child_id) = checkpoint.return_child {
+        if mining_transport_child_pending(context, child_id, "capacity return")? {
+            context
+                .advance_to("returning_released_capacity", checkpoint)
+                .map_err(string_error)?;
+            context.mark_waiting().map_err(string_error)?;
+            return Ok(());
+        }
+        return context
+            .mark_succeeded(Some(serde_json::json!({
+                "route": mining_transport_capacity_route_key(intent),
+                "target_freighters": intent.target_freighters,
+                "released_freighter": code,
+                "decommissioned": false,
+            })))
+            .map_err(string_error);
+    }
+
+    let snapshot = client
+        .devices()
+        .get(&code)
+        .await
+        .map_err(string_error)?
+        .snapshot()
+        .await
+        .map_err(string_error)?;
+    if snapshot.relationships.controller.is_some() || snapshot.travel.is_some() {
+        context
+            .advance_to("waiting_for_released_capacity", checkpoint)
+            .map_err(string_error)?;
+        context.mark_waiting().map_err(string_error)?;
+        return Ok(());
+    }
+    let Some(origin) = snapshot
+        .location
+        .as_ref()
+        .map(|location| location.id.as_str().to_owned())
+    else {
+        context
+            .advance_to("waiting_for_released_capacity_location", checkpoint)
+            .map_err(string_error)?;
+        context.mark_waiting().map_err(string_error)?;
+        return Ok(());
+    };
+    if origin.eq_ignore_ascii_case(&intent.deliver) {
+        return context
+            .mark_succeeded(Some(serde_json::json!({
+                "route": mining_transport_capacity_route_key(intent),
+                "target_freighters": intent.target_freighters,
+                "released_freighter": code,
+                "decommissioned": false,
+            })))
+            .map_err(string_error);
+    }
+    context
+        .release_claim(&ResourceKey::Device(code.clone()))
+        .map_err(string_error)?;
+    let child = context
+        .create_child(new_logistics_manifest_workflow(LogisticsManifestIntent {
+            origin,
+            destination: intent.deliver.clone(),
+            device_codes: vec![code.clone()],
+            return_transports: true,
+            allow_transport_staging: true,
+            region: Some(canonical_region(&intent.region)),
+            purpose: format!(
+                "mining-transport-capacity:return:{}:{}",
+                mining_transport_capacity_route_key(intent),
+                code
+            ),
+            ..LogisticsManifestIntent::default()
+        }))
+        .map_err(string_error)?;
+    checkpoint.return_child = Some(child.id);
+    context
+        .persist_checkpoint(checkpoint)
+        .map_err(string_error)?;
+    context
+        .advance_to("returning_released_capacity", checkpoint)
+        .map_err(string_error)?;
+    context.mark_waiting().map_err(string_error)
+}
+
+struct MiningTransportCapacityWorkflow;
+impl WorkflowExecutor for MiningTransportCapacityWorkflow {
+    fn execute<'a>(&'a mut self, context: &'a mut WorkflowContext) -> BoxWorkflowFuture<'a> {
+        Box::pin(async move {
+            let intent: MiningTransportCapacityIntent = context.config().map_err(string_error)?;
+            if !(MIN_TRANSPORT_FREIGHTERS..=MAX_TRANSPORT_FREIGHTERS)
+                .contains(&intent.target_freighters)
+            {
+                return Err(format!(
+                    "target_freighters must be between {MIN_TRANSPORT_FREIGHTERS} and {MAX_TRANSPORT_FREIGHTERS}"
+                ));
+            }
+            if intent.system.trim().is_empty()
+                || intent.collect.trim().is_empty()
+                || intent.deliver.trim().is_empty()
+                || intent.controller.trim().is_empty()
+            {
+                return Err("mining transport capacity intent fields must be nonblank".to_owned());
+            }
+            claim_target(
+                context,
+                "mining-transport-route",
+                &mining_transport_capacity_route_key(&intent),
+            )?;
+            let client = managed_client(context)?;
+            let mut checkpoint: MiningTransportCapacityCheckpoint =
+                context.checkpoint().map_err(string_error)?;
+            if recover_mining_transport_capacity_children(context, &intent, &mut checkpoint)? {
+                context
+                    .persist_checkpoint(&checkpoint)
+                    .map_err(string_error)?;
+            }
+
+            if checkpoint.release_complete {
+                return finish_mining_transport_scale_down(
+                    context,
+                    &client,
+                    &intent,
+                    &mut checkpoint,
+                )
+                .await;
+            }
+
+            let devices = dispatch_owned_device_snapshots(&client).await?;
+            let audit = transport_service_present(
+                &devices,
+                &intent.system,
+                &intent.collect,
+                &intent.deliver,
+            );
+            if audit.state == EvidenceState::Unknown {
+                context
+                    .advance_to("waiting_for_route_evidence", &checkpoint)
+                    .map_err(string_error)?;
+                context.mark_waiting().map_err(string_error)?;
+                return Ok(());
+            }
+            if audit.state != EvidenceState::Present
+                || audit
+                    .controller
+                    .as_deref()
+                    .is_none_or(|controller| !controller.eq_ignore_ascii_case(&intent.controller))
+            {
+                return Err(format!(
+                    "AMI route {} -> {} is no longer structurally healthy on controller {}; repair the route before changing capacity",
+                    intent.collect, intent.deliver, intent.controller
+                ));
+            }
+            if let Some(release) = checkpoint.release_freighter.clone() {
+                return release_mining_transport_capacity(
+                    context,
+                    &client,
+                    &intent,
+                    &mut checkpoint,
+                    &release,
+                )
+                .await;
+            }
+
+            let mut current = audit.usable_freighter_count();
+            if current == intent.target_freighters {
+                for code in checkpoint
+                    .selected_freighters
+                    .iter()
+                    .filter(|code| audit.adopted_freighters.contains(code))
+                {
+                    configure_mining_transport_freighter_tags(&client, code, &intent.system, true)
+                        .await?;
+                }
+                return context
+                    .mark_succeeded(Some(serde_json::json!({
+                        "route": mining_transport_capacity_route_key(&intent),
+                        "target_freighters": intent.target_freighters,
+                        "usable_freighters": current,
+                    })))
+                    .map_err(string_error);
+            }
+
+            if current > intent.target_freighters {
+                let release = audit
+                    .usable_freighters
+                    .iter()
+                    .rev()
+                    .find(|code| {
+                        audit.usable_freighters.len().saturating_sub(1) >= intent.target_freighters
+                            && !checkpoint.selected_freighters.contains(code)
+                    })
+                    .cloned()
+                    .ok_or_else(|| {
+                        "no safe extra Cargo Freighter is available to release".to_owned()
+                    })?;
+                return release_mining_transport_capacity(
+                    context,
+                    &client,
+                    &intent,
+                    &mut checkpoint,
+                    &release,
+                )
+                .await;
+            }
+
+            let controller_snapshot = devices
+                .iter()
+                .find(|device| {
+                    device
+                        .key
+                        .id
+                        .as_str()
+                        .eq_ignore_ascii_case(&intent.controller)
+                })
+                .ok_or_else(|| {
+                    format!("transport controller {} is not owned", intent.controller)
+                })?;
+            let controller_location = controller_snapshot
+                .location
+                .as_ref()
+                .map(|location| location.id.as_str().to_owned())
+                .ok_or_else(|| {
+                    format!(
+                        "transport controller {} has no authoritative location",
+                        intent.controller
+                    )
+                })?;
+            let mut needed = intent.target_freighters.saturating_sub(current);
+
+            for code in &intent.reuse_candidates {
+                if checkpoint.selected_freighters.len() >= needed {
+                    break;
+                }
+                if checkpoint.selected_freighters.contains(code) {
+                    continue;
+                }
+                let Some(candidate) = devices
+                    .iter()
+                    .find(|device| device.key.id.as_str().eq_ignore_ascii_case(code))
+                else {
+                    continue;
+                };
+                if !mining_transport_candidate_is_safe(candidate, &intent.system) {
+                    continue;
+                }
+                checkpoint
+                    .selected_freighters
+                    .push(candidate.key.id.as_str().to_owned());
+                let candidate_code = candidate.key.id.as_str().to_owned();
+                let Some(origin) = candidate
+                    .location
+                    .as_ref()
+                    .map(|location| location.id.as_str().to_owned())
+                else {
+                    checkpoint.selected_freighters.pop();
+                    continue;
+                };
+                if !origin.eq_ignore_ascii_case(&controller_location)
+                    && !checkpoint.staging_children.contains_key(&candidate_code)
+                {
+                    let child = context
+                        .create_child(new_logistics_manifest_workflow(LogisticsManifestIntent {
+                            origin,
+                            destination: controller_location.clone(),
+                            device_codes: vec![candidate_code.clone()],
+                            return_transports: true,
+                            allow_transport_staging: true,
+                            region: Some(canonical_region(&intent.region)),
+                            purpose: format!(
+                                "mining-transport-capacity:stage:{}:{}",
+                                mining_transport_capacity_route_key(&intent),
+                                candidate_code
+                            ),
+                            ..LogisticsManifestIntent::default()
+                        }))
+                        .map_err(string_error)?;
+                    checkpoint.staging_children.insert(candidate_code, child.id);
+                }
+            }
+            checkpoint.selected_freighters.sort();
+            checkpoint.selected_freighters.dedup();
+            context
+                .persist_checkpoint(&checkpoint)
+                .map_err(string_error)?;
+
+            let mut staging_pending = false;
+            for child_id in checkpoint.staging_children.values().copied() {
+                staging_pending |=
+                    mining_transport_child_pending(context, child_id, "capacity staging")?;
+            }
+            if staging_pending {
+                context
+                    .advance_to("staging_reusable_capacity", &checkpoint)
+                    .map_err(string_error)?;
+                context.mark_waiting().map_err(string_error)?;
+                return Ok(());
+            }
+
+            // Once staging children are terminal, reserve the exact reusable payloads in
+            // the capacity workflow itself. This prevents a subsequent regional-dispatch
+            // child from selecting the same local stock as part of the print deficit.
+            loop {
+                let Some((conflicted, owner)) =
+                    claim_devices_until_conflict(context, checkpoint.selected_freighters.iter())?
+                else {
+                    break;
+                };
+                checkpoint
+                    .selected_freighters
+                    .retain(|code| !code.eq_ignore_ascii_case(&conflicted));
+                checkpoint.staging_children.remove(&conflicted);
+                tracing::debug!(
+                    device = %conflicted,
+                    owner = %owner,
+                    route = %mining_transport_capacity_route_key(&intent),
+                    "Mining transport capacity skipped reusable stock claimed by another workflow"
+                );
+                context
+                    .persist_checkpoint(&checkpoint)
+                    .map_err(string_error)?;
+            }
+
+            let staged_devices = dispatch_owned_device_snapshots(&client).await?;
+            let staged_audit = transport_service_present(
+                &staged_devices,
+                &intent.system,
+                &intent.collect,
+                &intent.deliver,
+            );
+            if staged_audit.state == EvidenceState::Unknown {
+                context
+                    .advance_to("waiting_for_staged_capacity_evidence", &checkpoint)
+                    .map_err(string_error)?;
+                context.mark_waiting().map_err(string_error)?;
+                return Ok(());
+            }
+            if staged_audit.state != EvidenceState::Present
+                || staged_audit
+                    .controller
+                    .as_deref()
+                    .is_none_or(|controller| !controller.eq_ignore_ascii_case(&intent.controller))
+            {
+                return Err(format!(
+                    "AMI route {} -> {} became structurally unhealthy while capacity was being staged",
+                    intent.collect, intent.deliver
+                ));
+            }
+            current = staged_audit.usable_freighter_count();
+            let staged_available = checkpoint
+                .selected_freighters
+                .iter()
+                .filter(|code| !staged_audit.adopted_freighters.contains(code))
+                .filter(|code| {
+                    staged_devices
+                        .iter()
+                        .find(|device| device.key.id.as_str().eq_ignore_ascii_case(code))
+                        .is_some_and(|device| {
+                            device.location.as_ref().is_some_and(|location| {
+                                location
+                                    .id
+                                    .as_str()
+                                    .eq_ignore_ascii_case(&controller_location)
+                            }) && device.relationships.controller.is_none()
+                                && mining_transport_candidate_is_safe(device, &intent.system)
+                        })
+                })
+                .count();
+            needed = mining_transport_remaining_deficit(
+                intent.target_freighters,
+                current,
+                staged_available,
+            );
+            if needed > 0 {
+                if let Some(child_id) = checkpoint.dispatch_child {
+                    if mining_transport_child_pending(context, child_id, "capacity dispatch")? {
+                        context
+                            .advance_to("provisioning_capacity", &checkpoint)
+                            .map_err(string_error)?;
+                        context.mark_waiting().map_err(string_error)?;
+                        return Ok(());
+                    }
+                    let child = context
+                        .repository()
+                        .read(child_id)
+                        .map_err(string_error)?
+                        .ok_or_else(|| format!("capacity dispatch child {child_id} disappeared"))?;
+                    let dispatch: RegionalDispatchCheckpoint =
+                        child.checkpoint().map_err(string_error)?;
+                    checkpoint.selected_freighters.extend(dispatch.devices);
+                    checkpoint.selected_freighters.sort();
+                    checkpoint.selected_freighters.dedup();
+                    context
+                        .persist_checkpoint(&checkpoint)
+                        .map_err(string_error)?;
+                } else {
+                    let quantity = i64::try_from(needed)
+                        .map_err(|_| "capacity deficit is too large".to_owned())?;
+                    let child = context
+                        .create_child(new_regional_dispatch_workflow(RegionalDispatchIntent {
+                            source: intent.deliver.clone(),
+                            destination: controller_location.clone(),
+                            devices: vec![DeviceRequest {
+                                quantity,
+                                device_type: "cargo_freighter".to_owned(),
+                            }],
+                            print_tag: Some(replicant_mining_planner::site_tag(&intent.system)),
+                            ..RegionalDispatchIntent::default()
+                        }))
+                        .map_err(string_error)?;
+                    checkpoint.dispatch_child = Some(child.id);
+                    context
+                        .persist_checkpoint(&checkpoint)
+                        .map_err(string_error)?;
+                    context
+                        .advance_to("provisioning_capacity", &checkpoint)
+                        .map_err(string_error)?;
+                    context.mark_waiting().map_err(string_error)?;
+                    return Ok(());
+                }
+            }
+
+            let refreshed = dispatch_owned_device_snapshots(&client).await?;
+            let final_audit = transport_service_present(
+                &refreshed,
+                &intent.system,
+                &intent.collect,
+                &intent.deliver,
+            );
+            if final_audit.state == EvidenceState::Unknown {
+                context
+                    .advance_to("waiting_for_capacity_adoption_evidence", &checkpoint)
+                    .map_err(string_error)?;
+                context.mark_waiting().map_err(string_error)?;
+                return Ok(());
+            }
+            if final_audit.state != EvidenceState::Present
+                || final_audit
+                    .controller
+                    .as_deref()
+                    .is_none_or(|controller| !controller.eq_ignore_ascii_case(&intent.controller))
+            {
+                return Err(format!(
+                    "AMI route {} -> {} became structurally unhealthy before capacity adoption",
+                    intent.collect, intent.deliver
+                ));
+            }
+            current = final_audit.usable_freighter_count();
+            if current >= intent.target_freighters {
+                for code in checkpoint
+                    .selected_freighters
+                    .iter()
+                    .filter(|code| final_audit.adopted_freighters.contains(code))
+                {
+                    configure_mining_transport_freighter_tags(&client, code, &intent.system, true)
+                        .await?;
+                }
+                return context
+                    .mark_succeeded(Some(serde_json::json!({
+                        "route": mining_transport_capacity_route_key(&intent),
+                        "target_freighters": intent.target_freighters,
+                        "usable_freighters": current,
+                    })))
+                    .map_err(string_error);
+            }
+            let already_adopted = final_audit
+                .adopted_freighters
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            let mut adopt = checkpoint
+                .selected_freighters
+                .iter()
+                .filter(|code| !already_adopted.contains(*code))
+                .filter_map(|code| {
+                    refreshed
+                        .iter()
+                        .find(|device| device.key.id.as_str().eq_ignore_ascii_case(code))
+                        .filter(|device| {
+                            device.location.as_ref().is_some_and(|location| {
+                                location
+                                    .id
+                                    .as_str()
+                                    .eq_ignore_ascii_case(&controller_location)
+                            }) && device.relationships.controller.is_none()
+                                && mining_transport_candidate_is_safe(device, &intent.system)
+                        })
+                        .map(|device| device.key.id.as_str().to_owned())
+                })
+                .collect::<Vec<_>>();
+            adopt.sort();
+            adopt.dedup();
+            let required_new = intent.target_freighters.saturating_sub(current);
+            if adopt.len() < required_new {
+                context
+                    .advance_to("waiting_for_capacity_inventory", &checkpoint)
+                    .map_err(string_error)?;
+                context.mark_waiting().map_err(string_error)?;
+                return Ok(());
+            }
+            adopt.truncate(required_new);
+            for code in &adopt {
+                claim_device(context, code)?;
+            }
+            context
+                .advance_to("adopting_capacity", &checkpoint)
+                .map_err(string_error)?;
+            let controller = client
+                .devices()
+                .get(&intent.controller)
+                .await
+                .map_err(string_error)?;
+            let operation = controller
+                .command(replicant_client::raw::devices::DeviceCommand::Adopt(
+                    replicant_client::raw::devices::TargetsCommand {
+                        devices: Some(serde_json::json!(&adopt)),
+                        ..Default::default()
+                    },
+                ))
+                .await
+                .map_err(string_error)?;
+            await_success(&operation).await?;
+            for code in &adopt {
+                configure_mining_transport_freighter_tags(&client, code, &intent.system, true)
+                    .await?;
+            }
+            context
+                .mark_succeeded(Some(serde_json::json!({
+                    "route": mining_transport_capacity_route_key(&intent),
+                    "target_freighters": intent.target_freighters,
+                    "added_freighters": adopt,
+                })))
+                .map_err(string_error)
+        })
+    }
+}
+
+fn mining_maintenance_rotation_key(intent: &MiningMaintenanceRotationIntent) -> String {
+    format!(
+        "{}|{}|{}|{}",
+        canonical_region(&intent.region),
+        intent.system.trim().to_ascii_uppercase(),
+        intent.site_belt.trim().to_ascii_uppercase(),
+        intent.worn_drone.trim().to_ascii_uppercase()
+    )
+}
+
+fn mining_maintenance_pool_key(intent: &MiningMaintenancePoolIntent) -> String {
+    format!(
+        "{}|{}",
+        canonical_region(&intent.region),
+        intent.hub_belt.trim().to_ascii_uppercase()
+    )
+}
+
+fn maintenance_has_directive(device: &Device, directive: &str) -> bool {
+    device
+        .active_directive
+        .as_ref()
+        .and_then(|active| active.directive.as_ref())
+        .is_some_and(|active| active.as_str().eq_ignore_ascii_case(directive))
+}
+
+fn maintenance_candidate_has_foreign_commitment(device: &Device) -> bool {
+    let pool_role = replicant_mining_planner::role_tag(HUB_MAINTENANCE_ROLE);
+    device.tags.iter().any(|tag| {
+        tag.starts_with("evt-")
+            || tag.starts_with("evt_")
+            || tag.starts_with("relay-")
+            || tag.starts_with("mine-m:")
+            || tag.starts_with("mine-b:")
+            || tag.starts_with("mine-s:")
+            || (tag.starts_with("mine-r:") && tag != &pool_role)
+    })
+}
+
+fn maintenance_idle_replacement_candidate(device: &Device) -> bool {
+    device_is_type(device, replicant_mining_planner::MAINTENANCE_DRONE)
+        && maintenance_replacement_ready(device)
+        && device.relationships.controller.is_none()
+        && device.relationships.attached_to.is_none()
+        && device.relationships.stowed_in.is_none()
+        && device.travel.is_none()
+        && device
+            .status
+            .as_ref()
+            .is_some_and(|status| matches!(status.as_str(), "idle" | "inactive"))
+        && !maintenance_has_directive(device, "patrol")
+        && !maintenance_candidate_has_foreign_commitment(device)
+}
+
+fn maintenance_hub_replacement_candidate(
+    device: &Device,
+    intent: &MiningMaintenanceRotationIntent,
+    hub_healthy_count: usize,
+) -> bool {
+    device_is_type(device, replicant_mining_planner::MAINTENANCE_DRONE)
+        && device
+            .location
+            .as_ref()
+            .is_some_and(|location| location.id.as_str().eq_ignore_ascii_case(&intent.hub_belt))
+        && maintenance_replacement_ready(device)
+        && maintenance_has_directive(device, "patrol")
+        && hub_healthy_count > HUB_MAINTENANCE_MIN_HEALTHY
+        && device.relationships.controller.is_none()
+        && device.relationships.attached_to.is_none()
+        && device.relationships.stowed_in.is_none()
+        && device.travel.is_none()
+        && !maintenance_candidate_has_foreign_commitment(device)
+}
+
+async fn reconcile_maintenance_tags(
+    client: &Client,
+    code: &str,
+    expected_site: Option<&str>,
+    role: &str,
+) -> Result<(), String> {
+    let handle = client.devices().get(code).await.map_err(string_error)?;
+    let snapshot = handle.snapshot().await.map_err(string_error)?;
+    let expected_site_tag = expected_site.map(replicant_mining_planner::site_tag);
+    let expected_role_tag = replicant_mining_planner::role_tag(role);
+    let mut add_tags = Vec::new();
+    if let Some(site_tag) = expected_site_tag.as_ref()
+        && !snapshot.tags.contains(site_tag)
+    {
+        add_tags.push(site_tag.clone());
+    }
+    if !snapshot.tags.contains(&expected_role_tag) {
+        add_tags.push(expected_role_tag.clone());
+    }
+    let remove_tags = snapshot
+        .tags
+        .iter()
+        .filter(|tag| {
+            (tag.starts_with("mine-s:") && expected_site_tag.as_ref() != Some(*tag))
+                || (tag.starts_with("mine-r:") && *tag != &expected_role_tag)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if add_tags.is_empty() && remove_tags.is_empty() {
+        return Ok(());
+    }
+    let operation = handle
+        .configure(replicant_client::raw::devices::DeviceConfiguration {
+            add_tags: (!add_tags.is_empty()).then_some(add_tags),
+            remove_tags: (!remove_tags.is_empty()).then_some(remove_tags),
+            ..Default::default()
+        })
+        .await
+        .map_err(string_error)?;
+    await_success(&operation).await
+}
+
+async fn ensure_maintenance_patrol(
+    context: &WorkflowContext,
+    client: &Client,
+    code: &str,
+    expected_location: &str,
+) -> Result<bool, String> {
+    let handle = client.devices().get(code).await.map_err(string_error)?;
+    let snapshot = handle.snapshot().await.map_err(string_error)?;
+    if !device_at(&snapshot, expected_location) {
+        return Ok(false);
+    }
+    if maintenance_has_directive(&snapshot, "patrol")
+        && snapshot
+            .status
+            .as_ref()
+            .is_none_or(|status| !matches!(status.as_str(), "offline" | "deactivated"))
+    {
+        return Ok(true);
+    }
+    if !device_is_type(&snapshot, replicant_mining_planner::MAINTENANCE_DRONE) {
+        return Ok(false);
+    }
+    let operation = handle
+        .command_with_id(
+            manifest_operation_id(context.id(), "maintenance-patrol", code, expected_location),
+            replicant_client::raw::devices::DeviceCommand::SetDirective {
+                directive: "patrol".into(),
+                configuration: None,
+                notify: None,
+            },
+        )
+        .await
+        .map_err(string_error)?;
+    await_success(&operation).await?;
+    let refreshed = handle.snapshot().await.map_err(string_error)?;
+    Ok(device_at(&refreshed, expected_location)
+        && maintenance_has_directive(&refreshed, "patrol")
+        && refreshed
+            .status
+            .as_ref()
+            .is_none_or(|status| !matches!(status.as_str(), "offline" | "deactivated")))
+}
+
+fn recover_mining_maintenance_rotation_children(
+    context: &WorkflowContext,
+    intent: &MiningMaintenanceRotationIntent,
+    checkpoint: &mut MiningMaintenanceRotationCheckpoint,
+) -> Result<bool, String> {
+    let key = mining_maintenance_rotation_key(intent);
+    let delivery_prefix = format!("mining-maintenance:deliver:{key}:");
+    let recovery_prefix = format!("mining-maintenance:return:{key}:");
+    let mut children = context.child_workflows().map_err(string_error)?;
+    children.sort_by_key(|workflow| std::cmp::Reverse(workflow.created_at));
+    let mut changed = false;
+    for child in children {
+        if child.kind == logistics_manifest_workflow_kind() {
+            let Ok(config) = child.config::<LogisticsManifestIntent>() else {
+                continue;
+            };
+            if config.purpose.starts_with(&delivery_prefix) && checkpoint.delivery_child.is_none() {
+                checkpoint.delivery_child = Some(child.id);
+                changed = true;
+            } else if config.purpose.starts_with(&recovery_prefix)
+                && checkpoint.recovery_child.is_none()
+            {
+                checkpoint.recovery_child = Some(child.id);
+                changed = true;
+            }
+            continue;
+        }
+        if child.kind == regional_dispatch_workflow_kind() && checkpoint.provision_child.is_none() {
+            let Ok(config) = child.config::<RegionalDispatchIntent>() else {
+                continue;
+            };
+            if config.destination.eq_ignore_ascii_case(&intent.site_belt)
+                && config.devices.iter().any(|request| {
+                    request
+                        .device_type
+                        .eq_ignore_ascii_case(replicant_mining_planner::MAINTENANCE_DRONE)
+                        && request.quantity > 0
+                })
+            {
+                checkpoint.provision_child = Some(child.id);
+                changed = true;
+            }
+        }
+    }
+    Ok(changed)
+}
+
+fn recover_mining_maintenance_pool_child(
+    context: &WorkflowContext,
+    intent: &MiningMaintenancePoolIntent,
+    checkpoint: &mut MiningMaintenancePoolCheckpoint,
+) -> Result<bool, String> {
+    if checkpoint.provision_child.is_some() {
+        return Ok(false);
+    }
+    let mut children = context.child_workflows().map_err(string_error)?;
+    children.sort_by_key(|workflow| std::cmp::Reverse(workflow.created_at));
+    for child in children {
+        if child.kind != regional_dispatch_workflow_kind() {
+            continue;
+        }
+        let Ok(config) = child.config::<RegionalDispatchIntent>() else {
+            continue;
+        };
+        if config.destination.eq_ignore_ascii_case(&intent.hub_belt)
+            && config.devices.iter().any(|request| {
+                request
+                    .device_type
+                    .eq_ignore_ascii_case(replicant_mining_planner::MAINTENANCE_DRONE)
+                    && request.quantity > 0
+            })
+        {
+            checkpoint.provision_child = Some(child.id);
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn maintenance_workflow_child_pending(
+    context: &WorkflowContext,
+    child_id: WorkflowId,
+    label: &str,
+) -> Result<bool, String> {
+    mining_transport_child_pending(context, child_id, label)
+}
+
+fn maintenance_hub_available_healthy_count(
+    context: &WorkflowContext,
+    audit: &MaintenanceHubPoolAudit,
+) -> Result<usize, String> {
+    let claimed_elsewhere = context
+        .repository()
+        .device_claims()
+        .map_err(string_error)?
+        .into_iter()
+        .filter(|claim| claim.workflow_id != context.id())
+        .filter_map(|claim| match claim.resource {
+            ResourceKey::Device(code) => Some(code.to_ascii_uppercase()),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    Ok(audit
+        .healthy_patrol
+        .iter()
+        .filter(|code| !claimed_elsewhere.contains(&code.to_ascii_uppercase()))
+        .count())
+}
+
+async fn select_rotation_replacement(
+    context: &WorkflowContext,
+    intent: &MiningMaintenanceRotationIntent,
+    checkpoint: &mut MiningMaintenanceRotationCheckpoint,
+    devices: &[Device],
+) -> Result<bool, String> {
+    if checkpoint.replacement.is_some() {
+        return Ok(true);
+    }
+    let hub_pool = maintenance_hub_pool_audit(devices, &intent.hub_belt);
+    let claimed_elsewhere = context
+        .repository()
+        .device_claims()
+        .map_err(string_error)?
+        .into_iter()
+        .filter(|claim| claim.workflow_id != context.id())
+        .filter_map(|claim| match claim.resource {
+            ResourceKey::Device(code) => Some(code.to_ascii_uppercase()),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let available_hub_healthy = hub_pool
+        .healthy_patrol
+        .iter()
+        .filter(|code| !claimed_elsewhere.contains(&code.to_ascii_uppercase()))
+        .count();
+    for code in &intent.replacement_candidates {
+        if code.eq_ignore_ascii_case(&intent.worn_drone) {
+            continue;
+        }
+        let Some(device) = devices
+            .iter()
+            .find(|device| device.key.id.as_str().eq_ignore_ascii_case(code))
+        else {
+            continue;
+        };
+        let safe = maintenance_hub_replacement_candidate(device, intent, available_hub_healthy)
+            || maintenance_idle_replacement_candidate(device);
+        if !safe || !try_claim_available(context, ResourceKey::Device(code.clone()))? {
+            continue;
+        }
+        checkpoint.replacement = Some(code.clone());
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+async fn provision_rotation_replacement(
+    context: &mut WorkflowContext,
+    intent: &MiningMaintenanceRotationIntent,
+    checkpoint: &mut MiningMaintenanceRotationCheckpoint,
+) -> Result<bool, String> {
+    if let Some(child_id) = checkpoint.provision_child {
+        if maintenance_workflow_child_pending(context, child_id, "maintenance replacement")? {
+            context
+                .advance_to("provisioning_replacement", checkpoint)
+                .map_err(string_error)?;
+            context.mark_waiting().map_err(string_error)?;
+            return Ok(false);
+        }
+        let child = context
+            .repository()
+            .read(child_id)
+            .map_err(string_error)?
+            .ok_or_else(|| format!("maintenance replacement child {child_id} disappeared"))?;
+        let dispatch: RegionalDispatchCheckpoint = child.checkpoint().map_err(string_error)?;
+        let code = dispatch.devices.into_iter().next().ok_or_else(|| {
+            "maintenance replacement dispatch completed without a device".to_owned()
+        })?;
+        claim_device(context, &code)?;
+        checkpoint.replacement = Some(code);
+        context
+            .persist_checkpoint(checkpoint)
+            .map_err(string_error)?;
+        return Ok(true);
+    }
+    let child = context
+        .create_child(new_regional_dispatch_workflow(RegionalDispatchIntent {
+            source: intent.hub_belt.clone(),
+            destination: intent.site_belt.clone(),
+            devices: vec![DeviceRequest {
+                quantity: 1,
+                device_type: replicant_mining_planner::MAINTENANCE_DRONE.to_owned(),
+            }],
+            ..RegionalDispatchIntent::default()
+        }))
+        .map_err(string_error)?;
+    checkpoint.provision_child = Some(child.id);
+    context
+        .persist_checkpoint(checkpoint)
+        .map_err(string_error)?;
+    context
+        .advance_to("provisioning_replacement", checkpoint)
+        .map_err(string_error)?;
+    context.mark_waiting().map_err(string_error)?;
+    Ok(false)
+}
+
+fn maintenance_delivery_manifest(
+    intent: &MiningMaintenanceRotationIntent,
+    code: &str,
+    origin: String,
+) -> LogisticsManifestIntent {
+    LogisticsManifestIntent {
+        origin,
+        destination: intent.site_belt.clone(),
+        device_codes: vec![code.to_owned()],
+        pre_deactivate_device_codes: vec![code.to_owned()],
+        release_mining_reservations: true,
+        return_transports: true,
+        allow_transport_staging: true,
+        region: Some(canonical_region(&intent.region)),
+        purpose: format!(
+            "mining-maintenance:deliver:{}:{}",
+            mining_maintenance_rotation_key(intent),
+            code
+        ),
+        ..LogisticsManifestIntent::default()
+    }
+}
+
+fn maintenance_recovery_manifest(
+    intent: &MiningMaintenanceRotationIntent,
+    origin: String,
+) -> LogisticsManifestIntent {
+    LogisticsManifestIntent {
+        origin,
+        destination: intent.hub_belt.clone(),
+        device_codes: vec![intent.worn_drone.clone()],
+        pre_deactivate_device_codes: vec![intent.worn_drone.clone()],
+        release_mining_reservations: true,
+        return_transports: true,
+        allow_transport_staging: true,
+        region: Some(canonical_region(&intent.region)),
+        purpose: format!(
+            "mining-maintenance:return:{}:{}",
+            mining_maintenance_rotation_key(intent),
+            intent.worn_drone
+        ),
+        ..LogisticsManifestIntent::default()
+    }
+}
+
+fn maintenance_rotation_recovery_allowed(checkpoint: &MiningMaintenanceRotationCheckpoint) -> bool {
+    checkpoint.replacement_patrol_verified
+}
+
+fn maintenance_worn_recovery_unrecoverable(device: &Device) -> bool {
+    device
+        .status
+        .as_ref()
+        .is_some_and(|status| status.as_str().eq_ignore_ascii_case("offline"))
+}
+
+async fn deliver_rotation_replacement(
+    context: &mut WorkflowContext,
+    client: &Client,
+    intent: &MiningMaintenanceRotationIntent,
+    checkpoint: &mut MiningMaintenanceRotationCheckpoint,
+) -> Result<bool, String> {
+    let code = checkpoint
+        .replacement
+        .clone()
+        .ok_or_else(|| "maintenance rotation lost its replacement identity".to_owned())?;
+    let devices = dispatch_owned_device_snapshots(client).await?;
+    if devices
+        .iter()
+        .find(|device| device.key.id.as_str().eq_ignore_ascii_case(&code))
+        .is_some_and(|device| device_at(device, &intent.site_belt))
+    {
+        checkpoint.replacement_delivered = true;
+        context
+            .persist_checkpoint(checkpoint)
+            .map_err(string_error)?;
+        claim_device(context, &code)?;
+        return Ok(true);
+    }
+    if let Some(child_id) = checkpoint.delivery_child {
+        context
+            .release_claim(&ResourceKey::Device(code.clone()))
+            .map_err(string_error)?;
+        if maintenance_workflow_child_pending(
+            context,
+            child_id,
+            "maintenance replacement delivery",
+        )? {
+            context
+                .advance_to("delivering_replacement", checkpoint)
+                .map_err(string_error)?;
+            context.mark_waiting().map_err(string_error)?;
+            return Ok(false);
+        }
+        context
+            .advance_to("verifying_replacement_delivery", checkpoint)
+            .map_err(string_error)?;
+        context.mark_waiting().map_err(string_error)?;
+        return Ok(false);
+    }
+    let replacement = devices
+        .iter()
+        .find(|device| device.key.id.as_str().eq_ignore_ascii_case(&code))
+        .ok_or_else(|| format!("selected maintenance replacement {code} is no longer owned"))?;
+    let origin = replacement
+        .location
+        .as_ref()
+        .map(|location| location.id.as_str().to_owned())
+        .ok_or_else(|| format!("selected maintenance replacement {code} has no location"))?;
+    let child = context
+        .create_child(new_logistics_manifest_workflow(
+            maintenance_delivery_manifest(intent, &code, origin),
+        ))
+        .map_err(string_error)?;
+    checkpoint.delivery_child = Some(child.id);
+    context
+        .persist_checkpoint(checkpoint)
+        .map_err(string_error)?;
+    context
+        .release_claim(&ResourceKey::Device(code))
+        .map_err(string_error)?;
+    context
+        .advance_to("delivering_replacement", checkpoint)
+        .map_err(string_error)?;
+    context.mark_waiting().map_err(string_error)?;
+    Ok(false)
+}
+
+async fn configure_rotation_replacement(
+    context: &mut WorkflowContext,
+    client: &Client,
+    intent: &MiningMaintenanceRotationIntent,
+    checkpoint: &mut MiningMaintenanceRotationCheckpoint,
+) -> Result<bool, String> {
+    let code = checkpoint
+        .replacement
+        .clone()
+        .ok_or_else(|| "maintenance rotation lost its replacement identity".to_owned())?;
+    claim_device(context, &code)?;
+    reconcile_maintenance_tags(client, &code, Some(&intent.system), "maintenance").await?;
+    match ensure_maintenance_patrol(context, client, &code, &intent.site_belt).await {
+        Ok(true) => {
+            checkpoint.replacement_patrol_verified = true;
+            context
+                .persist_checkpoint(checkpoint)
+                .map_err(string_error)?;
+            Ok(true)
+        }
+        Ok(false) => {
+            context
+                .advance_to("waiting_for_replacement_patrol", checkpoint)
+                .map_err(string_error)?;
+            context
+                .emit_activity(format!(
+                    "replacement maintenance drone {code} is at {} but patrol cannot yet be authoritatively verified; worn drone {} remains in place",
+                    intent.site_belt, intent.worn_drone
+                ))
+                .map_err(string_error)?;
+            context.mark_waiting().map_err(string_error)?;
+            Ok(false)
+        }
+        Err(error) => {
+            context
+                .advance_to("waiting_for_replacement_patrol_repair", checkpoint)
+                .map_err(string_error)?;
+            context
+                .emit_activity(format!(
+                    "replacement maintenance drone {code} could not be configured for patrol ({error}); worn drone {} remains in place",
+                    intent.worn_drone
+                ))
+                .map_err(string_error)?;
+            context.mark_waiting().map_err(string_error)?;
+            Ok(false)
+        }
+    }
+}
+
+async fn recover_worn_maintenance(
+    context: &mut WorkflowContext,
+    client: &Client,
+    intent: &MiningMaintenanceRotationIntent,
+    checkpoint: &mut MiningMaintenanceRotationCheckpoint,
+) -> Result<bool, String> {
+    if !maintenance_rotation_recovery_allowed(checkpoint) {
+        return Ok(false);
+    }
+    let devices = dispatch_owned_device_snapshots(client).await?;
+    let Some(worn) = devices.iter().find(|device| {
+        device
+            .key
+            .id
+            .as_str()
+            .eq_ignore_ascii_case(&intent.worn_drone)
+    }) else {
+        checkpoint.worn_missing = true;
+        context
+            .persist_checkpoint(checkpoint)
+            .map_err(string_error)?;
+        return Ok(true);
+    };
+    if maintenance_worn_recovery_unrecoverable(worn) {
+        checkpoint.worn_unrecoverable = true;
+        context
+            .persist_checkpoint(checkpoint)
+            .map_err(string_error)?;
+        return Ok(true);
+    }
+    if device_at(worn, &intent.hub_belt) {
+        checkpoint.worn_returned = true;
+        context
+            .persist_checkpoint(checkpoint)
+            .map_err(string_error)?;
+        claim_device(context, &intent.worn_drone)?;
+        return Ok(true);
+    }
+    if let Some(child_id) = checkpoint.recovery_child {
+        context
+            .release_claim(&ResourceKey::Device(intent.worn_drone.clone()))
+            .map_err(string_error)?;
+        if maintenance_workflow_child_pending(context, child_id, "worn maintenance recovery")? {
+            context
+                .advance_to("recovering_worn_drone", checkpoint)
+                .map_err(string_error)?;
+            context.mark_waiting().map_err(string_error)?;
+            return Ok(false);
+        }
+        context
+            .advance_to("verifying_worn_return", checkpoint)
+            .map_err(string_error)?;
+        context.mark_waiting().map_err(string_error)?;
+        return Ok(false);
+    }
+    let origin = worn
+        .location
+        .as_ref()
+        .map(|location| location.id.as_str().to_owned())
+        .ok_or_else(|| {
+            format!(
+                "worn maintenance drone {} has no location",
+                intent.worn_drone
+            )
+        })?;
+    let child = context
+        .create_child(new_logistics_manifest_workflow(
+            maintenance_recovery_manifest(intent, origin),
+        ))
+        .map_err(string_error)?;
+    checkpoint.recovery_child = Some(child.id);
+    context
+        .persist_checkpoint(checkpoint)
+        .map_err(string_error)?;
+    context
+        .release_claim(&ResourceKey::Device(intent.worn_drone.clone()))
+        .map_err(string_error)?;
+    context
+        .advance_to("recovering_worn_drone", checkpoint)
+        .map_err(string_error)?;
+    context.mark_waiting().map_err(string_error)?;
+    Ok(false)
+}
+
+async fn finish_worn_maintenance_repair(
+    context: &mut WorkflowContext,
+    client: &Client,
+    intent: &MiningMaintenanceRotationIntent,
+    checkpoint: &mut MiningMaintenanceRotationCheckpoint,
+) -> Result<(), String> {
+    if checkpoint.worn_missing || checkpoint.worn_unrecoverable {
+        return context
+            .mark_succeeded(Some(serde_json::json!({
+                "site": intent.site_belt,
+                "worn_drone": intent.worn_drone,
+                "replacement": checkpoint.replacement,
+                "worn_missing": checkpoint.worn_missing,
+                "worn_unrecoverable": checkpoint.worn_unrecoverable,
+                "replacement_site_preserved": true,
+            })))
+            .map_err(string_error);
+    }
+    let devices = dispatch_owned_device_snapshots(client).await?;
+    let Some(worn) = devices.iter().find(|device| {
+        device
+            .key
+            .id
+            .as_str()
+            .eq_ignore_ascii_case(&intent.worn_drone)
+    }) else {
+        checkpoint.worn_missing = true;
+        context
+            .persist_checkpoint(checkpoint)
+            .map_err(string_error)?;
+        return context
+            .mark_succeeded(Some(serde_json::json!({
+                "site": intent.site_belt,
+                "worn_drone": intent.worn_drone,
+                "replacement": checkpoint.replacement,
+                "worn_missing": true,
+            })))
+            .map_err(string_error);
+    };
+    if !device_at(worn, &intent.hub_belt) {
+        context
+            .advance_to("waiting_for_worn_hub_evidence", checkpoint)
+            .map_err(string_error)?;
+        context.mark_waiting().map_err(string_error)?;
+        return Ok(());
+    }
+    claim_device(context, &intent.worn_drone)?;
+    reconcile_maintenance_tags(client, &intent.worn_drone, None, HUB_MAINTENANCE_ROLE).await?;
+    if !ensure_maintenance_patrol(context, client, &intent.worn_drone, &intent.hub_belt).await? {
+        context
+            .advance_to("configuring_hub_patrol", checkpoint)
+            .map_err(string_error)?;
+        context.mark_waiting().map_err(string_error)?;
+        return Ok(());
+    }
+    checkpoint.hub_patrol_configured = true;
+    context
+        .persist_checkpoint(checkpoint)
+        .map_err(string_error)?;
+    let refreshed = client
+        .devices()
+        .get(&intent.worn_drone)
+        .await
+        .map_err(string_error)?
+        .snapshot()
+        .await
+        .map_err(string_error)?;
+    if !maintenance_replacement_ready(&refreshed) {
+        context
+            .advance_to("repair_pending", checkpoint)
+            .map_err(string_error)?;
+        context
+            .emit_activity(format!(
+                "worn maintenance drone {} is back on hub patrol at {:.1}% operational capacity; waiting for >= {:.0}% before returning it to replacement-ready stock",
+                intent.worn_drone,
+                refreshed
+                    .operational_capacity
+                    .as_ref()
+                    .map_or(0.0, |capacity| capacity.percent()),
+                HUB_MAINTENANCE_READY_PCT
+            ))
+            .map_err(string_error)?;
+        context.mark_waiting().map_err(string_error)?;
+        return Ok(());
+    }
+    context
+        .mark_succeeded(Some(serde_json::json!({
+            "site": intent.site_belt,
+            "worn_drone": intent.worn_drone,
+            "replacement": checkpoint.replacement,
+            "replacement_ready": true,
+        })))
+        .map_err(string_error)
+}
+
+struct MiningMaintenanceRotationWorkflow;
+impl WorkflowExecutor for MiningMaintenanceRotationWorkflow {
+    fn execute<'a>(&'a mut self, context: &'a mut WorkflowContext) -> BoxWorkflowFuture<'a> {
+        Box::pin(async move {
+            let intent: MiningMaintenanceRotationIntent = context.config().map_err(string_error)?;
+            if intent.site_belt.trim().is_empty()
+                || intent.hub_belt.trim().is_empty()
+                || intent.worn_drone.trim().is_empty()
+            {
+                return Err(
+                    "maintenance rotation requires exact site, hub belt, and worn drone".to_owned(),
+                );
+            }
+            claim_target(
+                context,
+                "mining-maintenance-rotation",
+                &mining_maintenance_rotation_key(&intent),
+            )?;
+            let client = managed_client(context)?;
+            let mut checkpoint: MiningMaintenanceRotationCheckpoint =
+                context.checkpoint().map_err(string_error)?;
+            if recover_mining_maintenance_rotation_children(context, &intent, &mut checkpoint)? {
+                context
+                    .persist_checkpoint(&checkpoint)
+                    .map_err(string_error)?;
+            }
+            if !checkpoint.replacement_patrol_verified
+                && checkpoint.recovery_child.is_none()
+                && !checkpoint.worn_missing
+                && !checkpoint.worn_unrecoverable
+            {
+                claim_device(context, &intent.worn_drone)?;
+            }
+            let devices = dispatch_owned_device_snapshots(&client).await?;
+            if checkpoint.replacement.is_none()
+                && !select_rotation_replacement(context, &intent, &mut checkpoint, &devices).await?
+            {
+                if !provision_rotation_replacement(context, &intent, &mut checkpoint).await? {
+                    return Ok(());
+                }
+            }
+            context
+                .persist_checkpoint(&checkpoint)
+                .map_err(string_error)?;
+            if !checkpoint.replacement_delivered
+                && !deliver_rotation_replacement(context, &client, &intent, &mut checkpoint).await?
+            {
+                return Ok(());
+            }
+            if !checkpoint.replacement_patrol_verified
+                && !configure_rotation_replacement(context, &client, &intent, &mut checkpoint)
+                    .await?
+            {
+                return Ok(());
+            }
+            if !checkpoint.worn_returned
+                && !checkpoint.worn_missing
+                && !checkpoint.worn_unrecoverable
+                && !recover_worn_maintenance(context, &client, &intent, &mut checkpoint).await?
+            {
+                return Ok(());
+            }
+            finish_worn_maintenance_repair(context, &client, &intent, &mut checkpoint).await
+        })
+    }
+}
+
+async fn configure_hub_pool_candidate(
+    context: &WorkflowContext,
+    client: &Client,
+    code: &str,
+    hub_belt: &str,
+) -> Result<bool, String> {
+    claim_device(context, code)?;
+    reconcile_maintenance_tags(client, code, None, HUB_MAINTENANCE_ROLE).await?;
+    ensure_maintenance_patrol(context, client, code, hub_belt).await
+}
+
+struct MiningMaintenancePoolWorkflow;
+impl WorkflowExecutor for MiningMaintenancePoolWorkflow {
+    fn execute<'a>(&'a mut self, context: &'a mut WorkflowContext) -> BoxWorkflowFuture<'a> {
+        Box::pin(async move {
+            let intent: MiningMaintenancePoolIntent = context.config().map_err(string_error)?;
+            if !(HUB_MAINTENANCE_MIN_HEALTHY..=crate::mining::HUB_MAINTENANCE_TARGET_HEALTHY)
+                .contains(&intent.target_healthy)
+            {
+                return Err(
+                    "maintenance pool target must be between the hard minimum and target"
+                        .to_owned(),
+                );
+            }
+            claim_target(
+                context,
+                "mining-maintenance-pool",
+                &mining_maintenance_pool_key(&intent),
+            )?;
+            let client = managed_client(context)?;
+            let mut checkpoint: MiningMaintenancePoolCheckpoint =
+                context.checkpoint().map_err(string_error)?;
+            if recover_mining_maintenance_pool_child(context, &intent, &mut checkpoint)? {
+                context
+                    .persist_checkpoint(&checkpoint)
+                    .map_err(string_error)?;
+            }
+
+            let mut devices = dispatch_owned_device_snapshots(&client).await?;
+            let mut audit = maintenance_hub_pool_audit(&devices, &intent.hub_belt);
+            let mut available_healthy = maintenance_hub_available_healthy_count(context, &audit)?;
+            if available_healthy >= intent.target_healthy {
+                return context
+                    .mark_succeeded(Some(serde_json::json!({
+                        "hub_belt": intent.hub_belt,
+                        "healthy_patrol": available_healthy,
+                        "target_healthy": intent.target_healthy,
+                        "decommissioned": false,
+                    })))
+                    .map_err(string_error);
+            }
+
+            let deficit = intent.target_healthy.saturating_sub(available_healthy);
+            let mut candidates = intent
+                .reuse_candidates
+                .iter()
+                .chain(audit.configurable_ready.iter())
+                .cloned()
+                .collect::<Vec<_>>();
+            candidates.sort();
+            candidates.dedup();
+            for code in candidates.into_iter().take(deficit) {
+                let Some(device) = devices
+                    .iter()
+                    .find(|device| device.key.id.as_str().eq_ignore_ascii_case(&code))
+                else {
+                    continue;
+                };
+                if !device_at(device, &intent.hub_belt)
+                    || !maintenance_idle_replacement_candidate(device)
+                    || !try_claim_available(context, ResourceKey::Device(code.clone()))?
+                {
+                    continue;
+                }
+                if !checkpoint.selected_drones.contains(&code) {
+                    checkpoint.selected_drones.push(code.clone());
+                    checkpoint.selected_drones.sort();
+                    checkpoint.selected_drones.dedup();
+                    context
+                        .persist_checkpoint(&checkpoint)
+                        .map_err(string_error)?;
+                }
+                if !configure_hub_pool_candidate(context, &client, &code, &intent.hub_belt).await? {
+                    context
+                        .advance_to("configuring_hub_patrol", &checkpoint)
+                        .map_err(string_error)?;
+                    context.mark_waiting().map_err(string_error)?;
+                    return Ok(());
+                }
+            }
+
+            devices = dispatch_owned_device_snapshots(&client).await?;
+            audit = maintenance_hub_pool_audit(&devices, &intent.hub_belt);
+            available_healthy = maintenance_hub_available_healthy_count(context, &audit)?;
+            if available_healthy >= intent.target_healthy {
+                return context
+                    .mark_succeeded(Some(serde_json::json!({
+                        "hub_belt": intent.hub_belt,
+                        "healthy_patrol": available_healthy,
+                        "target_healthy": intent.target_healthy,
+                        "decommissioned": false,
+                    })))
+                    .map_err(string_error);
+            }
+
+            if let Some(child_id) = checkpoint.provision_child {
+                if maintenance_workflow_child_pending(
+                    context,
+                    child_id,
+                    "maintenance pool provisioning",
+                )? {
+                    context
+                        .advance_to("provisioning_hub_pool", &checkpoint)
+                        .map_err(string_error)?;
+                    context.mark_waiting().map_err(string_error)?;
+                    return Ok(());
+                }
+                let child = context
+                    .repository()
+                    .read(child_id)
+                    .map_err(string_error)?
+                    .ok_or_else(|| format!("maintenance pool child {child_id} disappeared"))?;
+                let dispatch: RegionalDispatchCheckpoint =
+                    child.checkpoint().map_err(string_error)?;
+                for code in dispatch.devices {
+                    if !checkpoint.selected_drones.contains(&code) {
+                        checkpoint.selected_drones.push(code);
+                    }
+                }
+                checkpoint.selected_drones.sort();
+                checkpoint.selected_drones.dedup();
+                context
+                    .persist_checkpoint(&checkpoint)
+                    .map_err(string_error)?;
+                for code in checkpoint.selected_drones.clone() {
+                    let snapshots = dispatch_owned_device_snapshots(&client).await?;
+                    let Some(device) = snapshots
+                        .iter()
+                        .find(|device| device.key.id.as_str().eq_ignore_ascii_case(&code))
+                    else {
+                        continue;
+                    };
+                    if !device_at(device, &intent.hub_belt) {
+                        continue;
+                    }
+                    if !configure_hub_pool_candidate(context, &client, &code, &intent.hub_belt)
+                        .await?
+                    {
+                        context
+                            .advance_to("configuring_hub_patrol", &checkpoint)
+                            .map_err(string_error)?;
+                        context.mark_waiting().map_err(string_error)?;
+                        return Ok(());
+                    }
+                }
+                let refreshed = dispatch_owned_device_snapshots(&client).await?;
+                let refreshed_audit = maintenance_hub_pool_audit(&refreshed, &intent.hub_belt);
+                let refreshed_available =
+                    maintenance_hub_available_healthy_count(context, &refreshed_audit)?;
+                if refreshed_available >= intent.target_healthy {
+                    return context
+                        .mark_succeeded(Some(serde_json::json!({
+                            "hub_belt": intent.hub_belt,
+                            "healthy_patrol": refreshed_available,
+                            "target_healthy": intent.target_healthy,
+                            "decommissioned": false,
+                        })))
+                        .map_err(string_error);
+                }
+                context
+                    .advance_to("waiting_for_hub_pool_health", &checkpoint)
+                    .map_err(string_error)?;
+                context.mark_waiting().map_err(string_error)?;
+                return Ok(());
+            }
+
+            let needed = intent.target_healthy.saturating_sub(available_healthy);
+            let quantity = i64::try_from(needed)
+                .map_err(|_| "maintenance pool deficit is too large".to_owned())?;
+            let child = context
+                .create_child(new_regional_dispatch_workflow(RegionalDispatchIntent {
+                    source: intent.hub_belt.clone(),
+                    destination: intent.hub_belt.clone(),
+                    devices: vec![DeviceRequest {
+                        quantity,
+                        device_type: replicant_mining_planner::MAINTENANCE_DRONE.to_owned(),
+                    }],
+                    ..RegionalDispatchIntent::default()
+                }))
+                .map_err(string_error)?;
+            checkpoint.provision_child = Some(child.id);
+            context
+                .persist_checkpoint(&checkpoint)
+                .map_err(string_error)?;
+            context
+                .advance_to("provisioning_hub_pool", &checkpoint)
+                .map_err(string_error)?;
+            context.mark_waiting().map_err(string_error)
+        })
+    }
+}
+
 struct LogisticsWorkflow;
 impl WorkflowExecutor for LogisticsWorkflow {
     fn execute<'a>(&'a mut self, context: &'a mut WorkflowContext) -> BoxWorkflowFuture<'a> {
@@ -6856,12 +8884,15 @@ async fn ensure_logistics_pre_deactivation(
         {
             continue;
         }
-        let can_deactivate = detail
+        let commands = detail
             .available_commands
             .iter()
             .chain(detail.commands.iter())
-            .any(|command| command.eq_ignore_ascii_case("deactivate"));
-        if can_deactivate {
+            .collect::<Vec<_>>();
+        if commands
+            .iter()
+            .any(|command| command.eq_ignore_ascii_case("deactivate"))
+        {
             let operation = client
                 .devices()
                 .get(code)
@@ -6873,8 +8904,23 @@ async fn ensure_logistics_pre_deactivation(
             await_success(&operation).await?;
             continue;
         }
+        if commands
+            .iter()
+            .any(|command| command.eq_ignore_ascii_case("clear_directive"))
+        {
+            let operation = client
+                .devices()
+                .get(code)
+                .await
+                .map_err(string_error)?
+                .command(replicant_client::raw::devices::DeviceCommand::ClearDirective)
+                .await
+                .map_err(string_error)?;
+            await_success(&operation).await?;
+            continue;
+        }
         return Err(format!(
-            "pre-delivery device {code} is {status:?} and cannot be deactivated safely"
+            "pre-delivery device {code} is {status:?} and cannot be stopped safely"
         ));
     }
     Ok(())
@@ -9759,6 +11805,39 @@ pub fn new_mining_campaign_workflow(
         current_step: Some("queued".to_owned()),
         parent_id: None,
     }
+}
+
+/// Creates a queued AMI Cargo Freighter capacity mutation workflow.
+pub fn new_mining_transport_capacity_workflow(
+    intent: MiningTransportCapacityIntent,
+) -> NewWorkflow<MiningTransportCapacityIntent, MiningTransportCapacityCheckpoint> {
+    queued_workflow(
+        mining_transport_capacity_workflow_kind(),
+        intent,
+        MiningTransportCapacityCheckpoint::default(),
+    )
+}
+
+/// Creates a queued remote maintenance rotation workflow.
+pub fn new_mining_maintenance_rotation_workflow(
+    intent: MiningMaintenanceRotationIntent,
+) -> NewWorkflow<MiningMaintenanceRotationIntent, MiningMaintenanceRotationCheckpoint> {
+    queued_workflow(
+        mining_maintenance_rotation_workflow_kind(),
+        intent,
+        MiningMaintenanceRotationCheckpoint::default(),
+    )
+}
+
+/// Creates a queued regional maintenance-pool restoration workflow.
+pub fn new_mining_maintenance_pool_workflow(
+    intent: MiningMaintenancePoolIntent,
+) -> NewWorkflow<MiningMaintenancePoolIntent, MiningMaintenancePoolCheckpoint> {
+    queued_workflow(
+        mining_maintenance_pool_workflow_kind(),
+        intent,
+        MiningMaintenancePoolCheckpoint::default(),
+    )
 }
 
 /// Creates a queued logistics workflow.
@@ -14797,6 +16876,18 @@ fn dispatch_payload_device_is_free(device: &Device, source: &str) -> bool {
         && device.relationships.controlled_devices.is_empty()
 }
 
+fn dispatch_payload_device_satisfies_request(
+    device: &Device,
+    device_type: &str,
+    source: &str,
+) -> bool {
+    device_is_type(device, device_type)
+        && dispatch_payload_device_is_free(device, source)
+        && (!device_type.eq_ignore_ascii_case(replicant_mining_planner::MAINTENANCE_DRONE)
+            || (maintenance_replacement_ready(device)
+                && !maintenance_has_directive(device, "patrol")))
+}
+
 fn dispatch_vessel_onboard_empty_matrix<'a>(
     vessel: &Device,
     devices: &'a [Device],
@@ -14979,8 +17070,7 @@ async fn select_regional_dispatch_stock(
                 break;
             }
             if used.contains(code)
-                || !device_is_type(device, &device_type)
-                || !dispatch_payload_device_is_free(device, &intent.source)
+                || !dispatch_payload_device_satisfies_request(device, &device_type, &intent.source)
             {
                 continue;
             }
@@ -15058,19 +17148,20 @@ async fn select_regional_dispatch_stock(
     // Transport itself is provisioning stock too. Only count a carrier that is
     // actually free at the source; a reserved, nested, travelling, loaded, or
     // occupied hull must not suppress the print deficit.
+    let movement_required = !intent.source.eq_ignore_ascii_case(&intent.destination);
     let has_cargo_transport = devices.iter().any(|device| {
         dispatch_transport_is_free(device, &intent.source, &used, &claimed_elsewhere)
             && device.cargo_capacity.unwrap_or(0) > 0
             && device.cargo.is_empty()
     });
-    if !intent.resources.is_empty() && !has_cargo_transport {
+    if movement_required && !intent.resources.is_empty() && !has_cargo_transport {
         *deficits.entry("cargo_freighter".to_owned()).or_default() += 1;
     }
     let has_device_carrier = devices.iter().any(|device| {
         dispatch_transport_is_free(device, &intent.source, &used, &claimed_elsewhere)
             && device.attach_capacity.unwrap_or(0) > 0
     });
-    if regional_dispatch_has_device_payload(intent) && !has_device_carrier {
+    if movement_required && regional_dispatch_has_device_payload(intent) && !has_device_carrier {
         *deficits.entry("surge_carrier".to_owned()).or_default() += 1;
     }
     checkpoint.print_requests = deficits
@@ -18929,6 +21020,7 @@ mod tests {
             system: "SOL".into(),
             collect: "SOL-BELT-1".into(),
             deliver: "ROOT-1-L4".into(),
+            desired_freighters: MIN_TRANSPORT_FREIGHTERS,
         };
         let current = repository
             .create(new_mining_campaign_workflow(MiningCampaignIntent {
@@ -18953,6 +21045,178 @@ mod tests {
             replicant_workflow::WorkflowServiceIntentCoverage::Complete
         );
         assert_eq!(projection.intents, vec![route.workflow_service_intent()]);
+    }
+
+    #[test]
+    fn mining_transport_capacity_reuses_selected_stock_before_printing_deficit() {
+        assert_eq!(mining_transport_remaining_deficit(3, 1, 0), 2);
+        assert_eq!(mining_transport_remaining_deficit(3, 1, 1), 1);
+        assert_eq!(mining_transport_remaining_deficit(3, 1, 2), 0);
+    }
+
+    #[test]
+    fn mining_transport_scale_down_releases_without_decommissioning() {
+        let command = mining_transport_release_command("CF-EXTRA");
+        assert!(matches!(
+            command,
+            replicant_client::raw::devices::DeviceCommand::Release(_)
+        ));
+    }
+
+    #[test]
+    fn mining_transport_reuse_rejects_foreign_route_or_role_tags() {
+        let mut candidate = dispatch_test_device("CF-FREE", "cargo_freighter", "ALPHA-HUB");
+        assert!(mining_transport_candidate_is_safe(&candidate, "ALPHA"));
+
+        candidate.tags = vec![replicant_mining_planner::site_tag("BETA")];
+        assert!(!mining_transport_candidate_is_safe(&candidate, "ALPHA"));
+
+        candidate.tags = vec![
+            replicant_mining_planner::site_tag("ALPHA"),
+            replicant_mining_planner::role_tag("survey-drone"),
+        ];
+        assert!(!mining_transport_candidate_is_safe(&candidate, "ALPHA"));
+    }
+
+    #[test]
+    fn maintenance_rotation_checkpoint_survives_restart_between_delivery_and_recovery() {
+        let checkpoint = MiningMaintenanceRotationCheckpoint {
+            replacement: Some("READY".to_owned()),
+            replacement_delivered: true,
+            replacement_patrol_verified: true,
+            ..MiningMaintenanceRotationCheckpoint::default()
+        };
+        let restored: MiningMaintenanceRotationCheckpoint = serde_json::from_value(
+            serde_json::to_value(&checkpoint).expect("serialize maintenance checkpoint"),
+        )
+        .expect("restore maintenance checkpoint");
+
+        assert_eq!(restored.replacement.as_deref(), Some("READY"));
+        assert!(restored.replacement_delivered);
+        assert!(maintenance_rotation_recovery_allowed(&restored));
+        assert!(restored.recovery_child.is_none());
+    }
+
+    #[test]
+    fn worn_recovery_is_forbidden_until_replacement_patrol_is_verified() {
+        let mut checkpoint = MiningMaintenanceRotationCheckpoint {
+            replacement: Some("READY".to_owned()),
+            replacement_delivered: true,
+            ..MiningMaintenanceRotationCheckpoint::default()
+        };
+        assert!(!maintenance_rotation_recovery_allowed(&checkpoint));
+
+        checkpoint.replacement_patrol_verified = true;
+        assert!(maintenance_rotation_recovery_allowed(&checkpoint));
+    }
+
+    #[test]
+    fn hub_pool_replacement_candidate_requires_one_spare_above_hard_minimum() {
+        let intent = MiningMaintenanceRotationIntent {
+            region: "Alpha".to_owned(),
+            system: "REMOTE".to_owned(),
+            site_belt: "REMOTE-BELT-1".to_owned(),
+            hub_belt: "ALPHA-BELT-1".to_owned(),
+            worn_drone: "WORN".to_owned(),
+            replacement_candidates: vec!["READY".to_owned()],
+        };
+        let mut candidate = dispatch_test_device("READY", "maintenance_drone", "ALPHA-BELT-1");
+        candidate.operational_capacity = replicant_client::domain::OperationalCapacity::new(100.0);
+        candidate.active_directive = Some(replicant_client::domain::ActiveDeviceDirective {
+            directive: Some(replicant_client::domain::DeviceDirective::from("patrol")),
+            status: Some("active".into()),
+            details: BTreeMap::new(),
+        });
+
+        assert!(maintenance_hub_replacement_candidate(
+            &candidate,
+            &intent,
+            HUB_MAINTENANCE_MIN_HEALTHY + 1,
+        ));
+        assert!(!maintenance_hub_replacement_candidate(
+            &candidate,
+            &intent,
+            HUB_MAINTENANCE_MIN_HEALTHY,
+        ));
+    }
+
+    #[test]
+    fn maintenance_rotation_uses_logistics_manifests_for_delivery_and_hub_return() {
+        let intent = MiningMaintenanceRotationIntent {
+            region: "Alpha".to_owned(),
+            system: "REMOTE".to_owned(),
+            site_belt: "REMOTE-BELT-1".to_owned(),
+            hub_belt: "ALPHA-BELT-1".to_owned(),
+            worn_drone: "WORN".to_owned(),
+            replacement_candidates: vec!["READY".to_owned()],
+        };
+        let delivery = maintenance_delivery_manifest(&intent, "READY", "ALPHA-BELT-1".to_owned());
+        assert_eq!(delivery.destination, "REMOTE-BELT-1");
+        assert_eq!(delivery.device_codes, ["READY"]);
+        assert_eq!(delivery.pre_deactivate_device_codes, ["READY"]);
+        assert!(delivery.allow_transport_staging);
+        assert!(delivery.return_transports);
+
+        let recovery = maintenance_recovery_manifest(&intent, "REMOTE-BELT-1".to_owned());
+        assert_eq!(recovery.destination, "ALPHA-BELT-1");
+        assert_eq!(recovery.device_codes, ["WORN"]);
+        assert_eq!(recovery.pre_deactivate_device_codes, ["WORN"]);
+        assert!(recovery.allow_transport_staging);
+        assert!(recovery.return_transports);
+        assert_ne!(delivery.purpose, recovery.purpose);
+    }
+
+    #[test]
+    fn maintenance_replacement_candidate_rejects_foreign_commitments() {
+        let mut candidate = dispatch_test_device("READY", "maintenance_drone", "ALPHA-BELT-1");
+        candidate.operational_capacity = replicant_client::domain::OperationalCapacity::new(100.0);
+        assert!(maintenance_idle_replacement_candidate(&candidate));
+
+        candidate.tags = vec!["evt-m:foreign".to_owned()];
+        assert!(!maintenance_idle_replacement_candidate(&candidate));
+
+        candidate.tags = vec![replicant_mining_planner::site_tag("OTHER")];
+        assert!(!maintenance_idle_replacement_candidate(&candidate));
+    }
+
+    #[test]
+    fn offline_worn_maintenance_is_terminal_for_physical_recovery() {
+        let mut worn = dispatch_test_device("WORN", "maintenance_drone", "REMOTE-BELT-1");
+        worn.status = Some(DeviceStatus::from("offline"));
+        assert!(maintenance_worn_recovery_unrecoverable(&worn));
+
+        worn.status = Some(DeviceStatus::from("deactivated"));
+        assert!(!maintenance_worn_recovery_unrecoverable(&worn));
+    }
+
+    #[test]
+    fn regional_dispatch_reuses_only_ready_non_patrolling_maintenance_stock() {
+        let mut candidate = dispatch_test_device("READY", "maintenance_drone", "ALPHA-BELT-1");
+        candidate.operational_capacity = replicant_client::domain::OperationalCapacity::new(100.0);
+        assert!(dispatch_payload_device_satisfies_request(
+            &candidate,
+            "maintenance_drone",
+            "ALPHA-BELT-1",
+        ));
+
+        candidate.operational_capacity = replicant_client::domain::OperationalCapacity::new(94.9);
+        assert!(!dispatch_payload_device_satisfies_request(
+            &candidate,
+            "maintenance_drone",
+            "ALPHA-BELT-1",
+        ));
+
+        candidate.operational_capacity = replicant_client::domain::OperationalCapacity::new(100.0);
+        candidate.active_directive = Some(replicant_client::domain::ActiveDeviceDirective {
+            directive: Some(replicant_client::domain::DeviceDirective::from("patrol")),
+            status: Some("active".into()),
+            details: BTreeMap::new(),
+        });
+        assert!(!dispatch_payload_device_satisfies_request(
+            &candidate,
+            "maintenance_drone",
+            "ALPHA-BELT-1",
+        ));
     }
 
     #[test]

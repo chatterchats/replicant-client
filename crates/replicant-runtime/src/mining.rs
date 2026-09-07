@@ -11,6 +11,8 @@ use replicant_client::{
     Client, Star,
     domain::{Device, DeviceStatus, DeviceType, Location},
 };
+#[cfg(test)]
+use replicant_mining_planner::role_tag;
 use replicant_mining_planner::{
     BlueprintSpec, CARGO_FREIGHTER, FactoryWorkload, MAINTENANCE_DRONE, MINING_CONTROLLER,
     MINING_DRONE, PrintBatch, QuantityMap, SURGE_CARRIER, SURVEY_CONTROLLER, SURVEY_DRONE,
@@ -32,6 +34,25 @@ mod executor;
 mod validation;
 
 const PLAN_VERSION: u32 = 1;
+pub(crate) const MINING_MAINTENANCE_ROTATION_THRESHOLD_PCT: f64 = 30.0;
+pub(crate) const HUB_MAINTENANCE_READY_PCT: f64 = 95.0;
+pub(crate) const HUB_MAINTENANCE_MIN_HEALTHY: usize = 2;
+pub(crate) const HUB_MAINTENANCE_TARGET_HEALTHY: usize = 3;
+pub(crate) const HUB_MAINTENANCE_ROLE: &str = "maintenance-pool";
+
+pub(crate) const CARGO_FREIGHTER_CAPACITY_UNITS: i64 = 500;
+pub(crate) const MIN_TRANSPORT_FREIGHTERS: usize = 1;
+pub(crate) const MAX_TRANSPORT_FREIGHTERS: usize = 6;
+pub(crate) const TRANSPORT_LOW_BACKLOG_LOADS: f64 = 2.0;
+pub(crate) const TRANSPORT_SCALE_UP_LOADS: f64 = 10.0;
+pub(crate) const TRANSPORT_CRITICAL_BACKLOG_LOADS: f64 = 30.0;
+pub(crate) const TRANSPORT_CAPACITY_COOLDOWN_MS: i64 = 15 * 60 * 1_000;
+pub(crate) const TRANSPORT_SCALE_DOWN_HOLD_MS: i64 = 60 * 60 * 1_000;
+pub(crate) const TRANSPORT_CAPACITY_DOCUMENT_NS: &str = "director.mining.transport_capacity";
+
+const fn default_transport_freighter_count() -> usize {
+    MIN_TRANSPORT_FREIGHTERS
+}
 
 /// Error type returned by the reusable mining workflow.
 pub type AnyError = Box<dyn StdError + Send + Sync + 'static>;
@@ -139,6 +160,9 @@ pub struct AmiTransportRouteIntent {
     pub collect: String,
     /// Exact System Hub location to deliver to.
     pub deliver: String,
+    /// Desired Cargo Freighter capacity. Legacy intents default to one.
+    #[serde(default = "default_transport_freighter_count")]
+    pub desired_freighters: usize,
 }
 
 impl AmiTransportRouteIntent {
@@ -172,8 +196,258 @@ pub(crate) enum EvidenceState {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TransportServiceAudit {
     pub(crate) state: EvidenceState,
+    pub(crate) collect: String,
+    pub(crate) deliver: String,
     pub(crate) controller: Option<String>,
+    pub(crate) controller_operational: EvidenceState,
+    pub(crate) controller_directive: EvidenceState,
+    pub(crate) controller_configuration: EvidenceState,
+    pub(crate) adopted_freighters: Vec<String>,
+    pub(crate) usable_freighters: Vec<String>,
+    pub(crate) unknown_freighters: Vec<String>,
+    pub(crate) unusable_freighters: Vec<String>,
     pub(crate) freighter: Option<String>,
+}
+
+impl TransportServiceAudit {
+    pub(crate) fn usable_freighter_count(&self) -> usize {
+        self.usable_freighters.len()
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct MaintenanceHubPoolAudit {
+    pub(crate) healthy_patrol: Vec<String>,
+    pub(crate) repairing_patrol: Vec<String>,
+    pub(crate) unknown_patrol: Vec<String>,
+    pub(crate) configurable_ready: Vec<String>,
+}
+
+impl MaintenanceHubPoolAudit {
+    pub(crate) fn healthy_count(&self) -> usize {
+        self.healthy_patrol.len()
+    }
+
+    pub(crate) fn dispatch_preserves_minimum(&self) -> bool {
+        self.healthy_count() > HUB_MAINTENANCE_MIN_HEALTHY
+    }
+
+    pub(crate) fn desired_healthy_count(
+        &self,
+        available_healthy: usize,
+        higher_priority_faults: bool,
+    ) -> usize {
+        if available_healthy < HUB_MAINTENANCE_MIN_HEALTHY {
+            HUB_MAINTENANCE_MIN_HEALTHY
+        } else if available_healthy == HUB_MAINTENANCE_MIN_HEALTHY
+            && self.repairing_patrol.is_empty()
+            && self.unknown_patrol.is_empty()
+            && !higher_priority_faults
+        {
+            HUB_MAINTENANCE_TARGET_HEALTHY
+        } else {
+            available_healthy
+        }
+    }
+}
+
+pub(crate) fn maintenance_replacement_ready(device: &Device) -> bool {
+    site_asset_usable(device)
+        && device
+            .operational_capacity
+            .is_some_and(|capacity| capacity.percent() >= HUB_MAINTENANCE_READY_PCT)
+}
+
+pub(crate) fn maintenance_rotation_due(device: &Device) -> bool {
+    site_asset_usable(device)
+        && has_directive(device, "patrol")
+        && device
+            .operational_capacity
+            .is_some_and(|capacity| capacity.percent() < MINING_MAINTENANCE_ROTATION_THRESHOLD_PCT)
+}
+
+pub(crate) fn maintenance_hub_pool_audit(
+    devices: &[Device],
+    hub_belt: &str,
+) -> MaintenanceHubPoolAudit {
+    let pool_role = replicant_mining_planner::role_tag(HUB_MAINTENANCE_ROLE);
+    let mut audit = MaintenanceHubPoolAudit::default();
+    for device in devices.iter().filter(|device| {
+        device_location(device) == Some(hub_belt)
+            && device_type(device) == Some(MAINTENANCE_DRONE)
+            && site_asset_usable(device)
+            && device.relationships.controller.is_none()
+            && !device
+                .tags
+                .iter()
+                .any(|tag| replicant_protocol::workflow_tag_reserved(tag) && tag != &pool_role)
+    }) {
+        let code = device.key.id.as_str().to_owned();
+        if has_directive(device, "patrol") {
+            match device
+                .operational_capacity
+                .as_ref()
+                .map(|capacity| capacity.percent())
+            {
+                Some(percent) if percent >= HUB_MAINTENANCE_READY_PCT => {
+                    audit.healthy_patrol.push(code);
+                }
+                Some(_) => audit.repairing_patrol.push(code),
+                None => audit.unknown_patrol.push(code),
+            }
+        } else if maintenance_patrol_capability(device) != EvidenceState::Absent
+            && maintenance_replacement_ready(device)
+        {
+            audit.configurable_ready.push(code);
+        }
+    }
+    audit.healthy_patrol.sort();
+    audit.repairing_patrol.sort();
+    audit.unknown_patrol.sort();
+    audit.configurable_ready.sort();
+    audit
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TransportBacklogClass {
+    Low,
+    HealthyBand,
+    ScaleUp,
+    Critical,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
+pub(crate) struct TransportCapacityTrend {
+    #[serde(default)]
+    pub(crate) last_observed_backlog_units: Option<i64>,
+    #[serde(default)]
+    pub(crate) last_observation_at_ms: Option<i64>,
+    #[serde(default)]
+    pub(crate) last_capacity_change_at_ms: Option<i64>,
+    #[serde(default)]
+    pub(crate) low_backlog_since_ms: Option<i64>,
+}
+
+pub(crate) fn transport_backlog_loads(backlog_units: i64) -> f64 {
+    backlog_units.max(0) as f64 / CARGO_FREIGHTER_CAPACITY_UNITS as f64
+}
+
+pub(crate) fn transport_backlog_class(backlog_units: i64) -> TransportBacklogClass {
+    let loads = transport_backlog_loads(backlog_units);
+    if loads < TRANSPORT_LOW_BACKLOG_LOADS {
+        TransportBacklogClass::Low
+    } else if loads > TRANSPORT_CRITICAL_BACKLOG_LOADS {
+        TransportBacklogClass::Critical
+    } else if loads > TRANSPORT_SCALE_UP_LOADS {
+        TransportBacklogClass::ScaleUp
+    } else {
+        TransportBacklogClass::HealthyBand
+    }
+}
+
+pub(crate) fn transport_scale_up_delta(backlog_units: i64) -> usize {
+    match transport_backlog_class(backlog_units) {
+        TransportBacklogClass::Critical => 2,
+        TransportBacklogClass::ScaleUp => 1,
+        TransportBacklogClass::Low | TransportBacklogClass::HealthyBand => 0,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TransportCapacityAction {
+    Hold,
+    Add(usize),
+    RemoveOne,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TransportThroughputState {
+    ImprovingOrUnproven,
+    Sufficient,
+    Insufficient,
+    InsufficientAtMaximum,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TransportCapacityEvaluation {
+    pub(crate) action: TransportCapacityAction,
+    pub(crate) trend: TransportCapacityTrend,
+    pub(crate) throughput: TransportThroughputState,
+    pub(crate) refresh_before_decision: bool,
+}
+
+pub(crate) fn evaluate_transport_capacity(
+    backlog_units: i64,
+    usable_freighters: usize,
+    now: i64,
+    previous: &TransportCapacityTrend,
+) -> TransportCapacityEvaluation {
+    let previous_backlog = previous.last_observed_backlog_units;
+    let falling = previous_backlog.is_some_and(|value| backlog_units < value);
+    let flat_or_rising = previous_backlog.is_some_and(|value| backlog_units >= value);
+    let cooldown_active = previous
+        .last_capacity_change_at_ms
+        .is_some_and(|changed| now.saturating_sub(changed) < TRANSPORT_CAPACITY_COOLDOWN_MS);
+    let class = transport_backlog_class(backlog_units);
+    let throughput_insufficient = matches!(
+        class,
+        TransportBacklogClass::ScaleUp | TransportBacklogClass::Critical
+    ) && flat_or_rising
+        && previous.last_observation_at_ms.is_some()
+        && !cooldown_active;
+    let mut trend = previous.clone();
+    trend.last_observed_backlog_units = Some(backlog_units.max(0));
+    trend.last_observation_at_ms = Some(now);
+    if class == TransportBacklogClass::Low {
+        if trend.low_backlog_since_ms.is_none() {
+            trend.low_backlog_since_ms = Some(now);
+        }
+    } else {
+        trend.low_backlog_since_ms = None;
+    }
+
+    let action = if cooldown_active {
+        TransportCapacityAction::Hold
+    } else if class == TransportBacklogClass::Low
+        && usable_freighters > MIN_TRANSPORT_FREIGHTERS
+        && trend
+            .low_backlog_since_ms
+            .is_some_and(|since| now.saturating_sub(since) >= TRANSPORT_SCALE_DOWN_HOLD_MS)
+    {
+        TransportCapacityAction::RemoveOne
+    } else {
+        let requested = transport_scale_up_delta(backlog_units);
+        let available = MAX_TRANSPORT_FREIGHTERS.saturating_sub(usable_freighters);
+        let add = requested.min(available);
+        if add == 0 || (falling && previous.last_capacity_change_at_ms.is_some()) {
+            TransportCapacityAction::Hold
+        } else {
+            TransportCapacityAction::Add(add)
+        }
+    };
+
+    let throughput = if throughput_insufficient && usable_freighters >= MAX_TRANSPORT_FREIGHTERS {
+        TransportThroughputState::InsufficientAtMaximum
+    } else if throughput_insufficient {
+        TransportThroughputState::Insufficient
+    } else if matches!(
+        class,
+        TransportBacklogClass::Low | TransportBacklogClass::HealthyBand
+    ) {
+        TransportThroughputState::Sufficient
+    } else {
+        TransportThroughputState::ImprovingOrUnproven
+    };
+    TransportCapacityEvaluation {
+        action,
+        trend,
+        throughput,
+        refresh_before_decision: throughput_insufficient,
+    }
+}
+
+pub(crate) fn record_transport_capacity_change(trend: &mut TransportCapacityTrend, now: i64) {
+    trend.last_capacity_change_at_ms = Some(now);
+    trend.low_backlog_since_ms = None;
 }
 
 /// Durable activation phase for one mining transport route.
@@ -198,7 +472,7 @@ pub enum PrintPurpose {
 
 /// Device assignments checkpointed for one mining site.
 #[allow(missing_docs)]
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SiteAssets {
     pub mining_controller: Option<String>,
     pub mining_drones: Vec<String>,
@@ -213,15 +487,23 @@ pub struct SiteAssets {
 }
 
 impl SiteAssets {
-    fn codes(&self) -> Vec<String> {
+    /// Returns checkpointed productive site devices, excluding optional protection.
+    pub(crate) fn productive_codes(&self) -> Vec<String> {
         self.mining_controller
             .iter()
             .chain(&self.mining_drones)
             .chain(self.survey_controller.iter())
             .chain(&self.survey_drones)
             .chain(self.maintenance_drone.iter())
-            .chain(self.system_ward.iter())
             .cloned()
+            .collect()
+    }
+
+    /// Returns every checkpointed device selected for this site.
+    pub(crate) fn codes(&self) -> Vec<String> {
+        self.productive_codes()
+            .into_iter()
+            .chain(self.system_ward.iter().cloned())
             .collect()
     }
 
@@ -290,7 +572,24 @@ pub struct RouteMission {
     pub tag: String,
     pub phase: RoutePhase,
     pub controller: Option<String>,
+    /// Primary Cargo Freighter retained for checkpoint compatibility.
     pub freighter: Option<String>,
+    /// Additional adopted Cargo Freighters on the same AMI route.
+    #[serde(default)]
+    pub additional_freighters: Vec<String>,
+    /// Desired route capacity. Legacy route checkpoints default to one.
+    #[serde(default = "default_transport_freighter_count")]
+    pub desired_freighters: usize,
+}
+
+impl RouteMission {
+    pub(crate) fn freighters(&self) -> Vec<String> {
+        self.freighter
+            .iter()
+            .chain(&self.additional_freighters)
+            .cloned()
+            .collect()
+    }
 }
 
 /// Durable manufacturing checkpoint for mining execution.
@@ -429,7 +728,7 @@ pub fn mining_work_item_specs(
                 "kind": "mining.route_inactive",
                 "parameters": { "belt": route.belt, "hub": mission.hub_location }
             }]),
-            requirements_json: serde_json::to_value(mining_route_item_requirements(region))?,
+            requirements_json: serde_json::to_value(mining_route_item_requirements(region, route))?,
             deadline_at_ms: None,
         });
     }
@@ -568,34 +867,42 @@ fn mining_site_item_requirements(region: &str, site: &SiteMission) -> Vec<Resour
     requirements
 }
 
-fn mining_route_item_requirements(region: &str) -> Vec<ResourceRequirement> {
+fn mining_route_item_requirements(region: &str, route: &RouteMission) -> Vec<ResourceRequirement> {
     let scope = || RequirementScope::Region(region.to_owned());
-    vec![
-        ResourceRequirement {
-            key: "worker".into(),
-            kind: "replicant".into(),
-            capabilities: vec![OPERATIONAL_REGIONAL_WORKER_CAPABILITY.into()],
-            scope: scope(),
-            count: 1,
-            quantity: 1,
-        },
-        ResourceRequirement {
+    let mut requirements = vec![ResourceRequirement {
+        key: "worker".into(),
+        kind: "replicant".into(),
+        capabilities: vec![OPERATIONAL_REGIONAL_WORKER_CAPABILITY.into()],
+        scope: scope(),
+        count: 1,
+        quantity: 1,
+    }];
+    if route.controller.is_none() {
+        requirements.push(ResourceRequirement {
             key: "transport_controller".into(),
             kind: "device".into(),
             capabilities: vec![TRANSPORT_CONTROLLER.into()],
             scope: scope(),
             count: 1,
             quantity: 1,
-        },
-        ResourceRequirement {
-            key: "freighter".into(),
+        });
+    }
+    let missing_freighters = route
+        .desired_freighters
+        .saturating_sub(route.freighters().len());
+    if let Ok(count) = u32::try_from(missing_freighters)
+        && count > 0
+    {
+        requirements.push(ResourceRequirement {
+            key: "freighters".into(),
             kind: "device".into(),
             capabilities: vec![CARGO_FREIGHTER.into()],
             scope: scope(),
-            count: 1,
+            count,
             quantity: 1,
-        },
-    ]
+        });
+    }
+    requirements
 }
 
 /// Executes one isolated mining site, route, or manufacturing stage.
@@ -683,16 +990,30 @@ pub async fn execute_mining_item(
             let mut route = lane.routes.get(index).cloned().ok_or_else(|| {
                 app_error(io::ErrorKind::InvalidInput, "mining route index is invalid")
             })?;
-            route.controller = Some(mining_allocated_identity(
-                allocations,
-                "transport_controller",
-                "device",
-            )?);
-            route.freighter = Some(mining_allocated_identity(
-                allocations,
-                "freighter",
-                "device",
-            )?);
+            if route.controller.is_none() {
+                route.controller = Some(mining_allocated_identity(
+                    allocations,
+                    "transport_controller",
+                    "device",
+                )?);
+            }
+            let missing_freighters = route
+                .desired_freighters
+                .saturating_sub(route.freighters().len());
+            if missing_freighters > 0 {
+                let mut allocated =
+                    mining_allocated_identities(allocations, "freighters", "device")?;
+                allocated.truncate(missing_freighters);
+                if route.freighter.is_none() {
+                    route.freighter = allocated.first().cloned();
+                    if !allocated.is_empty() {
+                        allocated.remove(0);
+                    }
+                }
+                route.additional_freighters.extend(allocated);
+                route.additional_freighters.sort();
+                route.additional_freighters.dedup();
+            }
             lane.routes = vec![route];
             lane.sites.clear();
             lane.print_batches
@@ -998,36 +1319,42 @@ async fn create_plan(client: &Client, config: &Config) -> AnyResult<MiningMissio
     let site_print_requirements = shortages(&site_required, &reusable_site);
 
     let mut routes = Vec::new();
+    let mut route_required = QuantityMap::new();
     for site in &sites {
         if site.belt == config.hub {
             continue;
         }
+        let desired_freighters = explicit_routes
+            .get(site.system.as_str())
+            .map_or(MIN_TRANSPORT_FREIGHTERS, |route| route.desired_freighters);
         let audit = transport_service_present(&devices, &site.system, &site.belt, &config.hub);
+        let usable_freighters = audit.usable_freighters.clone();
+        let freighter = usable_freighters.first().cloned();
+        let additional_freighters = usable_freighters.into_iter().skip(1).collect::<Vec<_>>();
+        let missing_freighters = desired_freighters.saturating_sub(audit.usable_freighter_count());
+        if audit.controller.is_none() {
+            *route_required
+                .entry(TRANSPORT_CONTROLLER.to_owned())
+                .or_default() += 1;
+        }
+        *route_required
+            .entry(CARGO_FREIGHTER.to_owned())
+            .or_default() += i64::try_from(missing_freighters)?;
         routes.push(RouteMission {
             system: site.system.clone(),
             belt: site.belt.clone(),
             tag: site.tag.clone(),
-            phase: if audit.state == EvidenceState::Present {
+            phase: if audit.state == EvidenceState::Present && missing_freighters == 0 {
                 RoutePhase::Active
             } else {
                 RoutePhase::Planned
             },
             controller: audit.controller,
-            freighter: audit.freighter,
+            freighter,
+            additional_freighters,
+            desired_freighters,
         });
     }
-    let missing_routes = i64::try_from(
-        routes
-            .iter()
-            .filter(|route| route.phase != RoutePhase::Active)
-            .count(),
-    )?;
-    let route_required = [
-        (TRANSPORT_CONTROLLER.to_owned(), missing_routes),
-        (CARGO_FREIGHTER.to_owned(), missing_routes),
-    ]
-    .into_iter()
-    .collect();
     let reusable_route = reusable_counts(&devices, &config.hub, &mission_tag, false);
     let route_print_requirements = shortages(&route_required, &reusable_route);
 
@@ -1100,11 +1427,22 @@ async fn validate_transport_routes(
             system: route.system.trim().to_ascii_uppercase(),
             collect: route.collect.trim().to_ascii_uppercase(),
             deliver: route.deliver.trim().to_ascii_uppercase(),
+            desired_freighters: route.desired_freighters,
         };
         if route.system.is_empty() || route.collect.is_empty() || route.deliver.is_empty() {
             return Err(app_error(
                 io::ErrorKind::InvalidInput,
                 "transport route fields must be nonblank",
+            ));
+        }
+        if !(MIN_TRANSPORT_FREIGHTERS..=MAX_TRANSPORT_FREIGHTERS)
+            .contains(&route.desired_freighters)
+        {
+            return Err(app_error(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "transport route desired_freighters must be between {MIN_TRANSPORT_FREIGHTERS} and {MAX_TRANSPORT_FREIGHTERS}"
+                ),
             ));
         }
         if !systems.contains(route.system.as_str()) {
@@ -1475,28 +1813,173 @@ fn density_rank(density: &str) -> u8 {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum MiningSiteRepair {
+    Adopt {
+        device: String,
+        controller: String,
+    },
+    SetDirective {
+        device: String,
+        directive: &'static str,
+    },
+    LaunchController {
+        device: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum MiningSiteIssue {
+    MissingDevice { device_type: String, count: i64 },
+    UnusableDevice { device: String, device_type: String },
+    CommittedElsewhere { device: String, device_type: String },
+    EvidenceIncomplete { device: String, field: &'static str },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SiteAudit {
     pub(crate) assets: SiteAssets,
+    /// Productive readiness only. A maintenance rotation that is due does not
+    /// turn an otherwise-working site into a hardware shortage.
     pub(crate) operational: bool,
+    pub(crate) mining_adoption_correct: bool,
+    pub(crate) survey_adoption_correct: bool,
+    pub(crate) normal_repair_needed: bool,
+    pub(crate) maintenance_rotation_due: bool,
+    /// Whether the evidence used for a repair is complete enough to mutate.
+    pub(crate) mutation_safe: bool,
+    pub(crate) repairs: Vec<MiningSiteRepair>,
+    pub(crate) issues: Vec<MiningSiteIssue>,
+    shortages: QuantityMap,
+}
+
+impl SiteAudit {
+    pub(crate) fn director_reason(&self) -> Option<String> {
+        if !self.mutation_safe
+            && let Some(reason) = self.issues.iter().find_map(|issue| match issue {
+                MiningSiteIssue::EvidenceIncomplete { device, field } => {
+                    Some(format!("{device} has incomplete {field} evidence"))
+                }
+                _ => None,
+            })
+        {
+            return Some(reason);
+        }
+        if (!self.mining_adoption_correct || !self.survey_adoption_correct)
+            && let Some(reason) = self.repairs.iter().find_map(|repair| match repair {
+                MiningSiteRepair::Adopt { device, controller } => {
+                    Some(format!("re-adopt {device} to {controller}"))
+                }
+                _ => None,
+            })
+        {
+            return Some(reason);
+        }
+        if let Some(reason) = self.issues.iter().find_map(|issue| match issue {
+            MiningSiteIssue::UnusableDevice {
+                device,
+                device_type,
+            } => Some(format!("replace unusable {device_type} {device}")),
+            _ => None,
+        }) {
+            return Some(reason);
+        }
+        if let Some(reason) = self.issues.iter().find_map(|issue| match issue {
+            MiningSiteIssue::CommittedElsewhere {
+                device,
+                device_type,
+            } => Some(format!(
+                "{device_type} {device} is committed elsewhere and cannot be reused"
+            )),
+            _ => None,
+        }) {
+            return Some(reason);
+        }
+        if let Some(reason) = self.issues.iter().find_map(|issue| match issue {
+            MiningSiteIssue::MissingDevice { device_type, count } => {
+                Some(format!("provision {count} missing {device_type}"))
+            }
+            _ => None,
+        }) {
+            return Some(reason);
+        }
+        self.repairs.iter().find_map(|repair| match repair {
+            MiningSiteRepair::SetDirective { device, directive } => {
+                Some(format!("set {device} directive to {directive}"))
+            }
+            MiningSiteRepair::LaunchController { device } => {
+                Some(format!("restore controller {device} to coordinating state"))
+            }
+            MiningSiteRepair::Adopt { device, controller } => {
+                Some(format!("re-adopt {device} to {controller}"))
+            }
+        })
+    }
 }
 
 pub(crate) fn audit_site(devices: &[Device], system: &str, belt: &str) -> SiteAudit {
+    let expected_site_tag = site_tag(system);
     let at_belt = devices
         .iter()
         .filter(|device| device_location(device) == Some(belt))
         .collect::<Vec<_>>();
-    let mining_controller = select_controller(&at_belt, MINING_CONTROLLER, MINING_DRONE);
-    let survey_controller = select_controller(&at_belt, SURVEY_CONTROLLER, SURVEY_DRONE);
-    let mut mining_drones = children_of(devices, mining_controller.as_deref(), MINING_DRONE);
-    let mut survey_drones = children_of(devices, survey_controller.as_deref(), SURVEY_DRONE);
-    fill_free_devices(&at_belt, MINING_DRONE, 4, &mut mining_drones);
-    fill_free_devices(&at_belt, SURVEY_DRONE, 2, &mut survey_drones);
+    let mining_controller = select_controller(
+        &at_belt,
+        MINING_CONTROLLER,
+        MINING_DRONE,
+        &expected_site_tag,
+    );
+    let survey_controller = select_controller(
+        &at_belt,
+        SURVEY_CONTROLLER,
+        SURVEY_DRONE,
+        &expected_site_tag,
+    );
+    let mut repairs = Vec::new();
+    let mut issues = Vec::new();
+    let mut mutation_safe = true;
+    let mining_drones = select_site_children(
+        devices,
+        &at_belt,
+        mining_controller.as_deref(),
+        MINING_CONTROLLER,
+        MINING_DRONE,
+        4,
+        &expected_site_tag,
+        &mut repairs,
+        &mut issues,
+        &mut mutation_safe,
+    );
+    let survey_drones = select_site_children(
+        devices,
+        &at_belt,
+        survey_controller.as_deref(),
+        SURVEY_CONTROLLER,
+        SURVEY_DRONE,
+        2,
+        &expected_site_tag,
+        &mut repairs,
+        &mut issues,
+        &mut mutation_safe,
+    );
     let maintenance = at_belt
         .iter()
         .filter(|device| device_type(device) == Some(MAINTENANCE_DRONE))
+        .filter(|device| site_asset_usable(device))
+        .filter(|device| !has_conflicting_site_commitment(device, &expected_site_tag))
+        .filter(|device| maintenance_patrol_capability(device) != EvidenceState::Absent)
+        .filter(|device| {
+            !device
+                .tags
+                .iter()
+                .any(|tag| tag == &replicant_mining_planner::role_tag(HUB_MAINTENANCE_ROLE))
+        })
         .min_by(|left, right| {
-            (!has_directive(left, "patrol"))
-                .cmp(&!has_directive(right, "patrol"))
+            (!left.tags.contains(&expected_site_tag))
+                .cmp(&!right.tags.contains(&expected_site_tag))
+                .then_with(|| {
+                    (!has_directive(left, "patrol")).cmp(&!has_directive(right, "patrol"))
+                })
                 .then_with(|| left.key.id.as_str().cmp(right.key.id.as_str()))
         })
         .map(|device| device.key.id.as_str().to_owned());
@@ -1514,19 +1997,94 @@ pub(crate) fn audit_site(devices: &[Device], system: &str, belt: &str) -> SiteAu
         maintenance_drone: maintenance,
         system_ward,
     };
-    // Protection is intentionally outside operational readiness: the Director
-    // backfills or relocates System Wards after the productive stack is online.
-    let operational = assets
-        .mining_controller
+    let mining_adoption_correct = adoption_correct(
+        devices,
+        assets.mining_controller.as_deref(),
+        &assets.mining_drones,
+    );
+    let survey_adoption_correct = adoption_correct(
+        devices,
+        assets.survey_controller.as_deref(),
+        &assets.survey_drones,
+    );
+    audit_controller_health(
+        devices,
+        assets.mining_controller.as_deref(),
+        "deplete_smallest",
+        &mut repairs,
+        &mut issues,
+        &mut mutation_safe,
+    );
+    audit_controller_health(
+        devices,
+        assets.survey_controller.as_deref(),
+        "belt_search",
+        &mut repairs,
+        &mut issues,
+        &mut mutation_safe,
+    );
+    if let Some(maintenance) = assets
+        .maintenance_drone
         .as_deref()
         .and_then(|code| find_device(devices, code))
-        .is_some_and(|device| {
-            has_directive(device, "deplete_smallest")
-                && device
-                    .status
-                    .as_ref()
-                    .is_some_and(|status| status.as_str() == "coordinating")
-        })
+        && !has_directive(maintenance, "patrol")
+    {
+        if maintenance_patrol_capability(maintenance) == EvidenceState::Unknown {
+            mutation_safe = false;
+            issues.push(MiningSiteIssue::EvidenceIncomplete {
+                device: maintenance.key.id.as_str().to_owned(),
+                field: "patrol_capability",
+            });
+        } else {
+            repairs.push(MiningSiteRepair::SetDirective {
+                device: maintenance.key.id.as_str().to_owned(),
+                directive: "patrol",
+            });
+        }
+    }
+    let maintenance_rotation_due = assets
+        .maintenance_drone
+        .as_deref()
+        .and_then(|code| find_device(devices, code))
+        .is_some_and(maintenance_rotation_due);
+    let shortages = shortages(&mining_site_requirements(), &assets.counts());
+    for (device_type_name, count) in &shortages {
+        issues.push(MiningSiteIssue::MissingDevice {
+            device_type: device_type_name.clone(),
+            count: *count,
+        });
+        for device in at_belt
+            .iter()
+            .filter(|device| device_type(device) == Some(device_type_name.as_str()))
+        {
+            if !site_asset_usable(device) {
+                issues.push(MiningSiteIssue::UnusableDevice {
+                    device: device.key.id.as_str().to_owned(),
+                    device_type: device_type_name.clone(),
+                });
+            } else if has_conflicting_site_commitment(device, &expected_site_tag) {
+                issues.push(MiningSiteIssue::CommittedElsewhere {
+                    device: device.key.id.as_str().to_owned(),
+                    device_type: device_type_name.clone(),
+                });
+            }
+        }
+    }
+    // Protection is intentionally outside operational readiness: the Director
+    // backfills or relocates System Wards after the productive stack is online.
+    let operational = shortages.is_empty()
+        && mutation_safe
+        && assets
+            .mining_controller
+            .as_deref()
+            .and_then(|code| find_device(devices, code))
+            .is_some_and(|device| {
+                has_directive(device, "deplete_smallest")
+                    && device
+                        .status
+                        .as_ref()
+                        .is_some_and(|status| status.as_str() == "coordinating")
+            })
         && assets.mining_drones.len() >= 4
         && assets
             .survey_controller
@@ -1545,11 +2103,20 @@ pub(crate) fn audit_site(devices: &[Device], system: &str, belt: &str) -> SiteAu
             .as_deref()
             .and_then(|code| find_device(devices, code))
             .is_some_and(|device| has_directive(device, "patrol"))
-        && adopted_count(devices, assets.mining_controller.as_deref(), MINING_DRONE) >= 4
-        && adopted_count(devices, assets.survey_controller.as_deref(), SURVEY_DRONE) >= 2;
+        && mining_adoption_correct
+        && survey_adoption_correct;
+    let normal_repair_needed = !shortages.is_empty() || !repairs.is_empty();
     SiteAudit {
         assets,
         operational,
+        mining_adoption_correct,
+        survey_adoption_correct,
+        normal_repair_needed,
+        maintenance_rotation_due,
+        mutation_safe,
+        repairs,
+        issues,
+        shortages,
     }
 }
 
@@ -1558,7 +2125,7 @@ fn site_shortages(audit: &SiteAudit) -> QuantityMap {
     // of the initial mining payload. Getting the controller/drone stack online
     // produces resources sooner; the Director can backfill or relocate a ward
     // after the site is operational when protection is available.
-    shortages(&mining_site_requirements(), &audit.assets.counts())
+    audit.shortages.clone()
 }
 
 fn device_is_in_system(device: &Device, system: &str) -> bool {
@@ -1569,11 +2136,16 @@ fn select_controller(
     devices: &[&Device],
     controller_type: &str,
     child_type: &str,
+    expected_site_tag: &str,
 ) -> Option<String> {
     devices
         .iter()
         .filter(|device| device_type(device) == Some(controller_type))
+        .filter(|device| site_asset_usable(device))
+        .filter(|device| !has_conflicting_site_commitment(device, expected_site_tag))
         .max_by(|left, right| {
+            let left_site_tagged = left.tags.iter().any(|tag| tag == expected_site_tag);
+            let right_site_tagged = right.tags.iter().any(|tag| tag == expected_site_tag);
             let left_count = devices
                 .iter()
                 .filter(|device| {
@@ -1588,50 +2160,260 @@ fn select_controller(
                         && controller_code(device) == Some(right.key.id.as_str())
                 })
                 .count();
-            left_count
-                .cmp(&right_count)
+            left_site_tagged
+                .cmp(&right_site_tagged)
+                .then_with(|| left_count.cmp(&right_count))
                 .then_with(|| right.key.id.as_str().cmp(left.key.id.as_str()))
         })
         .map(|device| device.key.id.as_str().to_owned())
 }
 
-fn children_of(devices: &[Device], controller: Option<&str>, child_type: &str) -> Vec<String> {
+fn select_site_children(
+    devices: &[Device],
+    at_belt: &[&Device],
+    controller: Option<&str>,
+    controller_type_name: &str,
+    child_type: &str,
+    required: usize,
+    expected_site_tag: &str,
+    repairs: &mut Vec<MiningSiteRepair>,
+    issues: &mut Vec<MiningSiteIssue>,
+    mutation_safe: &mut bool,
+) -> Vec<String> {
     let Some(controller) = controller else {
         return Vec::new();
     };
-    devices
+    let mut selected = at_belt
         .iter()
+        .filter(|device| device_type(device) == Some(child_type))
+        .filter(|device| site_asset_usable(device))
+        .filter(|device| controller_code(device) == Some(controller))
+        .map(|device| device.key.id.as_str().to_owned())
+        .collect::<Vec<_>>();
+    selected.sort();
+    selected.truncate(required);
+
+    let mut wrong_controller = at_belt
+        .iter()
+        .filter(|device| device_type(device) == Some(child_type))
+        .filter(|device| site_asset_usable(device))
         .filter(|device| {
-            device_type(device) == Some(child_type) && controller_code(device) == Some(controller)
+            controller_code(device).is_some_and(|actual| actual != controller)
+                && safely_reassignable_child(
+                    devices,
+                    device,
+                    controller_type_name,
+                    expected_site_tag,
+                )
         })
         .map(|device| device.key.id.as_str().to_owned())
-        .collect()
-}
-
-fn fill_free_devices(
-    devices: &[&Device],
-    device_type_name: &str,
-    minimum: usize,
-    selected: &mut Vec<String>,
-) {
-    for device in devices {
-        if selected.len() >= minimum {
+        .collect::<Vec<_>>();
+    wrong_controller.sort();
+    for code in wrong_controller {
+        if selected.len() >= required {
             break;
         }
-        let code = device.key.id.as_str();
-        if device_type(device) == Some(device_type_name)
-            && controller_code(device).is_none()
-            && !selected.iter().any(|selected| selected == code)
-        {
-            selected.push(code.to_owned());
+        if selected.contains(&code) {
+            continue;
         }
+        repairs.push(MiningSiteRepair::Adopt {
+            device: code.clone(),
+            controller: controller.to_owned(),
+        });
+        selected.push(code);
+    }
+
+    let mut free = at_belt
+        .iter()
+        .filter(|device| device_type(device) == Some(child_type))
+        .filter(|device| site_asset_usable(device))
+        .filter(|device| controller_code(device).is_none())
+        .filter(|device| !has_conflicting_site_commitment(device, expected_site_tag))
+        .map(|device| device.key.id.as_str().to_owned())
+        .collect::<Vec<_>>();
+    free.sort();
+    for code in free {
+        if selected.len() >= required {
+            break;
+        }
+        if selected.contains(&code) {
+            continue;
+        }
+        repairs.push(MiningSiteRepair::Adopt {
+            device: code.clone(),
+            controller: controller.to_owned(),
+        });
+        selected.push(code);
+    }
+
+    let mut uncertain_relationship = at_belt
+        .iter()
+        .filter(|device| device_type(device) == Some(child_type))
+        .filter(|device| site_asset_usable(device))
+        .filter(|device| {
+            controller_code(device).is_some_and(|actual| actual != controller)
+                && !has_conflicting_site_commitment(device, expected_site_tag)
+                && !safely_reassignable_child(
+                    devices,
+                    device,
+                    controller_type_name,
+                    expected_site_tag,
+                )
+                && relationship_reuse_is_uncertain(
+                    devices,
+                    device,
+                    controller_type_name,
+                    expected_site_tag,
+                )
+        })
+        .map(|device| device.key.id.as_str().to_owned())
+        .collect::<Vec<_>>();
+    uncertain_relationship.sort();
+    for code in uncertain_relationship {
+        if selected.len() >= required {
+            break;
+        }
+        if selected.contains(&code) {
+            continue;
+        }
+        *mutation_safe = false;
+        issues.push(MiningSiteIssue::EvidenceIncomplete {
+            device: code.clone(),
+            field: "controller_relationship",
+        });
+        selected.push(code);
     }
     selected.sort();
     selected.dedup();
+    selected
 }
 
-fn adopted_count(devices: &[Device], controller: Option<&str>, child_type: &str) -> usize {
-    children_of(devices, controller, child_type).len()
+fn safely_reassignable_child(
+    devices: &[Device],
+    device: &Device,
+    controller_type_name: &str,
+    expected_site_tag: &str,
+) -> bool {
+    if has_conflicting_site_commitment(device, expected_site_tag) {
+        return false;
+    }
+    let Some(actual_controller) = controller_code(device) else {
+        return false;
+    };
+    let Some(controller) = find_device(devices, actual_controller) else {
+        return false;
+    };
+    if device_type(controller) != Some(controller_type_name)
+        || device_location(controller) != device_location(device)
+        || !site_asset_usable(controller)
+        || has_conflicting_site_commitment(controller, expected_site_tag)
+    {
+        return false;
+    }
+    device.tags.iter().any(|tag| tag == expected_site_tag)
+        || controller.tags.iter().any(|tag| tag == expected_site_tag)
+}
+
+fn relationship_reuse_is_uncertain(
+    devices: &[Device],
+    device: &Device,
+    controller_type_name: &str,
+    expected_site_tag: &str,
+) -> bool {
+    let Some(actual_controller) = controller_code(device) else {
+        return false;
+    };
+    let Some(controller) = find_device(devices, actual_controller) else {
+        return true;
+    };
+    if has_conflicting_site_commitment(controller, expected_site_tag) {
+        return false;
+    }
+    device_type(controller) != Some(controller_type_name)
+        || device_location(controller) != device_location(device)
+        || !site_asset_usable(controller)
+        || (!device.tags.iter().any(|tag| tag == expected_site_tag)
+            && !controller.tags.iter().any(|tag| tag == expected_site_tag))
+}
+
+fn adoption_correct(devices: &[Device], controller: Option<&str>, selected: &[String]) -> bool {
+    let Some(controller) = controller else {
+        return false;
+    };
+    selected.iter().all(|code| {
+        find_device(devices, code).is_some_and(|device| controller_code(device) == Some(controller))
+    })
+}
+
+fn audit_controller_health(
+    devices: &[Device],
+    controller: Option<&str>,
+    expected_directive: &'static str,
+    repairs: &mut Vec<MiningSiteRepair>,
+    issues: &mut Vec<MiningSiteIssue>,
+    mutation_safe: &mut bool,
+) {
+    let Some(controller) = controller.and_then(|code| find_device(devices, code)) else {
+        return;
+    };
+    if !has_directive(controller, expected_directive) {
+        repairs.push(MiningSiteRepair::SetDirective {
+            device: controller.key.id.as_str().to_owned(),
+            directive: expected_directive,
+        });
+    }
+    match controller.status.as_ref().map(DeviceStatus::as_str) {
+        Some("coordinating") => {}
+        Some(_) => repairs.push(MiningSiteRepair::LaunchController {
+            device: controller.key.id.as_str().to_owned(),
+        }),
+        None => {
+            *mutation_safe = false;
+            issues.push(MiningSiteIssue::EvidenceIncomplete {
+                device: controller.key.id.as_str().to_owned(),
+                field: "status",
+            });
+        }
+    }
+}
+
+fn site_asset_usable(device: &Device) -> bool {
+    device.access == replicant_client::domain::AccessScope::Owned
+        && device.relationships.attached_to.is_none()
+        && device.relationships.stowed_in.is_none()
+        && device.travel.is_none()
+        && !device
+            .status
+            .as_ref()
+            .is_some_and(|status| matches!(status.as_str(), "offline" | "deactivated"))
+}
+
+fn has_conflicting_site_commitment(device: &Device, expected_site_tag: &str) -> bool {
+    let has_expected_site_tag = device.tags.iter().any(|tag| tag == expected_site_tag);
+    device.tags.iter().any(|tag| {
+        (!has_expected_site_tag && tag.starts_with("mine-s:") && tag != expected_site_tag)
+            || tag.starts_with("evt-")
+            || tag.starts_with("evt_")
+            || tag.starts_with("relay-")
+            || (!has_expected_site_tag
+                && (tag.starts_with("mine-m:") || tag.starts_with("mine-b:")))
+    })
+}
+
+fn maintenance_patrol_capability(device: &Device) -> EvidenceState {
+    if has_directive(device, "patrol")
+        || device
+            .available_directives
+            .iter()
+            .any(|directive| directive.as_str() == "patrol")
+    {
+        return EvidenceState::Present;
+    }
+    if device.available_directives.is_empty() {
+        EvidenceState::Unknown
+    } else {
+        EvidenceState::Absent
+    }
 }
 
 fn documented_transport_status(status: &str) -> bool {
@@ -1711,7 +2493,16 @@ pub(crate) fn transport_service_present(
     if collect == deliver {
         return TransportServiceAudit {
             state: EvidenceState::Present,
+            collect: collect.to_owned(),
+            deliver: deliver.to_owned(),
             controller: None,
+            controller_operational: EvidenceState::Present,
+            controller_directive: EvidenceState::Present,
+            controller_configuration: EvidenceState::Present,
+            adopted_freighters: Vec::new(),
+            usable_freighters: Vec::new(),
+            unknown_freighters: Vec::new(),
+            unusable_freighters: Vec::new(),
             freighter: None,
         };
     }
@@ -1720,79 +2511,155 @@ pub(crate) fn transport_service_present(
     } else {
         "ferry"
     };
-    let mut saw_unknown = false;
-    let mut saw_controller = None;
-    for controller in devices.iter().filter(|device| {
-        device.access == replicant_client::domain::AccessScope::Owned
-            && device_type(device) == Some(TRANSPORT_CONTROLLER)
-    }) {
-        let controller_status = transport_controller_status_state(controller);
-        if controller_status == EvidenceState::Unknown {
-            saw_unknown = true;
-            continue;
-        }
-        if controller_status != EvidenceState::Present {
-            continue;
-        }
-        let Some(active) = controller.active_directive.as_ref() else {
-            continue;
-        };
-        let Some(directive) = active.directive.as_ref().map(|value| value.as_str()) else {
-            saw_unknown = true;
-            continue;
-        };
-        if directive != expected {
-            continue;
-        }
-        match active.status.as_deref() {
-            Some("active") => {}
-            Some("paused" | "completed" | "cleared") => continue,
-            Some(_) | None => {
-                saw_unknown = true;
-                continue;
-            }
-        }
-        let Some(config) = active.details.get("config").and_then(Value::as_object) else {
-            saw_unknown = true;
-            continue;
-        };
-        if config.get("collect").and_then(Value::as_str) != Some(collect)
-            || config.get("deliver").and_then(Value::as_str) != Some(deliver)
-        {
-            continue;
-        }
-        saw_controller = Some(controller.key.id.as_str().to_owned());
-        let mut matching_freighter = false;
-        for freighter in devices.iter().filter(|device| {
+    let expected_site_tag = site_tag(system);
+    let expected_role_tag = replicant_mining_planner::role_tag("transport-controller");
+    let mut candidates = devices
+        .iter()
+        .filter(|device| {
             device.access == replicant_client::domain::AccessScope::Owned
-                && device_type(device) == Some(CARGO_FREIGHTER)
-                && controller_code(device) == Some(controller.key.id.as_str())
-        }) {
-            matching_freighter = true;
-            match transport_status_state(freighter) {
-                EvidenceState::Present => {
-                    return TransportServiceAudit {
-                        state: EvidenceState::Present,
-                        controller: saw_controller,
-                        freighter: Some(freighter.key.id.as_str().to_owned()),
-                    };
-                }
-                EvidenceState::Unknown => saw_unknown = true,
-                EvidenceState::Absent => {}
+                && device_type(device) == Some(TRANSPORT_CONTROLLER)
+        })
+        .filter_map(|controller| {
+            let active = controller.active_directive.as_ref();
+            let config_matches = active
+                .and_then(|active| active.details.get("config"))
+                .and_then(Value::as_object)
+                .is_some_and(|config| {
+                    config.get("collect").and_then(Value::as_str) == Some(collect)
+                        && config.get("deliver").and_then(Value::as_str) == Some(deliver)
+                });
+            let tagged = controller.tags.iter().any(|tag| tag == &expected_site_tag)
+                && controller.tags.iter().any(|tag| tag == &expected_role_tag);
+            (config_matches || tagged).then_some((
+                if config_matches { 2_u8 } else { 0 } + if tagged { 1 } else { 0 },
+                controller,
+            ))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| left.1.key.id.cmp(&right.1.key.id))
+    });
+
+    let Some((best_score, controller)) = candidates.first().copied() else {
+        return TransportServiceAudit {
+            state: EvidenceState::Absent,
+            collect: collect.to_owned(),
+            deliver: deliver.to_owned(),
+            controller: None,
+            controller_operational: EvidenceState::Absent,
+            controller_directive: EvidenceState::Absent,
+            controller_configuration: EvidenceState::Absent,
+            adopted_freighters: Vec::new(),
+            usable_freighters: Vec::new(),
+            unknown_freighters: Vec::new(),
+            unusable_freighters: Vec::new(),
+            freighter: None,
+        };
+    };
+    if candidates
+        .get(1)
+        .is_some_and(|candidate| candidate.0 == best_score)
+    {
+        return TransportServiceAudit {
+            state: EvidenceState::Unknown,
+            collect: collect.to_owned(),
+            deliver: deliver.to_owned(),
+            controller: None,
+            controller_operational: EvidenceState::Unknown,
+            controller_directive: EvidenceState::Unknown,
+            controller_configuration: EvidenceState::Unknown,
+            adopted_freighters: Vec::new(),
+            usable_freighters: Vec::new(),
+            unknown_freighters: Vec::new(),
+            unusable_freighters: Vec::new(),
+            freighter: None,
+        };
+    }
+
+    let selected_controller_code = controller.key.id.as_str().to_owned();
+    let controller_operational = transport_controller_status_state(controller);
+    let (controller_directive, controller_configuration) =
+        match controller.active_directive.as_ref() {
+            None => (EvidenceState::Absent, EvidenceState::Absent),
+            Some(active) => {
+                let directive = active.directive.as_ref().map(|value| value.as_str());
+                let active_status = active.status.as_deref();
+                let config = active.details.get("config").and_then(Value::as_object);
+                let directive_state = if directive.is_none() || active_status.is_none() {
+                    EvidenceState::Unknown
+                } else if directive == Some(expected) && active_status == Some("active") {
+                    EvidenceState::Present
+                } else {
+                    EvidenceState::Absent
+                };
+                let configuration_state = if config.is_none() {
+                    EvidenceState::Unknown
+                } else if config.is_some_and(|config| {
+                    config.get("collect").and_then(Value::as_str) == Some(collect)
+                        && config.get("deliver").and_then(Value::as_str) == Some(deliver)
+                }) {
+                    EvidenceState::Present
+                } else {
+                    EvidenceState::Absent
+                };
+                (directive_state, configuration_state)
             }
-        }
-        if !matching_freighter {
-            continue;
+        };
+
+    let mut adopted_freighters = Vec::new();
+    let mut usable_freighters = Vec::new();
+    let mut unknown_freighters = Vec::new();
+    let mut unusable_freighters = Vec::new();
+    for freighter in devices.iter().filter(|device| {
+        device.access == replicant_client::domain::AccessScope::Owned
+            && device_type(device) == Some(CARGO_FREIGHTER)
+            && controller_code(device) == Some(selected_controller_code.as_str())
+    }) {
+        let code = freighter.key.id.as_str().to_owned();
+        adopted_freighters.push(code.clone());
+        match transport_status_state(freighter) {
+            EvidenceState::Present => usable_freighters.push(code),
+            EvidenceState::Unknown => unknown_freighters.push(code),
+            EvidenceState::Absent => unusable_freighters.push(code),
         }
     }
+    adopted_freighters.sort();
+    usable_freighters.sort();
+    unknown_freighters.sort();
+    unusable_freighters.sort();
+
+    let state = if controller_operational == EvidenceState::Unknown
+        || controller_directive == EvidenceState::Unknown
+        || controller_configuration == EvidenceState::Unknown
+        || !unknown_freighters.is_empty()
+    {
+        EvidenceState::Unknown
+    } else if controller_operational == EvidenceState::Present
+        && controller_directive == EvidenceState::Present
+        && controller_configuration == EvidenceState::Present
+        && !usable_freighters.is_empty()
+    {
+        EvidenceState::Present
+    } else {
+        EvidenceState::Absent
+    };
+    let freighter = usable_freighters.first().cloned();
     TransportServiceAudit {
-        state: if saw_unknown {
-            EvidenceState::Unknown
-        } else {
-            EvidenceState::Absent
-        },
-        controller: saw_controller,
-        freighter: None,
+        state,
+        collect: collect.to_owned(),
+        deliver: deliver.to_owned(),
+        controller: Some(selected_controller_code),
+        controller_operational,
+        controller_directive,
+        controller_configuration,
+        adopted_freighters,
+        usable_freighters,
+        unknown_freighters,
+        unusable_freighters,
+        freighter,
     }
 }
 
@@ -2165,13 +3032,23 @@ mod tests {
 
     #[test]
     fn mining_transport_routes_do_not_require_stow_capacity() {
-        let requirements = mining_route_item_requirements("delta");
+        let route = RouteMission {
+            system: "SOL".into(),
+            belt: "SOL-BELT-1".into(),
+            tag: site_tag("SOL"),
+            phase: RoutePhase::Planned,
+            controller: None,
+            freighter: None,
+            additional_freighters: Vec::new(),
+            desired_freighters: 1,
+        };
+        let requirements = mining_route_item_requirements("delta", &route);
         let keys = requirements
             .iter()
             .map(|requirement| requirement.key.as_str())
             .collect::<Vec<_>>();
 
-        assert_eq!(keys, ["worker", "transport_controller", "freighter"]);
+        assert_eq!(keys, ["worker", "transport_controller", "freighters"]);
         assert!(
             requirements
                 .iter()
@@ -2271,6 +3148,82 @@ mod tests {
         });
     }
 
+    fn adopt(device: &mut Device, controller: &str) {
+        device.relationships.controller = Some(DeviceKey::live(DeviceId::from(controller)));
+    }
+
+    fn healthy_transport_controller(
+        code: &str,
+        system: &str,
+        belt: &str,
+        hub: &str,
+        freighters: &[&str],
+    ) -> Device {
+        let mut controller = device(code, TRANSPORT_CONTROLLER, belt);
+        controller.tags = vec![site_tag(system), role_tag("transport-controller")];
+        controller.status = Some(DeviceStatus::from("coordinating"));
+        controller.active_directive = Some(ActiveDeviceDirective {
+            directive: Some(DeviceDirective::from(
+                if location_is_in_system(hub, system) {
+                    "shuttle"
+                } else {
+                    "ferry"
+                },
+            )),
+            status: Some("active".into()),
+            details: [(
+                "config".into(),
+                serde_json::json!({"collect": belt, "deliver": hub}),
+            )]
+            .into_iter()
+            .collect(),
+        });
+        controller.relationships.controlled_devices = freighters
+            .iter()
+            .map(|code| DeviceKey::live(DeviceId::from(*code)))
+            .collect();
+        controller
+    }
+
+    fn transport_freighter(code: &str, controller: &str, location: &str, status: &str) -> Device {
+        let mut freighter = device(code, CARGO_FREIGHTER, location);
+        freighter.status = Some(DeviceStatus::from(status));
+        adopt(&mut freighter, controller);
+        freighter
+    }
+
+    fn healthy_site_devices(system: &str, belt: &str) -> Vec<Device> {
+        let stable_site_tag = site_tag(system);
+        let mut mining_controller = device("MC", MINING_CONTROLLER, belt);
+        mining_controller.tags = vec![stable_site_tag.clone(), role_tag("mining-controller")];
+        mining_controller.status = Some(DeviceStatus::from("coordinating"));
+        directive(&mut mining_controller, "deplete_smallest");
+
+        let mut survey_controller = device("SC", SURVEY_CONTROLLER, belt);
+        survey_controller.tags = vec![stable_site_tag.clone(), role_tag("survey-controller")];
+        survey_controller.status = Some(DeviceStatus::from("coordinating"));
+        directive(&mut survey_controller, "belt_search");
+
+        let mut maintenance = device("MD", MAINTENANCE_DRONE, belt);
+        maintenance.tags = vec![stable_site_tag.clone(), role_tag("maintenance")];
+        directive(&mut maintenance, "patrol");
+
+        let mut devices = vec![mining_controller, survey_controller, maintenance];
+        for index in 0..4 {
+            let mut drone = device(&format!("M{index}"), MINING_DRONE, belt);
+            drone.tags = vec![stable_site_tag.clone(), role_tag("mining-drone")];
+            adopt(&mut drone, "MC");
+            devices.push(drone);
+        }
+        for index in 0..2 {
+            let mut drone = device(&format!("S{index}"), SURVEY_DRONE, belt);
+            drone.tags = vec![stable_site_tag.clone(), role_tag("survey-drone")];
+            adopt(&mut drone, "SC");
+            devices.push(drone);
+        }
+        devices
+    }
+
     fn star(name: &str, x: f64, y: f64, z: f64) -> Star {
         Star {
             key: StarKey::live(replicant_client::StarId::from(name)),
@@ -2316,29 +3269,386 @@ mod tests {
     #[test]
     fn complete_site_is_recognized_from_child_relationships() {
         let belt = "SOL-BELT-1";
-        let mut devices = vec![
-            device("MC", MINING_CONTROLLER, belt),
-            device("SC", SURVEY_CONTROLLER, belt),
-            device("MD", MAINTENANCE_DRONE, belt),
-        ];
-        directive(&mut devices[0], "deplete_smallest");
-        directive(&mut devices[1], "belt_search");
-        directive(&mut devices[2], "patrol");
-        devices[0].status = Some(DeviceStatus::from("coordinating"));
-        devices[1].status = Some(DeviceStatus::from("coordinating"));
-        for index in 0..4 {
-            let mut drone = device(&format!("M{index}"), MINING_DRONE, belt);
-            drone.relationships.controller = Some(DeviceKey::live(DeviceId::from("MC")));
-            devices.push(drone);
-        }
-        for index in 0..2 {
-            let mut drone = device(&format!("S{index}"), SURVEY_DRONE, belt);
-            drone.relationships.controller = Some(DeviceKey::live(DeviceId::from("SC")));
-            devices.push(drone);
-        }
+        let devices = healthy_site_devices("SOL", belt);
         let audit = audit_site(&devices, "SOL", belt);
         assert!(audit.operational);
+        assert!(audit.mining_adoption_correct);
+        assert!(audit.survey_adoption_correct);
+        assert!(!audit.normal_repair_needed);
+        assert!(!audit.maintenance_rotation_due);
+        assert!(audit.mutation_safe);
+        assert!(audit.repairs.is_empty());
         assert!(site_shortages(&audit).is_empty());
+    }
+
+    #[test]
+    fn wrong_local_mining_adoption_is_repaired_before_printing() {
+        let belt = "SOL-BELT-1";
+        let stable_site_tag = site_tag("SOL");
+        let mut devices = healthy_site_devices("SOL", belt);
+        let moved = devices
+            .iter_mut()
+            .find(|device| device.key.id.as_str() == "M3")
+            .expect("fourth mining drone");
+        adopt(moved, "ZZ-MC");
+        let mut wrong_controller = device("ZZ-MC", MINING_CONTROLLER, belt);
+        wrong_controller.tags = vec![stable_site_tag, role_tag("mining-controller")];
+        devices.push(wrong_controller);
+
+        let audit = audit_site(&devices, "SOL", belt);
+
+        assert_eq!(audit.assets.mining_controller.as_deref(), Some("MC"));
+        assert_eq!(audit.assets.mining_drones.len(), 4);
+        assert!(!audit.mining_adoption_correct);
+        assert!(audit.normal_repair_needed);
+        assert!(!site_shortages(&audit).contains_key(MINING_DRONE));
+        assert!(audit.repairs.contains(&MiningSiteRepair::Adopt {
+            device: "M3".into(),
+            controller: "MC".into(),
+        }));
+    }
+
+    #[test]
+    fn wrong_local_survey_adoption_is_repaired_before_printing() {
+        let belt = "SOL-BELT-1";
+        let stable_site_tag = site_tag("SOL");
+        let mut devices = healthy_site_devices("SOL", belt);
+        let moved = devices
+            .iter_mut()
+            .find(|device| device.key.id.as_str() == "S1")
+            .expect("second survey drone");
+        adopt(moved, "ZZ-SC");
+        let mut wrong_controller = device("ZZ-SC", SURVEY_CONTROLLER, belt);
+        wrong_controller.tags = vec![stable_site_tag, role_tag("survey-controller")];
+        devices.push(wrong_controller);
+
+        let audit = audit_site(&devices, "SOL", belt);
+
+        assert_eq!(audit.assets.survey_controller.as_deref(), Some("SC"));
+        assert_eq!(audit.assets.survey_drones.len(), 2);
+        assert!(!audit.survey_adoption_correct);
+        assert!(audit.normal_repair_needed);
+        assert!(!site_shortages(&audit).contains_key(SURVEY_DRONE));
+        assert!(audit.repairs.contains(&MiningSiteRepair::Adopt {
+            device: "S1".into(),
+            controller: "SC".into(),
+        }));
+    }
+
+    #[test]
+    fn ambiguous_wrong_controller_relationship_waits_instead_of_printing() {
+        let belt = "SOL-BELT-1";
+        let mut devices = healthy_site_devices("SOL", belt);
+        let moved = devices
+            .iter_mut()
+            .find(|device| device.key.id.as_str() == "M3")
+            .expect("fourth mining drone");
+        adopt(moved, "MISSING-MC");
+
+        let audit = audit_site(&devices, "SOL", belt);
+
+        assert_eq!(audit.assets.mining_drones.len(), 4);
+        assert!(!audit.mutation_safe);
+        assert!(!site_shortages(&audit).contains_key(MINING_DRONE));
+        assert!(audit.issues.iter().any(|issue| matches!(
+            issue,
+            MiningSiteIssue::EvidenceIncomplete { device, field }
+                if device == "M3" && *field == "controller_relationship"
+        )));
+    }
+
+    #[test]
+    fn drone_committed_to_another_site_is_never_stolen() {
+        let belt = "SOL-BELT-1";
+        let mut devices = healthy_site_devices("SOL", belt);
+        let moved = devices
+            .iter_mut()
+            .find(|device| device.key.id.as_str() == "M3")
+            .expect("fourth mining drone");
+        moved.tags = vec![site_tag("BETA"), role_tag("mining-drone")];
+        adopt(moved, "OTHER-MC");
+        let mut other_controller = device("OTHER-MC", MINING_CONTROLLER, belt);
+        other_controller.tags = vec![site_tag("BETA"), role_tag("mining-controller")];
+        devices.push(other_controller);
+
+        let audit = audit_site(&devices, "SOL", belt);
+
+        assert_eq!(audit.assets.mining_drones.len(), 3);
+        assert_eq!(site_shortages(&audit).get(MINING_DRONE), Some(&1));
+        assert!(!audit.repairs.iter().any(|repair| matches!(
+            repair,
+            MiningSiteRepair::Adopt { device, .. } if device == "M3"
+        )));
+        assert!(audit.issues.iter().any(|issue| matches!(
+            issue,
+            MiningSiteIssue::CommittedElsewhere { device, .. } if device == "M3"
+        )));
+    }
+
+    #[test]
+    fn drone_reserved_by_another_workflow_is_never_stolen() {
+        let belt = "SOL-BELT-1";
+        let mut devices = healthy_site_devices("SOL", belt);
+        let moved = devices
+            .iter_mut()
+            .find(|device| device.key.id.as_str() == "M3")
+            .expect("fourth mining drone");
+        moved.tags = vec!["mine-m:other".into(), role_tag("mining-drone")];
+        adopt(moved, "OTHER-MC");
+        let mut other_controller = device("OTHER-MC", MINING_CONTROLLER, belt);
+        other_controller.tags = vec!["mine-m:other".into(), role_tag("mining-controller")];
+        devices.push(other_controller);
+
+        let audit = audit_site(&devices, "SOL", belt);
+
+        assert_eq!(audit.assets.mining_drones.len(), 3);
+        assert_eq!(site_shortages(&audit).get(MINING_DRONE), Some(&1));
+        assert!(!audit.repairs.iter().any(|repair| matches!(
+            repair,
+            MiningSiteRepair::Adopt { device, .. } if device == "M3"
+        )));
+        assert!(audit.issues.iter().any(|issue| matches!(
+            issue,
+            MiningSiteIssue::CommittedElsewhere { device, .. } if device == "M3"
+        )));
+    }
+
+    #[test]
+    fn wrong_controller_directive_is_repairable_not_missing_hardware() {
+        let belt = "SOL-BELT-1";
+        let mut devices = healthy_site_devices("SOL", belt);
+        directive(&mut devices[0], "largest_first");
+
+        let audit = audit_site(&devices, "SOL", belt);
+
+        assert!(!audit.operational);
+        assert!(audit.normal_repair_needed);
+        assert!(site_shortages(&audit).is_empty());
+        assert!(audit.repairs.contains(&MiningSiteRepair::SetDirective {
+            device: "MC".into(),
+            directive: "deplete_smallest",
+        }));
+    }
+
+    #[test]
+    fn low_capacity_patrolling_maintenance_is_rotation_due_not_missing() {
+        let belt = "SOL-BELT-1";
+        let mut devices = healthy_site_devices("SOL", belt);
+        devices[2].operational_capacity = replicant_client::domain::OperationalCapacity::new(10.0);
+
+        let audit = audit_site(&devices, "SOL", belt);
+
+        assert!(audit.operational);
+        assert!(audit.maintenance_rotation_due);
+        assert!(!audit.normal_repair_needed);
+        assert_eq!(audit.assets.maintenance_drone.as_deref(), Some("MD"));
+        assert!(!site_shortages(&audit).contains_key(MAINTENANCE_DRONE));
+    }
+
+    #[test]
+    fn maintenance_rotation_threshold_is_strictly_below_thirty_percent() {
+        let belt = "SOL-BELT-1";
+        let mut devices = healthy_site_devices("SOL", belt);
+        devices[2].operational_capacity = replicant_client::domain::OperationalCapacity::new(29.9);
+
+        assert!(audit_site(&devices, "SOL", belt).maintenance_rotation_due);
+
+        devices[2].operational_capacity = replicant_client::domain::OperationalCapacity::new(30.0);
+        assert!(!audit_site(&devices, "SOL", belt).maintenance_rotation_due);
+    }
+
+    #[test]
+    fn maintenance_replacement_ready_threshold_is_ninety_five_percent() {
+        let mut drone = device("MD", MAINTENANCE_DRONE, "HUB-BELT-1");
+        drone.operational_capacity = replicant_client::domain::OperationalCapacity::new(95.0);
+        assert!(maintenance_replacement_ready(&drone));
+
+        drone.operational_capacity = replicant_client::domain::OperationalCapacity::new(94.9);
+        assert!(!maintenance_replacement_ready(&drone));
+    }
+
+    #[test]
+    fn three_healthy_hub_patrol_drones_can_spare_one_but_two_cannot() {
+        let hub = "HUB-BELT-1";
+        let pool_role = role_tag(HUB_MAINTENANCE_ROLE);
+        let mut devices = (0..3)
+            .map(|index| {
+                let mut drone = device(&format!("H{index}"), MAINTENANCE_DRONE, hub);
+                drone.tags = vec![pool_role.clone()];
+                drone.operational_capacity =
+                    replicant_client::domain::OperationalCapacity::new(100.0);
+                directive(&mut drone, "patrol");
+                drone
+            })
+            .collect::<Vec<_>>();
+
+        let audit = maintenance_hub_pool_audit(&devices, hub);
+        assert_eq!(audit.healthy_count(), 3);
+        assert!(audit.dispatch_preserves_minimum());
+
+        devices.pop();
+        let audit = maintenance_hub_pool_audit(&devices, hub);
+        assert_eq!(audit.healthy_count(), 2);
+        assert!(!audit.dispatch_preserves_minimum());
+        assert_eq!(
+            audit.desired_healthy_count(audit.healthy_count(), false),
+            HUB_MAINTENANCE_TARGET_HEALTHY
+        );
+    }
+
+    #[test]
+    fn worn_hub_patrol_drone_repairs_before_becoming_replacement_ready() {
+        let hub = "HUB-BELT-1";
+        let mut drone = device("WORN", MAINTENANCE_DRONE, hub);
+        drone.tags = vec![role_tag(HUB_MAINTENANCE_ROLE)];
+        directive(&mut drone, "patrol");
+        drone.operational_capacity = replicant_client::domain::OperationalCapacity::new(94.9);
+
+        let audit = maintenance_hub_pool_audit(std::slice::from_ref(&drone), hub);
+        assert!(audit.healthy_patrol.is_empty());
+        assert_eq!(audit.repairing_patrol, ["WORN"]);
+        assert!(!maintenance_replacement_ready(&drone));
+
+        drone.operational_capacity = replicant_client::domain::OperationalCapacity::new(95.0);
+        let audit = maintenance_hub_pool_audit(std::slice::from_ref(&drone), hub);
+        assert_eq!(audit.healthy_patrol, ["WORN"]);
+        assert!(audit.repairing_patrol.is_empty());
+        assert!(maintenance_replacement_ready(&drone));
+    }
+
+    #[test]
+    fn repairing_hub_patrol_does_not_trigger_target_replenishment_above_hard_minimum() {
+        let hub = "HUB-BELT-1";
+        let pool_role = role_tag(HUB_MAINTENANCE_ROLE);
+        let mut devices = Vec::new();
+        for (code, capacity) in [("H0", 100.0), ("H1", 100.0), ("REPAIR", 60.0)] {
+            let mut drone = device(code, MAINTENANCE_DRONE, hub);
+            drone.tags = vec![pool_role.clone()];
+            drone.operational_capacity =
+                replicant_client::domain::OperationalCapacity::new(capacity);
+            directive(&mut drone, "patrol");
+            devices.push(drone);
+        }
+
+        let audit = maintenance_hub_pool_audit(&devices, hub);
+        assert_eq!(audit.healthy_count(), 2);
+        assert_eq!(audit.repairing_patrol, ["REPAIR"]);
+        assert_eq!(audit.desired_healthy_count(audit.healthy_count(), false), 2);
+    }
+
+    #[test]
+    fn hub_pool_ignores_foreign_workflow_reserved_maintenance_drones() {
+        let hub = "HUB-BELT-1";
+        let mut drone = device("FOREIGN", MAINTENANCE_DRONE, hub);
+        drone.tags = vec!["evt-m:other".into()];
+        drone.operational_capacity = replicant_client::domain::OperationalCapacity::new(100.0);
+        directive(&mut drone, "patrol");
+
+        let audit = maintenance_hub_pool_audit(&[drone], hub);
+        assert_eq!(audit.healthy_count(), 0);
+    }
+
+    #[test]
+    fn absent_or_unusable_maintenance_remains_a_normal_repair() {
+        let belt = "SOL-BELT-1";
+        let absent = healthy_site_devices("SOL", belt)
+            .into_iter()
+            .filter(|device| device.key.id.as_str() != "MD")
+            .collect::<Vec<_>>();
+        let absent_audit = audit_site(&absent, "SOL", belt);
+        assert_eq!(
+            site_shortages(&absent_audit).get(MAINTENANCE_DRONE),
+            Some(&1)
+        );
+        assert!(absent_audit.normal_repair_needed);
+        assert!(!absent_audit.maintenance_rotation_due);
+
+        let mut unusable = healthy_site_devices("SOL", belt);
+        unusable[2].status = Some(DeviceStatus::from("deactivated"));
+        let unusable_audit = audit_site(&unusable, "SOL", belt);
+        assert_eq!(
+            site_shortages(&unusable_audit).get(MAINTENANCE_DRONE),
+            Some(&1)
+        );
+        assert!(unusable_audit.issues.iter().any(|issue| matches!(
+            issue,
+            MiningSiteIssue::UnusableDevice { device, .. } if device == "MD"
+        )));
+    }
+
+    #[test]
+    fn incomplete_controller_state_blocks_mutation_without_printing_replacement() {
+        let belt = "SOL-BELT-1";
+        let mut devices = healthy_site_devices("SOL", belt);
+        devices[0].status = None;
+
+        let audit = audit_site(&devices, "SOL", belt);
+
+        assert!(!audit.operational);
+        assert!(!audit.mutation_safe);
+        assert!(site_shortages(&audit).is_empty());
+        assert!(audit.issues.iter().any(|issue| matches!(
+            issue,
+            MiningSiteIssue::EvidenceIncomplete { device, field }
+                if device == "MC" && *field == "status"
+        )));
+    }
+
+    #[test]
+    fn legacy_mining_checkpoint_deserializes_without_losing_site_assets() {
+        let legacy = serde_json::json!({
+            "version": 1,
+            "mission_id": "legacy-mining",
+            "mission_tag": "mine-m:legacy",
+            "phase": "deploying_sites",
+            "selected_replicant": "WORKER",
+            "hub_location": "SOL-L4",
+            "sites": [{
+                "system": "SOL",
+                "belt": "SOL-BELT-1",
+                "density": "dense",
+                "tag": "mine-s:sol",
+                "phase": "configuring",
+                "assets": {
+                    "mining_controller": "MC",
+                    "mining_drones": ["M0", "M1", "M2", "M3"],
+                    "survey_controller": "SC",
+                    "survey_drones": ["S0", "S1"],
+                    "maintenance_drone": "MD"
+                },
+                "missing": {},
+                "carrier": null
+            }],
+            "routes": [],
+            "print_batches": [],
+            "site_print_requirements": {},
+            "route_print_requirements": {},
+            "total_material_cost": {},
+            "warnings": []
+        });
+
+        let mission: MiningMission = serde_json::from_value(legacy).expect("legacy mission");
+        let site = &mission.sites[0];
+        assert_eq!(site.phase, SitePhase::Configuring);
+        assert_eq!(site.assets.mining_controller.as_deref(), Some("MC"));
+        assert_eq!(
+            site.assets.mining_drones,
+            ["M0", "M1", "M2", "M3"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(site.assets.survey_controller.as_deref(), Some("SC"));
+        assert_eq!(
+            site.assets.survey_drones,
+            ["S0", "S1"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(site.assets.maintenance_drone.as_deref(), Some("MD"));
+        assert!(site.assets.system_ward.is_none());
+        assert!(mission.legacy_mission_tags.is_empty());
     }
 
     #[test]
@@ -2431,6 +3741,220 @@ mod tests {
         assert_eq!(audit.state, EvidenceState::Present);
         assert_eq!(audit.controller.as_deref(), Some("TC"));
         assert_eq!(audit.freighter.as_deref(), Some("CF"));
+    }
+
+    #[test]
+    fn legacy_transport_route_intent_defaults_to_one_freighter() {
+        let route: AmiTransportRouteIntent = serde_json::from_value(serde_json::json!({
+            "system": "ALPHA",
+            "collect": "ALPHA-BELT-1",
+            "deliver": "ALPHA-HUB"
+        }))
+        .expect("legacy route intent");
+        assert_eq!(route.desired_freighters, MIN_TRANSPORT_FREIGHTERS);
+    }
+
+    #[test]
+    fn legacy_one_freighter_route_checkpoint_defaults_to_one_capacity() {
+        let legacy = serde_json::json!({
+            "system": "ALPHA",
+            "belt": "ALPHA-BELT-1",
+            "tag": "mine-s:alpha",
+            "phase": "active",
+            "controller": "TC",
+            "freighter": "CF-1"
+        });
+        let route: RouteMission = serde_json::from_value(legacy).expect("legacy route");
+        assert_eq!(route.freighter.as_deref(), Some("CF-1"));
+        assert!(route.additional_freighters.is_empty());
+        assert_eq!(route.desired_freighters, 1);
+        assert_eq!(route.freighters(), vec!["CF-1".to_owned()]);
+    }
+
+    #[test]
+    fn transport_audit_counts_all_adopted_healthy_freighters() {
+        let system = "ILPHARD";
+        let belt = "ILPHARD-BELT-1";
+        let hub = "SCEPTURUM-BELT-1";
+        let controller =
+            healthy_transport_controller("TC", system, belt, hub, &["CF-1", "CF-2", "CF-3"]);
+        let devices = vec![
+            controller,
+            transport_freighter("CF-1", "TC", belt, "idle"),
+            transport_freighter("CF-2", "TC", belt, "travelling"),
+            transport_freighter("CF-3", "TC", hub, "depositing"),
+        ];
+        let audit = transport_service_present(&devices, system, belt, hub);
+        assert_eq!(audit.state, EvidenceState::Present);
+        assert_eq!(audit.collect, belt);
+        assert_eq!(audit.deliver, hub);
+        assert_eq!(audit.controller_operational, EvidenceState::Present);
+        assert_eq!(audit.controller_directive, EvidenceState::Present);
+        assert_eq!(audit.controller_configuration, EvidenceState::Present);
+        assert_eq!(audit.adopted_freighters, ["CF-1", "CF-2", "CF-3"]);
+        assert_eq!(audit.usable_freighter_count(), 3);
+        assert!(audit.unknown_freighters.is_empty());
+        assert!(audit.unusable_freighters.is_empty());
+    }
+
+    #[test]
+    fn wrong_transport_controller_directive_is_structurally_broken_not_healthy() {
+        let system = "ILPHARD";
+        let belt = "ILPHARD-BELT-1";
+        let hub = "SCEPTURUM-BELT-1";
+        let mut controller = healthy_transport_controller("TC", system, belt, hub, &["CF-1"]);
+        controller
+            .active_directive
+            .as_mut()
+            .expect("directive")
+            .directive = Some(DeviceDirective::from("shuttle"));
+        let freighter = transport_freighter("CF-1", "TC", belt, "idle");
+        let audit = transport_service_present(&[controller, freighter], system, belt, hub);
+        assert_eq!(audit.controller_operational, EvidenceState::Present);
+        assert_eq!(audit.controller_directive, EvidenceState::Absent);
+        assert_eq!(audit.controller_configuration, EvidenceState::Present);
+        assert_eq!(audit.state, EvidenceState::Absent);
+        assert_eq!(audit.usable_freighter_count(), 1);
+    }
+
+    #[test]
+    fn wrong_controller_and_unusable_freighters_do_not_count_as_capacity() {
+        let system = "ILPHARD";
+        let belt = "ILPHARD-BELT-1";
+        let hub = "SCEPTURUM-BELT-1";
+        let controller =
+            healthy_transport_controller("TC", system, belt, hub, &["GOOD", "UNUSABLE"]);
+        let devices = vec![
+            controller,
+            transport_freighter("GOOD", "TC", belt, "idle"),
+            transport_freighter("UNUSABLE", "TC", belt, "mining"),
+            transport_freighter("WRONG", "OTHER", belt, "idle"),
+        ];
+        let audit = transport_service_present(&devices, system, belt, hub);
+        assert_eq!(audit.state, EvidenceState::Present);
+        assert_eq!(audit.usable_freighters, ["GOOD"]);
+        assert_eq!(audit.unusable_freighters, ["UNUSABLE"]);
+        assert!(!audit.adopted_freighters.contains(&"WRONG".to_owned()));
+        assert_eq!(audit.usable_freighter_count(), 1);
+    }
+
+    #[test]
+    fn transport_backlog_thresholds_use_exact_freighter_load_bands() {
+        assert_eq!(transport_backlog_class(999), TransportBacklogClass::Low);
+        assert_eq!(
+            transport_backlog_class(1_000),
+            TransportBacklogClass::HealthyBand
+        );
+        assert_eq!(
+            transport_backlog_class(5_000),
+            TransportBacklogClass::HealthyBand
+        );
+        assert_eq!(
+            transport_backlog_class(5_001),
+            TransportBacklogClass::ScaleUp
+        );
+        assert_eq!(
+            transport_backlog_class(15_000),
+            TransportBacklogClass::ScaleUp
+        );
+        assert_eq!(
+            transport_backlog_class(15_001),
+            TransportBacklogClass::Critical
+        );
+        assert_eq!(transport_scale_up_delta(5_001), 1);
+        assert_eq!(transport_scale_up_delta(15_001), 2);
+    }
+
+    #[test]
+    fn critical_backlog_requests_two_freighters_bounded_by_route_maximum() {
+        let evaluation =
+            evaluate_transport_capacity(54_979, 1, 1_000, &TransportCapacityTrend::default());
+        assert_eq!(transport_backlog_loads(54_979), 54_979_f64 / 500_f64);
+        assert_eq!(
+            transport_backlog_class(54_979),
+            TransportBacklogClass::Critical
+        );
+        assert_eq!(evaluation.action, TransportCapacityAction::Add(2));
+
+        let bounded =
+            evaluate_transport_capacity(54_979, 5, 1_000, &TransportCapacityTrend::default());
+        assert_eq!(bounded.action, TransportCapacityAction::Add(1));
+    }
+
+    #[test]
+    fn transport_capacity_cooldown_and_falling_backlog_suppress_repeated_additions() {
+        let previous = TransportCapacityTrend {
+            last_observed_backlog_units: Some(20_000),
+            last_observation_at_ms: Some(0),
+            last_capacity_change_at_ms: Some(0),
+            low_backlog_since_ms: None,
+        };
+        let during_cooldown =
+            evaluate_transport_capacity(22_000, 2, TRANSPORT_CAPACITY_COOLDOWN_MS - 1, &previous);
+        assert_eq!(during_cooldown.action, TransportCapacityAction::Hold);
+
+        let falling =
+            evaluate_transport_capacity(18_000, 2, TRANSPORT_CAPACITY_COOLDOWN_MS + 1, &previous);
+        assert_eq!(falling.action, TransportCapacityAction::Hold);
+
+        let flat_after_cooldown =
+            evaluate_transport_capacity(20_000, 2, TRANSPORT_CAPACITY_COOLDOWN_MS + 1, &previous);
+        assert_eq!(flat_after_cooldown.action, TransportCapacityAction::Add(2));
+        assert!(flat_after_cooldown.refresh_before_decision);
+        assert_eq!(
+            flat_after_cooldown.throughput,
+            TransportThroughputState::Insufficient
+        );
+    }
+    #[test]
+    fn flat_critical_backlog_at_route_maximum_is_an_actionable_stuck_state() {
+        let previous = TransportCapacityTrend {
+            last_observed_backlog_units: Some(54_979),
+            last_observation_at_ms: Some(0),
+            last_capacity_change_at_ms: None,
+            low_backlog_since_ms: None,
+        };
+
+        let evaluation = evaluate_transport_capacity(
+            54_979,
+            MAX_TRANSPORT_FREIGHTERS,
+            TRANSPORT_CAPACITY_COOLDOWN_MS + 1,
+            &previous,
+        );
+
+        assert_eq!(evaluation.action, TransportCapacityAction::Hold);
+        assert!(evaluation.refresh_before_decision);
+        assert_eq!(
+            evaluation.throughput,
+            TransportThroughputState::InsufficientAtMaximum
+        );
+    }
+
+    #[test]
+    fn scale_down_requires_continuous_low_backlog_hold_and_never_drops_below_one() {
+        let first = evaluate_transport_capacity(500, 2, 0, &TransportCapacityTrend::default());
+        assert_eq!(first.action, TransportCapacityAction::Hold);
+        assert_eq!(first.trend.low_backlog_since_ms, Some(0));
+
+        let before_hold =
+            evaluate_transport_capacity(500, 2, TRANSPORT_SCALE_DOWN_HOLD_MS - 1, &first.trend);
+        assert_eq!(before_hold.action, TransportCapacityAction::Hold);
+
+        let due =
+            evaluate_transport_capacity(500, 2, TRANSPORT_SCALE_DOWN_HOLD_MS, &before_hold.trend);
+        assert_eq!(due.action, TransportCapacityAction::RemoveOne);
+
+        let minimum =
+            evaluate_transport_capacity(500, 1, TRANSPORT_SCALE_DOWN_HOLD_MS, &before_hold.trend);
+        assert_eq!(minimum.action, TransportCapacityAction::Hold);
+
+        let mut changed = due.trend;
+        record_transport_capacity_change(&mut changed, TRANSPORT_SCALE_DOWN_HOLD_MS);
+        assert_eq!(
+            changed.last_capacity_change_at_ms,
+            Some(TRANSPORT_SCALE_DOWN_HOLD_MS)
+        );
+        assert!(changed.low_backlog_since_ms.is_none());
     }
 
     #[test]

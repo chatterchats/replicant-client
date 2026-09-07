@@ -13,12 +13,12 @@ use std::{
 use replicant_client::raw::RequestPriority;
 use replicant_workflow::{
     AllocationCandidate, AllocationSet, BoxWorkflowFuture, ClaimAcquireOutcome, NewWorkflow,
-    RegistryError, ReplacementOutcome, ResourceKey, WorkItem, WorkItemSpec, WorkItemStatus,
-    WorkItemTransition, WorkflowContext, WorkflowExecutor, WorkflowFactory, WorkflowId,
-    WorkflowKind, WorkflowMigration, WorkflowPlacementIntent, WorkflowPlacementIntentCoverage,
-    WorkflowPlacementIntentProjection, WorkflowPlacementIntentRelation,
-    WorkflowPlacementIntentSubject, WorkflowRegistry, WorkflowServiceIntentProjection,
-    WorkflowServiceScope, WorkflowStatus,
+    RegistryError, ReplacementOutcome, RepositoryError, ResourceKey, WorkItem, WorkItemSpec,
+    WorkItemStatus, WorkItemTransition, WorkflowContext, WorkflowExecutor, WorkflowFactory,
+    WorkflowId, WorkflowKind, WorkflowMigration, WorkflowPlacementIntent,
+    WorkflowPlacementIntentCoverage, WorkflowPlacementIntentProjection,
+    WorkflowPlacementIntentRelation, WorkflowPlacementIntentSubject, WorkflowRegistry,
+    WorkflowServiceIntentProjection, WorkflowServiceScope, WorkflowStatus,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -592,7 +592,12 @@ impl WorkflowFactory for MiningWorkflowFactory {
                     Some("ready") => Some(WorkflowPlacementIntentRelation::Staged),
                     _ => None,
                 };
-                for code in [route.controller, route.freighter].into_iter().flatten() {
+                for code in route
+                    .controller
+                    .into_iter()
+                    .chain(route.freighter)
+                    .chain(route.additional_freighters)
+                {
                     if let Some(subject) = placement_subject(&code)
                         && let Some(intent) =
                             status_intent(instance.status, subject, relation, None, None)
@@ -645,6 +650,7 @@ impl WorkflowFactory for MiningWorkflowFactory {
                             system: route.system,
                             collect: route.belt,
                             deliver: destination.clone(),
+                            desired_freighters: route.desired_freighters,
                         }
                         .workflow_service_intent()
                     })
@@ -1115,6 +1121,51 @@ fn allocation_resource_identity(resource: &ResourceKey) -> &str {
     }
 }
 
+// Repair-only site work mutates already-deployed hardware that is not represented by
+// missing-hardware allocation requirements. Claim that productive stack before mutation so
+// another durable workflow can never be silently overridden. Optional System Ward protection
+// remains outside this gate.
+fn claim_existing_mining_site_assets(
+    repository: &replicant_workflow::WorkflowRepository,
+    workflow_id: WorkflowId,
+    mission: &MiningMission,
+    index: usize,
+) -> Result<Option<String>, String> {
+    let Some(site) = mission.sites.get(index) else {
+        return Err("mining site index is invalid while acquiring repair claims".to_owned());
+    };
+    let mut acquired = Vec::new();
+    for code in site
+        .assets
+        .productive_codes()
+        .into_iter()
+        .collect::<BTreeSet<_>>()
+    {
+        let resource = ResourceKey::Device(code);
+        match repository.acquire_claim(workflow_id, resource.clone()) {
+            Ok(ClaimAcquireOutcome::Acquired(_)) => acquired.push(resource),
+            Ok(ClaimAcquireOutcome::AlreadyOwned(_)) => {}
+            Err(error @ RepositoryError::ClaimConflict { .. }) => {
+                for acquired_resource in &acquired {
+                    repository
+                        .release_claim(workflow_id, acquired_resource)
+                        .map_err(string_error)?;
+                }
+                return Ok(Some(error.to_string()));
+            }
+            Err(error) => {
+                for acquired_resource in &acquired {
+                    repository
+                        .release_claim(workflow_id, acquired_resource)
+                        .map_err(string_error)?;
+                }
+                return Err(error.to_string());
+            }
+        }
+    }
+    Ok(None)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_mining_item(
     repository: Arc<replicant_workflow::WorkflowRepository>,
@@ -1132,6 +1183,30 @@ async fn run_mining_item(
     let revision = item.state.revision;
     let allocation_affinities =
         mining_allocation_affinities(&item_type, &item.spec.requirements_json);
+    if item_type == "site"
+        && let Some(reason) = claim_existing_mining_site_assets(
+            repository.as_ref(),
+            item.spec.workflow_id,
+            &mission,
+            index,
+        )?
+    {
+        repository
+            .transition_work_item(
+                item.id,
+                revision,
+                WorkItemTransition::Waiting {
+                    checkpoint_json: Some(serde_json::to_value(&mission).map_err(string_error)?),
+                    reason: format!(
+                        "mining site repair asset is claimed by another workflow: {reason}"
+                    ),
+                    retry_at_ms: Some(workflow_now_millis().saturating_add(300_000)),
+                },
+                workflow_now_millis(),
+            )
+            .map_err(string_error)?;
+        return Ok((item_type, index, mission));
+    }
     loop {
         match item_executor
             .execute(
@@ -3941,6 +4016,8 @@ struct PlacementMiningRoute {
     controller: Option<String>,
     #[serde(default)]
     freighter: Option<String>,
+    #[serde(default)]
+    additional_freighters: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -4780,6 +4857,8 @@ mod tests {
                     phase: crate::mining::RoutePhase::Planned,
                     controller: None,
                     freighter: None,
+                    additional_freighters: Vec::new(),
+                    desired_freighters: 1,
                 },
                 crate::mining::RouteMission {
                     system: "PENDING-2".into(),
@@ -4788,6 +4867,8 @@ mod tests {
                     phase: crate::mining::RoutePhase::Planned,
                     controller: None,
                     freighter: None,
+                    additional_freighters: Vec::new(),
+                    desired_freighters: 1,
                 },
             ],
             print_batches: Vec::new(),
@@ -4839,6 +4920,92 @@ mod tests {
             &[("stow", "carrier")]
         );
         assert!(mining_ignored_allocation_requirements("site").is_empty());
+    }
+
+    #[test]
+    fn mining_site_repair_claims_never_take_a_device_claimed_by_another_workflow() {
+        let repository =
+            replicant_workflow::WorkflowRepository::open_in_memory().expect("repository");
+        let create_workflow = || {
+            repository
+                .create(NewWorkflow {
+                    kind: mining_workflow_kind(),
+                    schema_version: SCHEMA_VERSION,
+                    config: Value::Null,
+                    checkpoint: Value::Null,
+                    current_step: Some("executing".into()),
+                    parent_id: None,
+                })
+                .expect("workflow")
+        };
+        let owner = create_workflow();
+        let repair = create_workflow();
+        repository
+            .acquire_claim(owner.id, ResourceKey::Device("Z-CLAIMED".into()))
+            .expect("seed conflicting claim");
+
+        let mut mission = mining_pool_mission();
+        mission.sites[1].assets.mining_controller = Some("A-LOCAL".into());
+        mission.sites[1].assets.mining_drones = vec!["Z-CLAIMED".into()];
+        mission.sites[1].missing.clear();
+
+        let conflict = claim_existing_mining_site_assets(&repository, repair.id, &mission, 1)
+            .expect("claim preflight");
+
+        assert!(conflict.is_some());
+        assert!(
+            repository
+                .claims(repair.id)
+                .expect("repair claims")
+                .is_empty()
+        );
+        assert!(
+            repository
+                .claims(owner.id)
+                .expect("owner claims")
+                .iter()
+                .any(|claim| claim.resource == ResourceKey::Device("Z-CLAIMED".into()))
+        );
+    }
+
+    #[test]
+    fn mining_site_repair_claims_do_not_gate_on_optional_system_ward() {
+        let repository =
+            replicant_workflow::WorkflowRepository::open_in_memory().expect("repository");
+        let create_workflow = || {
+            repository
+                .create(NewWorkflow {
+                    kind: mining_workflow_kind(),
+                    schema_version: SCHEMA_VERSION,
+                    config: Value::Null,
+                    checkpoint: Value::Null,
+                    current_step: Some("executing".into()),
+                    parent_id: None,
+                })
+                .expect("workflow")
+        };
+        let ward_owner = create_workflow();
+        let repair = create_workflow();
+        repository
+            .acquire_claim(ward_owner.id, ResourceKey::Device("WARD".into()))
+            .expect("seed ward claim");
+
+        let mut mission = mining_pool_mission();
+        mission.sites[1].assets.mining_controller = Some("MC".into());
+        mission.sites[1].assets.system_ward = Some("WARD".into());
+        mission.sites[1].missing.clear();
+
+        let conflict = claim_existing_mining_site_assets(&repository, repair.id, &mission, 1)
+            .expect("claim preflight");
+
+        assert!(conflict.is_none());
+        assert!(
+            repository
+                .claims(repair.id)
+                .expect("repair claims")
+                .iter()
+                .any(|claim| claim.resource == ResourceKey::Device("MC".into()))
+        );
     }
 
     #[test]

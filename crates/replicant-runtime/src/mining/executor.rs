@@ -120,7 +120,7 @@ fn mission_resource_codes(mission: &MiningMission) -> Vec<String> {
             mission
                 .routes
                 .iter()
-                .flat_map(|route| route.controller.iter().chain(&route.freighter).cloned()),
+                .flat_map(|route| route.controller.iter().cloned().chain(route.freighters())),
         )
         .chain(mission.print_batches.iter().flat_map(|batch| {
             std::iter::once(batch.factory_code.clone()).chain(batch.produced_codes.clone())
@@ -147,8 +147,8 @@ fn route_resource_codes(route: &super::RouteMission) -> Vec<String> {
     route
         .controller
         .iter()
-        .chain(&route.freighter)
         .cloned()
+        .chain(route.freighters())
         .collect()
 }
 
@@ -245,9 +245,13 @@ async fn reconcile(client: &Client, config: &Config, mission: &mut MiningMission
             site.missing.clear();
             site.phase = SitePhase::Operational;
         } else if site.phase == SitePhase::Operational {
-            site.phase = SitePhase::Planned;
             site.missing = site_shortages(&audit);
             site.assets = audit.assets;
+            if audit.mutation_safe && audit.normal_repair_needed {
+                site.phase = SitePhase::Planned;
+            } else {
+                site.phase = SitePhase::Verifying;
+            }
         } else if site.phase == SitePhase::Planned {
             site.missing = site_shortages(&audit);
             site.assets = audit.assets;
@@ -712,6 +716,25 @@ async fn allocate_site_assets(
     mission: &mut MiningMission,
 ) -> AnyResult<()> {
     allocate_available_site_assets(client, config, mission).await?;
+    let devices = device_snapshots(client).await?;
+    let incomplete_evidence = mission
+        .sites
+        .iter()
+        .filter(|site| site.phase == SitePhase::Planned)
+        .filter_map(|site| {
+            let audit = audit_site(&devices, &site.system, &site.belt);
+            (!audit.mutation_safe).then_some(format!("{}:{:?}", site.system, audit.issues))
+        })
+        .collect::<Vec<_>>();
+    if !incomplete_evidence.is_empty() {
+        return Err(app_error(
+            io::ErrorKind::WouldBlock,
+            format!(
+                "mining site evidence is incomplete; waiting before mutation: {}",
+                incomplete_evidence.join(", ")
+            ),
+        ));
+    }
     let incomplete = mission
         .sites
         .iter()
@@ -761,12 +784,25 @@ async fn allocate_available_site_assets(
             mission
                 .routes
                 .iter()
-                .flat_map(|route| route.controller.iter().chain(&route.freighter).cloned()),
+                .flat_map(|route| route.controller.iter().cloned().chain(route.freighters())),
         )
         .collect::<BTreeSet<_>>();
     let mut pool = reusable_pool(&devices, &mission.hub_location, &mission.mission_tag, &used);
     let mut allocated = 0usize;
     for index in 0..mission.sites.len() {
+        if mission.sites[index].phase == SitePhase::Planned {
+            let audit = audit_site(
+                &devices,
+                &mission.sites[index].system,
+                &mission.sites[index].belt,
+            );
+            let missing = site_shortages(&audit);
+            mission.sites[index].assets = audit.assets;
+            mission.sites[index].missing = missing;
+            if !audit.mutation_safe {
+                continue;
+            }
+        }
         let missing = mission.sites[index].missing.clone();
         let initial_deployment = mission.sites[index].phase == SitePhase::Planned
             && pool_can_complete_initial_deployment(&pool, &missing);
@@ -952,9 +988,51 @@ fn fill_site_devices(
 async fn tag_site_assets(client: &Client, site: &super::SiteMission) -> AnyResult<()> {
     let roles = site_roles(&site.assets);
     for (code, role) in roles {
-        add_tags(client, &code, &[site.tag.clone(), role_tag(role)]).await?;
+        reconcile_site_asset_tags(client, &code, &site.tag, role).await?;
     }
     Ok(())
+}
+
+async fn reconcile_site_asset_tags(
+    client: &Client,
+    code: &str,
+    expected_site_tag: &str,
+    role: &str,
+) -> AnyResult<()> {
+    let snapshot = validation::device(client, code, ValidationReason::Mutation).await?;
+    let expected_role_tag = role_tag(role);
+    let desired = [expected_site_tag.to_owned(), expected_role_tag.clone()];
+    let add_tags = desired
+        .iter()
+        .filter(|tag| !snapshot.tags.contains(*tag))
+        .cloned()
+        .collect::<Vec<_>>();
+    let remove_tags = snapshot
+        .tags
+        .iter()
+        .filter(|tag| {
+            (tag.starts_with("mine-s:") && tag.as_str() != expected_site_tag)
+                || (tag.starts_with("mine-r:") && tag.as_str() != expected_role_tag.as_str())
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if add_tags.is_empty() && remove_tags.is_empty() {
+        return Ok(());
+    }
+    let handle = match client.devices().cached(code) {
+        Some(handle) => handle,
+        None => client.devices().get(code).await?,
+    };
+    ensure_operation_accepted(
+        &handle
+            .configure(api_raw::devices::DeviceConfiguration {
+                add_tags: (!add_tags.is_empty()).then_some(add_tags),
+                remove_tags: (!remove_tags.is_empty()).then_some(remove_tags),
+                ..Default::default()
+            })
+            .await?,
+    )
+    .await
 }
 
 fn site_roles(assets: &SiteAssets) -> Vec<(String, &'static str)> {
@@ -1205,7 +1283,28 @@ async fn configure_site(
     mission: &mut MiningMission,
     index: usize,
 ) -> AnyResult<()> {
-    let site = mission.sites[index].clone();
+    let mut site = mission.sites[index].clone();
+    let preflight = audit_site(&device_snapshots(client).await?, &site.system, &site.belt);
+    if !preflight.mutation_safe {
+        let missing = site_shortages(&preflight);
+        mission.sites[index].assets = preflight.assets;
+        mission.sites[index].missing = missing;
+        mission.sites[index].phase = SitePhase::Verifying;
+        save_plan(&config.plan_path, mission)?;
+        return Err(app_error(
+            io::ErrorKind::WouldBlock,
+            format!(
+                "mining site {} has incomplete authoritative evidence: {:?}",
+                site.belt, preflight.issues
+            ),
+        ));
+    }
+    let missing = site_shortages(&preflight);
+    site.assets = preflight.assets;
+    site.missing = missing;
+    mission.sites[index].assets = site.assets.clone();
+    mission.sites[index].missing = site.missing.clone();
+    save_plan(&config.plan_path, mission)?;
     let ward_assigned = site.assets.system_ward.is_some();
     let mut ward_pending = false;
     for code in site.assets.codes() {
@@ -1426,7 +1525,7 @@ async fn allocate_route_assets(
             mission
                 .routes
                 .iter()
-                .flat_map(|route| route.controller.iter().chain(&route.freighter).cloned()),
+                .flat_map(|route| route.controller.iter().cloned().chain(route.freighters())),
         )
         .collect::<BTreeSet<_>>();
     let mut pool = reusable_pool(&devices, &mission.hub_location, &mission.mission_tag, &used);
@@ -1441,17 +1540,28 @@ async fn allocate_route_assets(
             &mut pool,
             &mut used,
         )?;
-        fill_site_asset(
-            &mut mission.routes[index].freighter,
-            CARGO_FREIGHTER,
-            &mut pool,
-            &mut used,
-        )?;
+        if mission.routes[index].freighter.is_none() {
+            fill_site_asset(
+                &mut mission.routes[index].freighter,
+                CARGO_FREIGHTER,
+                &mut pool,
+                &mut used,
+            )?;
+        }
+        while mission.routes[index].freighters().len() < mission.routes[index].desired_freighters {
+            let mut next = None;
+            fill_site_asset(&mut next, CARGO_FREIGHTER, &mut pool, &mut used)?;
+            if let Some(code) = next {
+                mission.routes[index].additional_freighters.push(code);
+            }
+        }
+        mission.routes[index].additional_freighters.sort();
+        mission.routes[index].additional_freighters.dedup();
         let codes = mission.routes[index]
             .controller
             .iter()
-            .chain(&mission.routes[index].freighter)
             .cloned()
+            .chain(mission.routes[index].freighters())
             .collect::<Vec<_>>();
         mission.routes[index].phase = RoutePhase::Ready;
         save_plan(&config.plan_path, mission)?;
@@ -1470,10 +1580,10 @@ async fn tag_route_assets(client: &Client, route: &super::RouteMission) -> AnyRe
         )
         .await?;
     }
-    if let Some(freighter) = &route.freighter {
+    for freighter in route.freighters() {
         add_tags(
             client,
-            freighter,
+            &freighter,
             &[route.tag.clone(), role_tag("cargo-freighter")],
         )
         .await?;
@@ -1507,11 +1617,18 @@ async fn configure_route(client: &Client, route: &super::RouteMission, hub: &str
             "route has no transport controller",
         )
     })?;
-    let freighter = route
-        .freighter
-        .as_deref()
-        .ok_or_else(|| app_error(io::ErrorKind::InvalidData, "route has no Cargo Freighter"))?;
-    ensure_adoption(client, controller, &[freighter.to_owned()]).await?;
+    let freighters = route.freighters();
+    if freighters.len() < route.desired_freighters {
+        return Err(app_error(
+            io::ErrorKind::InvalidData,
+            format!(
+                "route has {} Cargo Freighter(s), but {} are required",
+                freighters.len(),
+                route.desired_freighters
+            ),
+        ));
+    }
+    ensure_adoption(client, controller, &freighters).await?;
     let handle = match client.devices().cached(controller) {
         Some(handle) => handle,
         None => client.devices().get(controller).await?,
@@ -1558,8 +1675,9 @@ async fn configure_route(client: &Client, route: &super::RouteMission, hub: &str
             ValidationReason::StateConflict,
         )
         .await?;
-        if transport_service_present(&devices, &route.system, &route.belt, hub).state
-            == EvidenceState::Present
+        let audit = transport_service_present(&devices, &route.system, &route.belt, hub);
+        if audit.state == EvidenceState::Present
+            && audit.usable_freighter_count() >= route.desired_freighters
         {
             break;
         }

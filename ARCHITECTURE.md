@@ -150,6 +150,21 @@ Legacy `survey.route`, `relay.expansion`, `mining.expansion`, `event.fulfillment
 are categorized as `compatibility` and are not offered by the normal web/Tauri operation
 picker.
 
+Mining Ops additionally uses the internal `mining.transport_capacity` workflow for durable AMI
+Cargo Freighter count changes. The Director owns only capacity policy and structural health; the
+operating AMI Transport Controller continues to own tactical route execution and automatically
+picks up newly adopted transports without being recreated or restarted.
+
+Mining Ops also uses the internal `mining.maintenance_rotation` workflow for one exact worn
+remote maintenance drone and `mining.maintenance_pool` for the regional repair pool. Remote mining
+sites intentionally keep exactly one maintenance drone; a patrolling drone below 30% operational
+capacity is rotated rather than treated as missing hardware. Replacements are delivered with the
+shared logistics planner and the worn drone is not recovered until replacement patrol is verified.
+Returned drones go to the region's exact manufacturing/home belt, join the mutually repairing hub
+patrol pool, and remain non-ready until authoritative operational capacity reaches 95%. The hub
+pool has a hard minimum of two healthy patrol drones and a target of three; extra drones remain
+regional stock and are never automatically decommissioned.
+
 `logistics.regional_dispatch` is the operator-facing regional provisioning workflow. Its source
 may be the regional hub system, the owned System Hub device location, or the exact manufacturing
 home. Execution resolves all three forms to an owned Autofactory location in that same hub system
@@ -246,18 +261,23 @@ The initial standing goals are intentionally batch-oriented rather than one-goal
   Already-explored systems use the durable managed location projection when available; the workflow
   only revisits an explored system when location data is absent, because remote location reads are
   presence-gated.
-- **Expand Mining Ops** reconciles a protected regional mining footprint rather than treating
-  deployment as one-shot work. Each region expands into every density-policy-eligible belt system
-  within 30 LY of its selected regional hub; the footprint has no fixed system-count cap. Up to four
-  non-hub mining systems receive System Wards, prioritized dense over moderate over sparse and then
-  by distance, while active System Hubs satisfy protection without consuming those ward slots.
-  Existing in-range sites are audited for missing hardware, controller directives, adoption
-  relationships, protection, and AMI transport service back to the exact regional hub. Mining-site
-  deployment/repair takes precedence over transport-service repair; once a producing site is healthy,
-  missing compatible `AmiTransportRouteIntent` service is adopted or launched through the existing
-  durable `mining.campaign` machinery. Transport-service authority is resolved before optional ward
-  relocation. When a hub makes a ward redundant or a higher-density belt displaces a lower-density
-  allocation, the Director reuses the existing ward before launching the repair/expansion campaign.
+- **Mining Ops** retains the persisted `ExpandMiningOps` / `expand_mining_ops` identity while
+  reconciling a protected regional mining footprint. It repairs existing productive stacks,
+  rotates worn remote maintenance drones, restores AMI transport service, services critical
+  backlog, and preserves the regional maintenance reserve before protection, normal scaling, or
+  new expansion. Expansion remains within 30 LY of the selected regional hub and follows the
+  dense/moderate/sparse policy; already-managed in-range sites remain managed if their density is
+  later disabled for new expansion.
+  Healthy routes are capacity-managed from authoritative exact-belt inventory and the durable
+  per-route backlog trend. Backlog above 30 Cargo Freighter loads suppresses expansion; eligible
+  backlog above 10 loads scales before expansion, while 2–10 loads alone does not block it.
+  Flat/rising backlog triggers a narrow authoritative route refresh before bounded scale-up, and a
+  stuck route already at six usable freighters surfaces an actionable blocker. Sustained low
+  backlog releases at most one extra freighter to regional stock.
+  Established inter-system ferries that lose valid FTL reach raise the existing regional
+  Connectivity requirement instead of rewriting their Transport Controller. Up to four non-hub
+  mining systems receive System Wards by density and distance; a donor ward is never stripped
+  before destination connectivity is authoritative.
 - **Maintain System Hubs** keeps each operational hub stocked at its exact location. The
   `quantity_per_20pct` value is the authoritative material cost of one 20% repair tranche: when
   every upkeep resource has at least two complete tranches on hand, no shipment is launched; when
@@ -299,7 +319,7 @@ The initial standing goals are intentionally batch-oriented rather than one-goal
   local-control `logistics.manifest`. After the Replicant establishes authority at the source, the normal
   transport planner stages cargo-capable transport (for example a cargo freighter) to collect the stock,
   deliver it to the exact regional hub, and return borrowed transport while the Replicant returns home.
-  Persistent AMI transport-route maintenance belongs to **Expand Mining Ops**, not this goal.
+  Persistent AMI transport-route maintenance belongs to **Mining Ops**, not this goal.
 
 ### Regions and worker ownership
 
