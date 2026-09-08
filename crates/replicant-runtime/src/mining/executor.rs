@@ -172,16 +172,31 @@ pub(crate) async fn execute(
     if mission.phase.is_terminal() {
         return Ok(());
     }
+    config.claim_devices(&mission_resource_codes(mission))?;
 
-    validation::replicant(
+    let replicant = validation::replicant(
         client,
         &mission.selected_replicant,
-        ValidationReason::Mutation,
+        ValidationReason::StateConflict,
     )
     .await?;
+    if let Some(claims) = &config.claims {
+        claims.repository.acquire_claim(
+            claims.workflow_id,
+            replicant_workflow::ResourceKey::Replicant(mission.selected_replicant.clone()),
+        )?;
+        let vessel = replicant.hosted_device.as_ref().ok_or_else(|| {
+            app_error(
+                io::ErrorKind::WouldBlock,
+                "mining worker has no authoritative hosted vessel",
+            )
+        })?;
+        config.claim_devices(&[vessel.id.as_str().to_owned()])?;
+    }
     migrate_legacy_mission_devices(client, mission).await?;
     save_plan(&config.plan_path, mission)?;
     reconcile(client, config, mission).await?;
+    config.claim_devices(&mission_resource_codes(mission))?;
     tag_existing_automation(client, mission).await?;
 
     set_phase(config, mission, MissionPhase::ManufacturingSites)?;
@@ -236,10 +251,19 @@ fn set_phase(config: &Config, mission: &mut MiningMission, phase: MissionPhase) 
 }
 
 async fn reconcile(client: &Client, config: &Config, mission: &mut MiningMission) -> AnyResult<()> {
-    reconcile_print_batches(client, mission).await?;
+    reconcile_print_batches(client, mission, config.claims.as_ref()).await?;
     let devices = device_snapshots(client).await?;
     for site in &mut mission.sites {
         let audit = audit_site(&devices, &site.system, &site.belt);
+        if !audit.mutation_safe {
+            return Err(app_error(
+                io::ErrorKind::WouldBlock,
+                format!(
+                    "mining site {} requires authoritative evidence before provisioning: {:?}",
+                    site.belt, audit.issues
+                ),
+            ));
+        }
         if audit.operational {
             site.assets = audit.assets;
             site.missing.clear();
@@ -292,7 +316,7 @@ async fn execute_print_phase(
     mission: &mut MiningMission,
     purpose: PrintPurpose,
 ) -> AnyResult<()> {
-    reconcile_print_batches(client, mission).await?;
+    reconcile_print_batches(client, mission, config.claims.as_ref()).await?;
     let migrated = split_pending_print_batches(mission);
     if migrated > 0 {
         info!(
@@ -355,7 +379,11 @@ fn phase_batches(mission: &MiningMission, purpose: PrintPurpose) -> Vec<usize> {
         .collect()
 }
 
-async fn reconcile_print_batches(client: &Client, mission: &mut MiningMission) -> AnyResult<()> {
+async fn reconcile_print_batches(
+    client: &Client,
+    mission: &mut MiningMission,
+    claims: Option<&super::MiningWorkflowClaims>,
+) -> AnyResult<()> {
     let batch_tags = mission
         .print_batches
         .iter()
@@ -417,6 +445,9 @@ async fn reconcile_print_batches(client: &Client, mission: &mut MiningMission) -
                     batch.quantity
                 ),
             ));
+        }
+        if let Some(claims) = claims {
+            claims.acquire_devices(&codes)?;
         }
         batch.produced_codes = codes;
         let queued =
@@ -514,7 +545,7 @@ async fn submit_print_batches(
     let deadline = Instant::now() + config.wait_timeout;
     let mut watch = client.events().watch().await?;
     loop {
-        reconcile_print_batches(client, mission).await?;
+        reconcile_print_batches(client, mission, config.claims.as_ref()).await?;
         if purpose == PrintPurpose::Site {
             progress_site_pipeline(client, config, mission).await?;
         }
@@ -568,6 +599,9 @@ async fn submit_print_batches(
             &printing_blueprints,
             |update| match update {
                 TrackedPrintUpdate::Preparing(assignment) => {
+                    config
+                        .claim_devices(std::slice::from_ref(&assignment.factory_code))
+                        .map_err(|error| error.to_string())?;
                     let index = schedulable[assignment.request_index];
                     let batch = &mut mission.print_batches[index];
                     batch.factory_code.clone_from(&assignment.factory_code);
@@ -649,7 +683,7 @@ async fn wait_for_print_outputs(
     let deadline = Instant::now() + config.wait_timeout;
     let mut watch = client.events().watch().await?;
     loop {
-        reconcile_print_batches(client, mission).await?;
+        reconcile_print_batches(client, mission, config.claims.as_ref()).await?;
         if purpose == PrintPurpose::Site {
             progress_site_pipeline(client, config, mission).await?;
         }
@@ -867,6 +901,7 @@ async fn allocate_available_site_assets(
                 .missing
                 .retain(|device_type, _| device_type == SYSTEM_WARD);
         }
+        config.claim_devices(&site_resource_codes(&mission.sites[index]))?;
         mission.sites[index].phase = SitePhase::Ready;
         allocated += 1;
         save_plan(&config.plan_path, mission)?;
@@ -1285,6 +1320,7 @@ async fn dispatch_ready_sites(
             validation::device(client, &item.code, ValidationReason::CapacitySensitive).await?;
         }
         mission.sites[index].carrier = Some(carrier.clone());
+        config.claim_devices(std::slice::from_ref(&carrier))?;
         mission.sites[index].phase = SitePhase::Outbound;
         save_plan(&config.plan_path, mission)?;
         add_tags(
@@ -1367,6 +1403,12 @@ async fn configure_site(
     index: usize,
 ) -> AnyResult<()> {
     let mut site = mission.sites[index].clone();
+    validate_codes(
+        client,
+        &site_resource_codes(&site),
+        ValidationReason::StateConflict,
+    )
+    .await?;
     let preflight = audit_site(&device_snapshots(client).await?, &site.system, &site.belt);
     if !preflight.mutation_safe {
         let missing = site_shortages(&preflight);
@@ -1385,6 +1427,7 @@ async fn configure_site(
     let missing = site_shortages(&preflight);
     site.assets = preflight.assets;
     site.missing = missing;
+    config.claim_devices(&site_resource_codes(&site))?;
     mission.sites[index].assets = site.assets.clone();
     mission.sites[index].missing = site.missing.clone();
     save_plan(&config.plan_path, mission)?;
@@ -1447,7 +1490,7 @@ async fn configure_site(
         None => client.devices().get(mining_controller).await?,
     };
     let mining = mining_handle.as_mining_controller()?;
-    if !has_directive(&mining_snapshot, "deplete_smallest") {
+    if site_directive_missing(&mining_snapshot, "deplete_smallest")? {
         let operation = mining
             .set_directive(MiningDirective::DepleteSmallest)
             .await?;
@@ -1455,6 +1498,12 @@ async fn configure_site(
     }
     let mining_snapshot =
         validation::device(client, mining_controller, ValidationReason::StateConflict).await?;
+    if mining_snapshot.status.is_none() {
+        return Err(app_error(
+            io::ErrorKind::WouldBlock,
+            "mining controller status is unknown before launch",
+        ));
+    }
     if mining_snapshot
         .status
         .as_ref()
@@ -1471,12 +1520,18 @@ async fn configure_site(
         None => client.devices().get(survey_controller).await?,
     };
     let survey = survey_handle.as_survey_controller()?;
-    if !has_directive(&survey_snapshot, "belt_search") {
+    if site_directive_missing(&survey_snapshot, "belt_search")? {
         ensure_operation_accepted(&survey.set_directive(SurveyDirective::BeltSearch).await?)
             .await?;
     }
     let survey_snapshot =
         validation::device(client, survey_controller, ValidationReason::StateConflict).await?;
+    if survey_snapshot.status.is_none() {
+        return Err(app_error(
+            io::ErrorKind::WouldBlock,
+            "survey controller status is unknown before launch",
+        ));
+    }
     if survey_snapshot
         .status
         .as_ref()
@@ -1495,7 +1550,7 @@ async fn configure_site(
         Some(handle) => handle,
         None => client.devices().get(maintenance).await?,
     };
-    if !has_directive(&maintenance_snapshot, "patrol") {
+    if site_directive_missing(&maintenance_snapshot, "patrol")? {
         ensure_operation_accepted(
             &maintenance_handle
                 .command(api_raw::devices::DeviceCommand::SetDirective {
@@ -1597,9 +1652,36 @@ async fn ensure_adoption(
     if missing.is_empty() {
         return Ok(());
     }
-    validation::device(client, controller, ValidationReason::CapacitySensitive).await?;
-    for code in &missing {
-        validation::device(client, code, ValidationReason::CapacitySensitive).await?;
+    let controller_state =
+        validation::device(client, controller, ValidationReason::StateConflict).await?;
+    if !super::site_asset_usable(&controller_state)
+        || controller_state.location.is_none()
+        || controller_state.status.is_none()
+    {
+        return Err(app_error(
+            io::ErrorKind::WouldBlock,
+            "controller authority changed before adoption",
+        ));
+    }
+    let mut missing = Vec::new();
+    for code in devices {
+        let device = validation::device(client, code, ValidationReason::StateConflict).await?;
+        if controller_code(&device) == Some(controller) {
+            continue;
+        }
+        if !super::site_asset_usable(&device)
+            || device.location != controller_state.location
+            || device.status.is_none()
+            || find_device(&snapshots, code).is_none_or(|before| {
+                before.relationships.controller != device.relationships.controller
+            })
+        {
+            return Err(app_error(
+                io::ErrorKind::WouldBlock,
+                format!("device {code} is no longer free at controller {controller}"),
+            ));
+        }
+        missing.push(code.clone());
     }
     let handle = match client.devices().cached(controller) {
         Some(handle) => handle,
@@ -1669,6 +1751,7 @@ async fn allocate_route_assets(
             .cloned()
             .chain(mission.routes[index].freighters())
             .collect::<Vec<_>>();
+        config.claim_devices(&codes)?;
         mission.routes[index].phase = RoutePhase::Ready;
         save_plan(&config.plan_path, mission)?;
         ensure_asset_ownership(client, &codes, &mission.selected_replicant).await?;
@@ -1722,6 +1805,20 @@ async fn activate_routes(
     Ok(())
 }
 
+fn site_directive_missing(device: &Device, expected: &str) -> AnyResult<bool> {
+    match super::site_directive_evidence(device, expected) {
+        EvidenceState::Present => Ok(false),
+        EvidenceState::Absent => Ok(true),
+        EvidenceState::Unknown => Err(app_error(
+            io::ErrorKind::WouldBlock,
+            format!(
+                "device {} has incomplete active directive evidence",
+                device.key.id
+            ),
+        )),
+    }
+}
+
 async fn configure_route(
     client: &Client,
     mission_id: &str,
@@ -1745,12 +1842,6 @@ async fn configure_route(
             ),
         ));
     }
-    ensure_adoption(client, mission_id, controller, &freighters).await?;
-    let handle = match client.devices().cached(controller) {
-        Some(handle) => handle,
-        None => client.devices().get(controller).await?,
-    };
-    let transport = handle.as_transport_controller()?;
     let initial_devices = validate_codes(
         client,
         &route_resource_codes(route),
@@ -1759,7 +1850,24 @@ async fn configure_route(
     .await?;
     let initial_audit =
         transport_service_present(&initial_devices, &route.system, &route.belt, hub);
-    if initial_audit.state != EvidenceState::Present {
+    if initial_audit.controller_operational == EvidenceState::Unknown
+        || initial_audit.controller_directive == EvidenceState::Unknown
+        || initial_audit.controller_configuration == EvidenceState::Unknown
+    {
+        return Err(app_error(
+            io::ErrorKind::WouldBlock,
+            "transport controller evidence is incomplete before mutation",
+        ));
+    }
+    ensure_adoption(client, mission_id, controller, &freighters).await?;
+    let handle = match client.devices().cached(controller) {
+        Some(handle) => handle,
+        None => client.devices().get(controller).await?,
+    };
+    let transport = handle.as_transport_controller()?;
+    if initial_audit.controller_directive == EvidenceState::Absent
+        || initial_audit.controller_configuration == EvidenceState::Absent
+    {
         let directive = if super::location_is_in_system(hub, &route.system) {
             TransportDirective::Shuttle {
                 collect: route.belt.clone(),
@@ -1776,6 +1884,12 @@ async fn configure_route(
         ensure_operation_accepted(&transport.set_directive(directive).await?).await?;
     }
     let snapshot = validation::device(client, controller, ValidationReason::StateConflict).await?;
+    if super::transport_controller_status_state(&snapshot) == EvidenceState::Unknown {
+        return Err(app_error(
+            io::ErrorKind::WouldBlock,
+            "transport controller status is incomplete before launch",
+        ));
+    }
     if snapshot
         .status
         .as_ref()
@@ -2350,7 +2464,7 @@ mod tests {
                 "total_material_cost": {}, "warnings": []
             })).expect("legacy print checkpoint");
             for _ in 0..2 {
-                let result = reconcile_print_batches(&client, &mut mission).await;
+                let result = reconcile_print_batches(&client, &mut mission, None).await;
                 if evidence == "ambiguous" {
                     assert!(result.is_err());
                     assert!(!mission.print_batches[0].submitted);
@@ -2369,6 +2483,140 @@ mod tests {
             );
             client.close().await.expect("close");
         }
+    }
+
+    #[tokio::test]
+    async fn mining_print_output_cannot_be_allocated_before_or_after_owner_reconciliation() {
+        use replicant_client::{SecretString, StartupPolicy, raw::Url};
+        use replicant_workflow::{
+            NewWorkflow, RequirementScope, ResourceRequirement, WorkItemSpec, WorkflowKind,
+            WorkflowRepository,
+        };
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+        let server = MockServer::start().await;
+        for (code, body) in [
+            (
+                "AF",
+                serde_json::json!({"device_code": "AF", "device_type": "autofactory", "location": "SOL-BELT-1", "status": "idle", "print_queue": []}),
+            ),
+            (
+                "OUTPUT",
+                serde_json::json!({"device_code": "OUTPUT", "device_type": "mining_drone", "location": "SOL-BELT-1", "status": "idle", "tags": ["mine-m:sol", "mine-b:one"]}),
+            ),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(format!("/v1/devices/{code}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .mount(&server)
+                .await;
+        }
+        let client = Client::builder()
+            .base_url(Url::parse(&server.uri()).expect("URL"))
+            .authentication_token(SecretString::from("fixture"))
+            .in_memory()
+            .startup_policy(StartupPolicy::RestoreOnly)
+            .start()
+            .await
+            .expect("client");
+        client
+            .devices()
+            .refresh("OUTPUT")
+            .await
+            .expect("new print output");
+        let repository =
+            std::sync::Arc::new(WorkflowRepository::open_in_memory().expect("repository"));
+        let create = || {
+            repository
+                .create(NewWorkflow {
+                    kind: WorkflowKind::new("mining.campaign").expect("kind"),
+                    schema_version: 1,
+                    config: serde_json::json!({}),
+                    checkpoint: serde_json::json!({}),
+                    current_step: None,
+                    parent_id: None,
+                })
+                .expect("workflow")
+        };
+        let owner = create();
+        let rival = create();
+        let item_for = |workflow_id| {
+            repository
+                .reconcile_work_items(
+                    workflow_id,
+                    &[WorkItemSpec {
+                        workflow_id,
+                        dedupe_key: "output".into(),
+                        kind: WorkflowKind::new("mining.site").expect("kind"),
+                        sort_key: "output".into(),
+                        payload_json: serde_json::json!({}),
+                        preconditions_json: serde_json::json!([]),
+                        deadline_at_ms: None,
+                        requirements_json: serde_json::to_value(vec![ResourceRequirement {
+                            key: "drone".into(),
+                            kind: "device".into(),
+                            capabilities: vec!["mining_drone".into()],
+                            scope: RequirementScope::Anywhere,
+                            count: 1,
+                            quantity: 1,
+                        }])
+                        .expect("requirements"),
+                    }],
+                    0,
+                )
+                .expect("item")
+                .remove(0)
+        };
+        let owner_item = item_for(owner.id);
+        let rival_item = item_for(rival.id);
+        let broker = crate::assignment::ResourceBroker::with_managed_client(
+            repository.clone(),
+            client.clone(),
+        );
+        let before = broker.discover_candidates().expect("new output discovery");
+        assert!(
+            broker
+                .allocate(rival_item.id, rival_item.state.revision, &before)
+                .is_err()
+        );
+        let mut mission: MiningMission = serde_json::from_value(serde_json::json!({
+            "version": 1, "mission_id": "owner", "mission_tag": "mine-m:sol",
+            "phase": "manufacturing_sites", "selected_replicant": "WORKER",
+            "hub_location": "SOL-BELT-1", "sites": [], "routes": [],
+            "print_batches": [{
+                "purpose": "site", "factory_code": "AF", "device_type": "mining_drone",
+                "quantity": 1, "projected_finish_seconds": 10.0, "batch_tag": "mine-b:one",
+                "submission_started": true, "submitted": false, "produced_codes": []
+            }],
+            "site_print_requirements": {}, "route_print_requirements": {}, "total_material_cost": {}, "warnings": []
+        })).expect("mission");
+        let claims = super::super::MiningWorkflowClaims {
+            repository: repository.clone(),
+            workflow_id: owner.id,
+        };
+        for _ in 0..2 {
+            reconcile_print_batches(&client, &mut mission, Some(&claims))
+                .await
+                .expect("claim output on restart");
+        }
+        let after = broker
+            .discover_candidates()
+            .expect("claimed output discovery");
+        assert!(
+            broker
+                .allocate(rival_item.id, rival_item.state.revision, &after)
+                .is_err()
+        );
+        let allocation = broker
+            .allocate(owner_item.id, owner_item.state.revision, &after)
+            .expect("owner uses output");
+        assert_eq!(
+            allocation.by_requirement["drone"][0].resource,
+            replicant_workflow::ResourceKey::Device("OUTPUT".into())
+        );
+        client.close().await.expect("close");
     }
 
     #[tokio::test]
@@ -2425,6 +2673,7 @@ mod tests {
             replace_plan: false,
             wait_timeout: Duration::from_secs(1),
             max_concurrency: 1,
+            claims: None,
         };
         save_plan(&plan_path, &mission).expect("persist outbound intent");
         mission = serde_json::from_slice(&std::fs::read(&plan_path).expect("checkpoint"))
@@ -2450,5 +2699,221 @@ mod tests {
         );
         client.close().await.expect("close");
         std::fs::remove_file(plan_path).expect("remove checkpoint");
+    }
+
+    #[tokio::test]
+    async fn mining_route_unknown_controller_evidence_never_rewrites_or_launches() {
+        use replicant_client::{SecretString, StartupPolicy, raw::Url};
+        use replicant_mining_planner::site_tag;
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+        for missing in [
+            "status",
+            "device_type",
+            "ami_directive",
+            "ami_directive_status",
+            "config",
+            "collect",
+            "deliver",
+        ] {
+            let server = MockServer::start().await;
+            let mut controller = serde_json::json!({
+                "device_code": "AUTH-TC", "device_type": "ami_transport_controller",
+                "location": "REMOTE-BELT-1", "status": "coordinating",
+                "tags": [site_tag("REMOTE"), role_tag("transport-controller")],
+                "ami_directive": {"directive": "ferry", "config": {
+                    "collect": "REMOTE-BELT-1", "deliver": "HUB-BELT-1"
+                }},
+                "ami_directive_status": "active",
+                "controlled_devices": [{"device_code": "AUTH-CF"}]
+            });
+            if missing == "config" {
+                controller["ami_directive"]
+                    .as_object_mut()
+                    .expect("directive")
+                    .remove(missing);
+            } else if matches!(missing, "collect" | "deliver") {
+                controller["ami_directive"]["config"]
+                    .as_object_mut()
+                    .expect("configuration")
+                    .remove(missing);
+            } else {
+                controller
+                    .as_object_mut()
+                    .expect("controller")
+                    .remove(missing);
+            }
+            let freighter = serde_json::json!({
+                "device_code": "AUTH-CF", "device_type": "cargo_freighter",
+                "location": "REMOTE-BELT-1", "status": "idle", "controller_device_code": "AUTH-TC"
+            });
+            for (code, value) in [("AUTH-TC", controller), ("AUTH-CF", freighter)] {
+                Mock::given(method("GET"))
+                    .and(path(format!("/v1/devices/{code}")))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(value))
+                    .mount(&server)
+                    .await;
+            }
+            let client = Client::builder()
+                .base_url(Url::parse(&server.uri()).expect("URL"))
+                .authentication_token(SecretString::from("fixture"))
+                .in_memory()
+                .startup_policy(StartupPolicy::RestoreOnly)
+                .start()
+                .await
+                .expect("client");
+            let route: super::super::RouteMission = serde_json::from_value(serde_json::json!({
+                "system": "REMOTE", "belt": "REMOTE-BELT-1", "tag": site_tag("REMOTE"),
+                "phase": "ready", "controller": "AUTH-TC", "freighter": "AUTH-CF",
+                "desired_freighters": 1
+            }))
+            .expect("route");
+            assert!(
+                configure_route(&client, "authority-test", &route, "HUB-BELT-1")
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                transport_service_present(
+                    &device_snapshots(&client).await.expect("devices"),
+                    "REMOTE",
+                    "REMOTE-BELT-1",
+                    "HUB-BELT-1"
+                )
+                .state,
+                EvidenceState::Unknown,
+                "{missing}",
+            );
+            assert!(
+                server
+                    .received_requests()
+                    .await
+                    .expect("requests")
+                    .iter()
+                    .all(|request| request.method == "GET"),
+                "{missing}"
+            );
+            client.close().await.expect("close");
+        }
+    }
+
+    #[tokio::test]
+    async fn mining_site_missing_active_directives_never_issue_commands() {
+        use replicant_client::{SecretString, StartupPolicy, raw::Url};
+        use replicant_mining_planner::site_tag;
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+        for missing in ["SITE-MC", "SITE-SC", "SITE-MD"] {
+            let server = MockServer::start().await;
+            let client = Client::builder()
+                .base_url(Url::parse(&server.uri()).expect("URL"))
+                .authentication_token(SecretString::from("fixture"))
+                .in_memory()
+                .startup_policy(StartupPolicy::RestoreOnly)
+                .start()
+                .await
+                .expect("client");
+            for (code, kind, role, directive, status) in [
+                (
+                    "SITE-MC",
+                    MINING_CONTROLLER,
+                    "mining-controller",
+                    "deplete_smallest",
+                    "coordinating",
+                ),
+                (
+                    "SITE-SC",
+                    SURVEY_CONTROLLER,
+                    "survey-controller",
+                    "belt_search",
+                    "coordinating",
+                ),
+                (
+                    "SITE-MD",
+                    MAINTENANCE_DRONE,
+                    "maintenance",
+                    "patrol",
+                    "patrolling",
+                ),
+            ] {
+                let mut body = serde_json::json!({
+                    "device_code": code, "device_type": kind, "location": "AUTH-BELT-1",
+                    "status": status, "operational_capacity": 100,
+                    "tags": [site_tag("AUTH"), role_tag(role)],
+                    "available_directives": [directive],
+                    "ami_directive": {"directive": directive}, "ami_directive_status": "active"
+                });
+                if code == missing {
+                    let fields = body.as_object_mut().expect("device");
+                    fields.remove("ami_directive");
+                    fields.remove("ami_directive_status");
+                }
+                Mock::given(method("GET"))
+                    .and(path(format!("/v1/devices/{code}")))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                    .mount(&server)
+                    .await;
+            }
+            let mut mission: MiningMission = serde_json::from_value(serde_json::json!({
+                "version": 1, "mission_id": "site-directive-authority", "mission_tag": "mine-m:authority",
+                "phase": "deploying_sites", "selected_replicant": "WORKER", "hub_location": "HUB-BELT-1",
+                "sites": [{
+                    "system": "AUTH", "belt": "AUTH-BELT-1", "density": "dense", "tag": site_tag("AUTH"),
+                    "phase": "configuring", "missing": {},
+                    "assets": {"mining_controller": "SITE-MC", "survey_controller": "SITE-SC",
+                        "maintenance_drone": "SITE-MD", "mining_drones": [], "survey_drones": []}
+                }],
+                "routes": [], "print_batches": [], "site_print_requirements": {},
+                "route_print_requirements": {}, "total_material_cost": {}, "warnings": []
+            })).expect("mission");
+            let plan_path = std::env::temp_dir()
+                .join(format!("mining-directive-{}.json", uuid::Uuid::new_v4()));
+            let config = Config {
+                systems: vec!["AUTH".into()],
+                replicant: None,
+                hub: "HUB-BELT-1".into(),
+                transport_routes: Vec::new(),
+                plan_path: plan_path.clone(),
+                replace_plan: false,
+                wait_timeout: Duration::from_secs(1),
+                max_concurrency: 1,
+                claims: None,
+            };
+            assert!(
+                configure_site(&client, &config, &mut mission, 0)
+                    .await
+                    .is_err()
+            );
+            let devices = device_snapshots(&client).await.expect("devices");
+            let audit = audit_site(&devices, "AUTH", "AUTH-BELT-1");
+            assert!(!audit.mutation_safe);
+            assert!(audit.issues.iter().any(|issue| matches!(
+                issue, super::super::MiningSiteIssue::EvidenceIncomplete { device, field: "active_directive" }
+                    if device == missing
+            )));
+            let mut idle = find_device(&devices, missing)
+                .expect("selected device")
+                .clone();
+            idle.status = Some(DeviceStatus::from("idle"));
+            assert_eq!(
+                super::super::site_directive_evidence(&idle, "patrol"),
+                EvidenceState::Absent
+            );
+            assert!(
+                server
+                    .received_requests()
+                    .await
+                    .expect("requests")
+                    .iter()
+                    .all(|request| request.method == "GET"),
+                "{missing}"
+            );
+            client.close().await.expect("close");
+            std::fs::remove_file(plan_path).expect("remove checkpoint");
+        }
     }
 }

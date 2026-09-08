@@ -195,6 +195,20 @@ A maintenance rotation resumes its existing provisioning child before considerin
 Scale-down retains one exact selected freighter, and a successful return child alone does not
 prove arrival: the device must be stationary and detached at the exact hub location.
 
+Workflow-owned mining execution, including bootstrap's mining stages, carries explicit repository
+custody. Selected devices, hosted vessels, assigned factories, and discovered print outputs are
+claimed before mutation. Reserved-tagged outputs stay out of broker pools until their owner has
+claimed them. Device and Autofactory claim namespaces cannot independently own the same physical
+device. Delivery creation hands payload claims to the child atomically; successful delivery returns
+them to the live parent in the terminal-state transaction. Capacity provisioning verifies the exact
+staged freighters before deriving a print deficit.
+
+Maintenance dispatch checks the unclaimed healthy reserve and acquires its replacement in one
+transaction. Rotation rechecks wear before starting, discovers current hub stock rather than relying
+only on saved candidate IDs, and verifies replacement patrol/readiness before worn-drone recovery.
+The hub pool reuses claimable stock before printing and waits for sufficient existing repair patrols
+to recover instead of manufacturing duplicates.
+
 ### Parent and child work
 
 `WorkflowContext::create_child` persists `parent_id` automatically, and
@@ -282,9 +296,22 @@ The initial standing goals are intentionally batch-oriented rather than one-goal
   Healthy routes are capacity-managed from authoritative exact-belt inventory and the durable
   per-route backlog trend. Backlog above 30 Cargo Freighter loads suppresses expansion; eligible
   backlog above 10 loads scales before expansion, while 2–10 loads alone does not block it.
-  Flat/rising backlog triggers a narrow authoritative route refresh before bounded scale-up, and a
-  stuck route already at six usable freighters surfaces an actionable blocker. Sustained low
-  backlog releases at most one extra freighter to regional stock.
+  Flat/rising backlog triggers a bounded Cargo Freighter census once per regional reconcile, then
+  exact controller/child reads. Both directions of adoption must agree before capacity changes;
+  incomplete type, status, directive/configuration, or relationship evidence remains unknown.
+  Coordinating or patrolling devices with missing directive details are not rewritten. An explicitly
+  idle device may be initialized: the upstream status contract defines idle as having no active task.
+  A stuck route already at six usable freighters surfaces an actionable blocker. Load bands compare
+  integer resource totals against 500-unit planning loads. Capacity changes have a 15-minute
+  cooldown; scale-down releases one freighter only after 60 continuous observed minutes below two
+  loads. Unknown inventory breaks that hold. Stock at the exact delivery/home belt is not a route
+  backlog. Device-membership authority is separate from inventory authority, so known device repair
+  does not depend on unrelated inventory or Full REST readiness.
+  Each regional reconcile creates at most one Mining Ops strategic workflow and publishes at most
+  four connectivity dependencies. Site campaigns select at most four systems; structural route
+  repair selects one route. Critical capacity additions request at most two freighters, capped at
+  six total. New expansion connectivity is deferred behind higher-priority work, while the exact
+  active campaign may still restore connectivity needed to finish.
   Established inter-system ferries that lose valid FTL reach raise the existing regional
   Connectivity requirement instead of rewriting their Transport Controller. Up to four non-hub
   mining systems receive System Wards by density and distance; a donor ward is never stripped

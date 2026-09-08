@@ -142,6 +142,38 @@ impl WorkflowContext {
         self.repository.create(workflow)
     }
 
+    /// Creates a child with exclusive custody of the supplied resources, without a release gap.
+    pub fn create_child_with_claims<C: Serialize, P: Serialize>(
+        &self,
+        mut workflow: NewWorkflow<C, P>,
+        resources: &[ResourceKey],
+    ) -> Result<WorkflowInstance, RepositoryError> {
+        workflow.parent_id = Some(self.instance.id);
+        self.repository
+            .create_with_parent_claims(workflow, resources)
+    }
+
+    /// Completes delivery while atomically returning payload custody to the live parent.
+    pub fn mark_succeeded_returning_claims<R: Serialize>(
+        &mut self,
+        result: Option<R>,
+        resources: &[ResourceKey],
+    ) -> Result<(), RepositoryError> {
+        self.instance = self.repository.complete_with_parent_claims(
+            self.instance.id,
+            self.instance.revision,
+            WorkflowState {
+                status: WorkflowStatus::Succeeded,
+                current_step: self.instance.current_step.clone(),
+                checkpoint: self.checkpoint_value()?,
+                last_error: None,
+                result: result.map(serde_json::to_value).transpose()?,
+            },
+            resources,
+        )?;
+        Ok(())
+    }
+
     /// Lists durable child workflows owned by this orchestration.
     ///
     /// This lets restart reconciliation reattach to child work that was

@@ -82,6 +82,150 @@ fn complete(
 }
 
 #[test]
+fn mining_claim_handoff_survives_competing_selection_and_returns_payload_atomically() {
+    let repository = WorkflowRepository::open_in_memory().expect("repository");
+    let parent = create(&repository, None);
+    let rival = create(&repository, None);
+    let payload = ResourceKey::Device("MINING-PAYLOAD".into());
+    repository
+        .acquire_claim(parent.id, payload.clone())
+        .expect("parent custody");
+    let child = repository
+        .create_with_parent_claims(
+            NewWorkflow {
+                kind: kind(),
+                schema_version: 2,
+                config: Config {
+                    system: "SOL".into(),
+                },
+                checkpoint: Checkpoint { visits: 0 },
+                current_step: None,
+                parent_id: Some(parent.id),
+            },
+            std::slice::from_ref(&payload),
+        )
+        .expect("atomic child creation");
+    assert!(
+        repository
+            .claims(parent.id)
+            .expect("parent claims")
+            .is_empty()
+    );
+    assert!(matches!(
+        repository.acquire_claim(rival.id, payload.clone()),
+        Err(RepositoryError::ClaimConflict { owner, .. }) if owner == child.id
+    ));
+    repository
+        .transfer_claims(parent.id, child.id, std::slice::from_ref(&payload))
+        .expect("restart repeats handoff");
+    assert!(
+        !repository
+            .release_claim(parent.id, &payload)
+            .expect("old owner release")
+    );
+    let child = repository
+        .update(
+            child.id,
+            child.revision,
+            WorkflowState::<_, ()> {
+                status: WorkflowStatus::Running,
+                current_step: None,
+                checkpoint: Checkpoint { visits: 0 },
+                last_error: None,
+                result: None,
+            },
+        )
+        .expect("running");
+    repository
+        .complete_with_parent_claims(
+            child.id,
+            child.revision,
+            WorkflowState::<_, ()> {
+                status: WorkflowStatus::Succeeded,
+                current_step: None,
+                checkpoint: Checkpoint { visits: 1 },
+                last_error: None,
+                result: None,
+            },
+            std::slice::from_ref(&payload),
+        )
+        .expect("atomic payload return");
+    assert!(matches!(
+        repository.acquire_claim(rival.id, payload.clone()),
+        Err(RepositoryError::ClaimConflict { owner, .. }) if owner == parent.id
+    ));
+    assert!(matches!(
+        repository.acquire_claim(parent.id, payload),
+        Ok(ClaimAcquireOutcome::AlreadyOwned(_))
+    ));
+}
+
+#[test]
+fn mining_claim_concurrency_preserves_hub_minimum_and_factory_identity() {
+    let repository = Arc::new(WorkflowRepository::open_in_memory().expect("repository"));
+    let owners = [create(&repository, None).id, create(&repository, None).id];
+    let reserve = (0..3)
+        .map(|index| ResourceKey::Device(format!("HUB-MD-{index}")))
+        .collect::<Vec<_>>();
+    let barrier = Arc::new(Barrier::new(2));
+    let threads = owners
+        .into_iter()
+        .enumerate()
+        .map(|(index, owner)| {
+            let repository = repository.clone();
+            let barrier = barrier.clone();
+            let reserve = reserve.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                repository.acquire_claim_preserving_reserve(
+                    owner,
+                    reserve[index].clone(),
+                    &reserve,
+                    2,
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    let results = threads
+        .into_iter()
+        .map(|thread| thread.join().expect("join"))
+        .collect::<Vec<_>>();
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| matches!(
+                result,
+                Err(RepositoryError::ReserveUnavailable { minimum: 2 })
+            ))
+            .count(),
+        1
+    );
+    for (first, second) in [
+        (
+            ResourceKey::Device("FACTORY-A".into()),
+            ResourceKey::Autofactory("FACTORY-A".into()),
+        ),
+        (
+            ResourceKey::Autofactory("FACTORY-B".into()),
+            ResourceKey::Device("FACTORY-B".into()),
+        ),
+        (
+            ResourceKey::Device("CASE-SENSITIVE-ASSET".into()),
+            ResourceKey::Device("case-sensitive-asset".into()),
+        ),
+    ] {
+        repository
+            .acquire_claim(owners[0], first)
+            .expect("physical custody");
+        assert!(matches!(
+            repository.acquire_claim(owners[1], second),
+            Err(RepositoryError::ClaimConflict { .. })
+        ));
+    }
+}
+
+#[test]
 fn creates_reads_and_lists_typed_workflows() {
     let repository = WorkflowRepository::open_in_memory().expect("open repository");
     let parent = create(&repository, None);

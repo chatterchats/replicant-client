@@ -2286,6 +2286,7 @@ async fn establish_initial_mine(
             wait_timeout: config.wait_timeout,
             max_concurrency: mission.max_concurrency,
         },
+        config.mining_claims.clone(),
     )
     .await?;
     Ok(())
@@ -2401,6 +2402,7 @@ async fn expand_mining(
                 wait_timeout: config.wait_timeout,
                 max_concurrency: mission.max_concurrency,
             },
+            config.mining_claims.clone(),
         )
         .await?;
     }

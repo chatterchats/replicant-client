@@ -312,49 +312,284 @@ async fn seed_route(server: &MockServer, client: &Client, adopted_new: bool) {
             "controller_device_code": if code == "BASE" || adopted_new { Some("TC") } else { None }
         })).await;
     }
+    Mock::given(method("GET"))
+        .and(path("/v1/devices"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "devices": (["BASE", "NEW"].iter().map(|code| serde_json::json!({
+                "device_code": code, "device_type": "cargo_freighter",
+                "location": "REMOTE-BELT-1", "status": "idle",
+                "controller_device_code": if *code == "BASE" || adopted_new { Some("TC") } else { None }
+            })).collect::<Vec<_>>()),
+            "next_cursor": null
+        })))
+        .mount(server).await;
+}
+
+#[tokio::test]
+async fn mining_authority_remote_census_discovers_hidden_freighter_before_provisioning() {
+    let server = MockServer::start().await;
+    let client = client_at(&server).await;
+    seed_device(&server, &client, serde_json::json!({
+        "device_code": "TC", "device_type": "ami_transport_controller",
+        "location": "REMOTE-BELT-1", "status": "coordinating",
+        "tags": [replicant_mining_planner::site_tag("REMOTE"), replicant_mining_planner::role_tag("transport-controller")],
+        "ami_directive": {"directive": "ferry", "config": {
+            "collect": "REMOTE-BELT-1", "deliver": "HUB-BELT-1"
+        }},
+        "ami_directive_status": "active",
+        "controlled_devices": [{"device_code": "BASE"}]
+    })).await;
+    let freighters = ["BASE", "HIDDEN"].map(|code| {
+        serde_json::json!({
+            "device_code": code, "device_type": "cargo_freighter",
+            "location": "REMOTE-BELT-1", "status": "idle", "controller_device_code": "TC"
+        })
+    });
+    seed_device(&server, &client, freighters[0].clone()).await;
+    Mock::given(method("GET"))
+        .and(path("/v1/devices/HIDDEN"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(freighters[1].clone()))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/devices"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "devices": freighters, "next_cursor": null
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let repository = Arc::new(WorkflowRepository::open_in_memory().expect("repository"));
+    let mut intent = capacity_intent();
+    intent.target_freighters = 3;
+    let workflow = repository
+        .create(new_mining_transport_capacity_workflow(intent))
+        .expect("capacity");
+    let resumed = resume_once(repository.clone(), client.clone(), workflow.id).await;
+    assert_eq!(resumed.status, WorkflowStatus::Waiting);
+    assert_eq!(repository.list().expect("workflows").len(), 1);
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("requests")
+            .iter()
+            .all(|request| request.method == "GET")
+    );
+    client.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn mining_authority_hub_patrol_health_never_becomes_a_spurious_print_deficit() {
+    for (capacity, expected) in [
+        (None, WorkflowStatus::Waiting),
+        (Some(94.9), WorkflowStatus::Waiting),
+        (Some(95.0), WorkflowStatus::Succeeded),
+    ] {
+        let server = MockServer::start().await;
+        let client = client_at(&server).await;
+        let drones = ["HUB-1", "HUB-2"].map(|code| {
+            serde_json::json!({
+                "device_code": code, "device_type": "maintenance_drone",
+                "location": "HUB-BELT-1", "status": "idle", "operational_capacity": capacity,
+                "tags": [replicant_mining_planner::role_tag(HUB_MAINTENANCE_ROLE)],
+                "ami_directive": {"directive": "patrol"}, "ami_directive_status": "active"
+            })
+        });
+        for drone in &drones {
+            seed_device(&server, &client, drone.clone()).await;
+        }
+        Mock::given(method("GET"))
+            .and(path("/v1/devices"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "devices": drones, "next_cursor": null
+            })))
+            .mount(&server)
+            .await;
+        let repository = Arc::new(WorkflowRepository::open_in_memory().expect("repository"));
+        let workflow = repository
+            .create(new_mining_maintenance_pool_workflow(
+                MiningMaintenancePoolIntent {
+                    region: "alpha".into(),
+                    hub_belt: "HUB-BELT-1".into(),
+                    target_healthy: 2,
+                    reuse_candidates: Vec::new(),
+                },
+            ))
+            .expect("pool");
+        let resumed = resume_once(repository.clone(), client.clone(), workflow.id).await;
+        assert_eq!(resumed.status, expected, "{capacity:?}");
+        assert_eq!(repository.list().expect("workflows").len(), 1);
+        assert!(
+            server
+                .received_requests()
+                .await
+                .expect("requests")
+                .iter()
+                .all(|request| request.method == "GET")
+        );
+        client.close().await.expect("close");
+    }
+}
+
+#[tokio::test]
+async fn mining_rotation_rechecks_wear_and_discovers_dynamic_hub_stock() {
+    for (capacity, stocked, expected_status, needs_child) in [
+        (None, false, WorkflowStatus::Waiting, false),
+        (Some(30.0), false, WorkflowStatus::Succeeded, false),
+        (Some(29.9), false, WorkflowStatus::Waiting, true),
+        (Some(29.9), true, WorkflowStatus::Waiting, true),
+    ] {
+        let server = MockServer::start().await;
+        let client = client_at(&server).await;
+        seed_device(
+            &server,
+            &client,
+            serde_json::json!({
+                "device_code": "WORN", "device_type": "maintenance_drone",
+                "location": "REMOTE-BELT-1", "status": "idle", "operational_capacity": capacity,
+                "ami_directive": {"directive": "patrol"}, "ami_directive_status": "active"
+            }),
+        )
+        .await;
+        let drones = (0..if stocked { 3 } else { 0 })
+            .map(|index| {
+                serde_json::json!({
+                    "device_code": format!("POOL-{index}"), "device_type": "maintenance_drone",
+                    "location": "HUB-BELT-1", "status": "idle", "operational_capacity": 95,
+                    "tags": [replicant_mining_planner::role_tag(HUB_MAINTENANCE_ROLE)],
+                    "ami_directive": {"directive": "patrol"}, "ami_directive_status": "active"
+                })
+            })
+            .collect::<Vec<_>>();
+        for drone in &drones {
+            Mock::given(method("GET"))
+                .and(path(format!(
+                    "/v1/devices/{}",
+                    drone["device_code"].as_str().expect("code")
+                )))
+                .respond_with(ResponseTemplate::new(200).set_body_json(drone))
+                .mount(&server)
+                .await;
+        }
+        Mock::given(method("GET"))
+            .and(path("/v1/devices"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "devices": drones, "next_cursor": null
+            })))
+            .mount(&server)
+            .await;
+        let repository = Arc::new(WorkflowRepository::open_in_memory().expect("repository"));
+        let workflow = repository
+            .create(new_mining_maintenance_rotation_workflow(rotation_intent()))
+            .expect("rotation");
+        let resumed = resume_once(repository.clone(), client.clone(), workflow.id).await;
+        assert_eq!(
+            resumed.status, expected_status,
+            "{capacity:?}, stocked={stocked}"
+        );
+        let children = repository.list_children(workflow.id).expect("children");
+        assert_eq!(children.len(), usize::from(needs_child));
+        if let Some(child) = children.first() {
+            assert_eq!(
+                child.kind,
+                if stocked {
+                    logistics_manifest_workflow_kind()
+                } else {
+                    regional_dispatch_workflow_kind()
+                }
+            );
+            let checkpoint: MiningMaintenanceRotationCheckpoint =
+                resumed.checkpoint().expect("checkpoint");
+            assert_eq!(checkpoint.replacement.is_some(), stocked);
+            if !stocked {
+                assert_eq!(
+                    child
+                        .config::<RegionalDispatchIntent>()
+                        .expect("dispatch")
+                        .devices[0]
+                        .quantity,
+                    1
+                );
+            }
+        }
+        assert!(
+            server
+                .received_requests()
+                .await
+                .expect("requests")
+                .iter()
+                .all(|request| request.method == "GET")
+        );
+        client.close().await.expect("close");
+    }
 }
 
 #[tokio::test]
 async fn mining_restart_after_freighter_delivery_recovers_selected_stock_before_printing() {
-    let server = MockServer::start().await;
-    let client = client_at(&server).await;
-    seed_route(&server, &client, false).await;
-    let repository = Arc::new(WorkflowRepository::open_in_memory().expect("repository"));
-    let mut intent = capacity_intent();
-    intent.target_freighters = 3;
-    let parent = repository
-        .create(new_mining_transport_capacity_workflow(intent.clone()))
-        .expect("capacity");
-    let mut delivery = new_logistics_manifest_workflow(LogisticsManifestIntent {
-        origin: "HUB-BELT-1".into(),
-        destination: "REMOTE-BELT-1".into(),
-        device_codes: vec!["NEW".into()],
-        purpose: format!(
-            "mining-transport-capacity:stage:{}:NEW",
-            mining_transport_capacity_route_key(&intent)
-        ),
-        ..Default::default()
-    });
-    delivery.parent_id = Some(parent.id);
-    let delivered = repository
-        .create(delivery)
-        .expect("delivery before parent checkpoint");
-    let delivered_id = delivered.id;
-    settle_child(&repository, delivered, WorkflowStatus::Succeeded);
-    let resumed = resume_once(repository.clone(), client.clone(), parent.id).await;
-    let checkpoint: MiningTransportCapacityCheckpoint = resumed.checkpoint().expect("checkpoint");
-    assert_eq!(checkpoint.selected_freighters, ["NEW"]);
-    assert_eq!(checkpoint.staging_children.get("NEW"), Some(&delivered_id));
-    let dispatch = repository
-        .read(checkpoint.dispatch_child.expect("remaining deficit"))
-        .expect("read")
-        .expect("dispatch");
-    let config: RegionalDispatchIntent = dispatch.config().expect("dispatch config");
-    assert_eq!(
-        config.devices[0].quantity, 1,
-        "delivered freighter must not be printed again"
-    );
-    client.close().await.expect("close");
+    for arrived in [true, false] {
+        let server = MockServer::start().await;
+        let client = client_at(&server).await;
+        seed_route(&server, &client, false).await;
+        if !arrived {
+            // The collection projection says arrived; the exact device read disagrees.
+            Mock::given(method("GET"))
+                .and(path("/v1/devices/NEW"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "device_code": "NEW", "device_type": "cargo_freighter",
+                    "location": "HUB-BELT-1", "status": "idle"
+                })))
+                .with_priority(1)
+                .mount(&server)
+                .await;
+        }
+        let repository = Arc::new(WorkflowRepository::open_in_memory().expect("repository"));
+        let mut intent = capacity_intent();
+        intent.target_freighters = 3;
+        let parent = repository
+            .create(new_mining_transport_capacity_workflow(intent.clone()))
+            .expect("capacity");
+        let mut delivery = new_logistics_manifest_workflow(LogisticsManifestIntent {
+            origin: "HUB-BELT-1".into(),
+            destination: "REMOTE-BELT-1".into(),
+            device_codes: vec!["NEW".into()],
+            purpose: format!(
+                "mining-transport-capacity:stage:{}:NEW",
+                mining_transport_capacity_route_key(&intent)
+            ),
+            ..Default::default()
+        });
+        delivery.parent_id = Some(parent.id);
+        let delivered = repository
+            .create(delivery)
+            .expect("delivery before parent checkpoint");
+        let delivered_id = delivered.id;
+        settle_child(&repository, delivered, WorkflowStatus::Succeeded);
+        let resumed = resume_once(repository.clone(), client.clone(), parent.id).await;
+        let checkpoint: MiningTransportCapacityCheckpoint =
+            resumed.checkpoint().expect("checkpoint");
+        assert_eq!(checkpoint.selected_freighters, ["NEW"]);
+        assert_eq!(checkpoint.staging_children.get("NEW"), Some(&delivered_id));
+        if arrived {
+            let dispatch = repository
+                .read(checkpoint.dispatch_child.expect("remaining deficit"))
+                .expect("read")
+                .expect("dispatch");
+            let config: RegionalDispatchIntent = dispatch.config().expect("dispatch config");
+            assert_eq!(
+                config.devices[0].quantity, 1,
+                "delivered freighter must not be printed again"
+            );
+        } else {
+            assert_eq!(resumed.status, WorkflowStatus::Waiting);
+            assert!(checkpoint.dispatch_child.is_none());
+            assert_eq!(
+                repository.list_children(parent.id).expect("children").len(),
+                1
+            );
+        }
+        client.close().await.expect("close");
+    }
 }
 
 #[tokio::test]
@@ -473,5 +708,84 @@ async fn mining_restart_print_with_lost_operation_callback_submits_only_once() {
         }
     }
     server.verify().await;
+    client.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn mining_pool_reuses_stock_after_claim_conflicts() {
+    let server = MockServer::start().await;
+    let client = client_at(&server).await;
+    let idle = |code: &str| {
+        serde_json::json!({
+            "device_code": code, "device_type": "maintenance_drone",
+            "location": "HUB-BELT-1", "status": "idle", "operational_capacity": 100,
+            "tags": [replicant_mining_planner::role_tag(HUB_MAINTENANCE_ROLE)]
+        })
+    };
+    for code in ["POOL-A", "POOL-B"] {
+        Mock::given(method("GET"))
+            .and(path(format!("/v1/devices/{code}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(idle(code)))
+            .mount(&server)
+            .await;
+    }
+    Mock::given(method("GET"))
+        .and(path("/v1/devices/POOL-C"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(idle("POOL-C")))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    let mut patrolling = idle("POOL-C");
+    patrolling["ami_directive"] = serde_json::json!({"directive": "patrol"});
+    patrolling["ami_directive_status"] = serde_json::json!("active");
+    Mock::given(method("GET"))
+        .and(path("/v1/devices/POOL-C"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(patrolling))
+        .with_priority(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/devices"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "devices": [idle("POOL-A"), idle("POOL-B"), idle("POOL-C")], "next_cursor": null
+        })))
+        .mount(&server)
+        .await;
+    let repository = Arc::new(WorkflowRepository::open_in_memory().expect("repository"));
+    let holder = repository
+        .create(new_mining_transport_capacity_workflow(capacity_intent()))
+        .expect("holder");
+    let holder_id = holder.id;
+    settle_child(&repository, holder, WorkflowStatus::Paused);
+    for code in ["POOL-A", "POOL-B"] {
+        repository
+            .acquire_claim(holder_id, ResourceKey::Device(code.into()))
+            .expect("foreign custody");
+    }
+    let pool = repository
+        .create(new_mining_maintenance_pool_workflow(
+            MiningMaintenancePoolIntent {
+                region: "alpha".into(),
+                hub_belt: "HUB-BELT-1".into(),
+                target_healthy: 2,
+                reuse_candidates: vec!["POOL-A".into(), "POOL-B".into(), "POOL-C".into()],
+            },
+        ))
+        .expect("pool");
+    let resumed = resume_once(repository.clone(), client.clone(), pool.id).await;
+    let checkpoint: MiningMaintenancePoolCheckpoint = resumed.checkpoint().expect("checkpoint");
+    let provision = repository
+        .read(checkpoint.provision_child.expect("one remaining deficit"))
+        .expect("read")
+        .expect("provisioning");
+    assert_eq!(
+        provision
+            .config::<RegionalDispatchIntent>()
+            .expect("dispatch")
+            .devices[0]
+            .quantity,
+        1
+    );
     client.close().await.expect("close");
 }

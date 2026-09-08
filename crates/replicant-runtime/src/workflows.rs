@@ -395,10 +395,10 @@ pub(crate) trait MiningItemExecutor: Send + Sync {
         &'a self,
         client: &'a replicant_client::Client,
         mission: &'a MiningMission,
-        item_type: &'a str,
-        index: usize,
+        item: (&'a str, usize),
         allocations: &'a AllocationSet,
         wait_timeout: Duration,
+        claims: crate::mining::MiningWorkflowClaims,
     ) -> MiningItemFuture<'a>;
 }
 
@@ -415,10 +415,10 @@ impl MiningItemExecutor for ManagedMiningItemExecutor {
         &'a self,
         client: &'a replicant_client::Client,
         mission: &'a MiningMission,
-        item_type: &'a str,
-        index: usize,
+        (item_type, index): (&'a str, usize),
         allocations: &'a AllocationSet,
         wait_timeout: Duration,
+        claims: crate::mining::MiningWorkflowClaims,
     ) -> MiningItemFuture<'a> {
         Box::pin(execute_mining_item(
             client,
@@ -427,6 +427,7 @@ impl MiningItemExecutor for ManagedMiningItemExecutor {
             index,
             allocations,
             wait_timeout,
+            claims,
         ))
     }
 }
@@ -1212,10 +1213,13 @@ async fn run_mining_item(
             .execute(
                 &client,
                 &mission,
-                &item_type,
-                index,
+                (&item_type, index),
                 &allocations,
                 wait_timeout,
+                crate::mining::MiningWorkflowClaims {
+                    repository: repository.clone(),
+                    workflow_id: item.spec.workflow_id,
+                },
             )
             .await
         {
@@ -4732,10 +4736,10 @@ mod tests {
             &'a self,
             _client: &'a replicant_client::Client,
             mission: &'a MiningMission,
-            item_type: &'a str,
-            index: usize,
+            (item_type, index): (&'a str, usize),
             allocations: &'a AllocationSet,
             _wait_timeout: Duration,
+            _claims: crate::mining::MiningWorkflowClaims,
         ) -> MiningItemFuture<'a> {
             let mut lane = mission.clone();
             let item_type = item_type.to_owned();

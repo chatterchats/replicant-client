@@ -1,4 +1,7 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use replicant_client::{
     Client, ManagedStateSnapshot,
@@ -64,6 +67,16 @@ impl ResourceBroker {
         let observed_at_ms = unix_millis();
         let hosted_capabilities = hosted_device_capabilities(&devices);
         let catalogue = client.galaxy().catalogue();
+        let claimed_devices = self
+            .repository
+            .device_claims()?
+            .into_iter()
+            .chain(self.repository.autofactory_claims()?)
+            .filter_map(|claim| match claim.resource {
+                ResourceKey::Device(code) | ResourceKey::Autofactory(code) => Some(code),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
         let mut candidates = Vec::new();
         for replicant in owned_replicants {
             let vessel = operational_vessel_for(&replicant, &devices);
@@ -91,6 +104,14 @@ impl ResourceBroker {
         }
         for device in devices {
             let device_code = device.key.id.to_string();
+            // Print outputs are tagged before they are discovered by the owner.
+            // Keep them out of every pool until durable custody exists; once
+            // claimed, the allocation transaction admits only that owner.
+            if replicant_protocol::workflow_reserved(&device.tags)
+                && !claimed_devices.contains(&device_code)
+            {
+                continue;
+            }
             let mut capabilities = json_string_values(&device.features);
             if let Some(device_type) = &device.device_type {
                 capabilities.extend(json_string_values(std::slice::from_ref(device_type)));

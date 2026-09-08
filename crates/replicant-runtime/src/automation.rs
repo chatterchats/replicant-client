@@ -68,9 +68,8 @@ use crate::{
     mining::{
         AmiTransportRouteIntent, EvidenceState, HUB_MAINTENANCE_MIN_HEALTHY,
         HUB_MAINTENANCE_READY_PCT, HUB_MAINTENANCE_ROLE, MAX_TRANSPORT_FREIGHTERS,
-        MIN_TRANSPORT_FREIGHTERS, MaintenanceHubPoolAudit, MiningExpansionRequest, MiningMission,
-        execute_expansion, maintenance_hub_pool_audit, maintenance_replacement_ready,
-        transport_service_present,
+        MIN_TRANSPORT_FREIGHTERS, MiningExpansionRequest, MiningMission, execute_expansion,
+        maintenance_hub_pool_audit, maintenance_replacement_ready, transport_service_present,
     },
     observatory::auto_prospect,
     relay::{
@@ -5138,7 +5137,14 @@ impl WorkflowExecutor for MiningDeployWorkflow {
                 wait_timeout: Duration::from_secs(DEFAULT_WAIT_SECONDS),
                 max_concurrency: 1,
             };
-            let execution = execute_expansion(&client, &request);
+            let execution = execute_expansion(
+                &client,
+                &request,
+                Some(crate::mining::MiningWorkflowClaims {
+                    repository: context.repository_handle(),
+                    workflow_id: context.id(),
+                }),
+            );
             tokio::pin!(execution);
             let mut checkpoint_interval = tokio::time::interval(Duration::from_secs(2));
             let result = loop {
@@ -5866,6 +5872,26 @@ fn mining_transport_child_pending(
     }
 }
 
+fn mining_payload_child_pending(
+    context: &WorkflowContext,
+    child_id: WorkflowId,
+    code: &str,
+    label: &str,
+) -> Result<bool, String> {
+    let pending = mining_transport_child_pending(context, child_id, label)?;
+    if pending {
+        context
+            .repository()
+            .transfer_claims(
+                context.id(),
+                child_id,
+                &[ResourceKey::Device(code.to_owned())],
+            )
+            .map_err(string_error)?;
+    }
+    Ok(pending)
+}
+
 fn recover_mining_transport_capacity_children(
     context: &WorkflowContext,
     intent: &MiningTransportCapacityIntent,
@@ -5993,7 +6019,7 @@ async fn finish_mining_transport_scale_down(
         .clone()
         .ok_or_else(|| "capacity checkpoint lost its released freighter".to_owned())?;
     if let Some(child_id) = checkpoint.return_child {
-        if mining_transport_child_pending(context, child_id, "capacity return")? {
+        if mining_payload_child_pending(context, child_id, &code, "capacity return")? {
             context
                 .advance_to("returning_released_capacity", checkpoint)
                 .map_err(string_error)?;
@@ -6049,24 +6075,24 @@ async fn finish_mining_transport_scale_down(
         context.mark_waiting().map_err(string_error)?;
         return Ok(());
     }
-    context
-        .release_claim(&ResourceKey::Device(code.clone()))
-        .map_err(string_error)?;
     let child = context
-        .create_child(new_logistics_manifest_workflow(LogisticsManifestIntent {
-            origin,
-            destination: intent.deliver.clone(),
-            device_codes: vec![code.clone()],
-            return_transports: true,
-            allow_transport_staging: true,
-            region: Some(canonical_region(&intent.region)),
-            purpose: format!(
-                "mining-transport-capacity:return:{}:{}",
-                mining_transport_capacity_route_key(intent),
-                code
-            ),
-            ..LogisticsManifestIntent::default()
-        }))
+        .create_child_with_claims(
+            new_logistics_manifest_workflow(LogisticsManifestIntent {
+                origin,
+                destination: intent.deliver.clone(),
+                device_codes: vec![code.clone()],
+                return_transports: true,
+                allow_transport_staging: true,
+                region: Some(canonical_region(&intent.region)),
+                purpose: format!(
+                    "mining-transport-capacity:return:{}:{}",
+                    mining_transport_capacity_route_key(intent),
+                    code
+                ),
+                ..LogisticsManifestIntent::default()
+            }),
+            &[ResourceKey::Device(code.clone())],
+        )
         .map_err(string_error)?;
     checkpoint.return_child = Some(child.id);
     context
@@ -6076,6 +6102,41 @@ async fn finish_mining_transport_scale_down(
         .advance_to("returning_released_capacity", checkpoint)
         .map_err(string_error)?;
     context.mark_waiting().map_err(string_error)
+}
+
+async fn refresh_mining_route_devices(client: &Client, controller: &str) -> Result<(), String> {
+    let state = client
+        .devices()
+        .refresh(controller)
+        .await
+        .map_err(string_error)?
+        .snapshot()
+        .await
+        .map_err(string_error)?;
+    let mut children = state
+        .relationships
+        .controlled_devices
+        .iter()
+        .map(|child| child.id.as_str().to_owned())
+        .collect::<BTreeSet<_>>();
+    for device in dispatch_owned_device_snapshots(client).await? {
+        if device
+            .relationships
+            .controller
+            .as_ref()
+            .is_some_and(|owner| owner.id.as_str().eq_ignore_ascii_case(controller))
+        {
+            children.insert(device.key.id.as_str().to_owned());
+        }
+    }
+    for child in children {
+        client
+            .devices()
+            .refresh(&child)
+            .await
+            .map_err(string_error)?;
+    }
+    Ok(())
 }
 
 struct MiningTransportCapacityWorkflow;
@@ -6102,6 +6163,7 @@ impl WorkflowExecutor for MiningTransportCapacityWorkflow {
                 "mining-transport-route",
                 &mining_transport_capacity_route_key(&intent),
             )?;
+            claim_device(context, &intent.controller)?;
             let client = managed_client(context)?;
             let mut checkpoint: MiningTransportCapacityCheckpoint =
                 context.checkpoint().map_err(string_error)?;
@@ -6120,6 +6182,16 @@ impl WorkflowExecutor for MiningTransportCapacityWorkflow {
                 )
                 .await;
             }
+            // A detail response can omit a child. Traverse only the freighter
+            // domain before trusting the controller's count; never require full_rest.
+            client
+                .devices()
+                .refresh_many()
+                .of_type(DeviceType::CargoFreighter)
+                .collect()
+                .await
+                .map_err(string_error)?;
+            refresh_mining_route_devices(&client, &intent.controller).await?;
 
             let devices = dispatch_owned_device_snapshots(&client).await?;
             let audit = transport_service_present(
@@ -6224,6 +6296,9 @@ impl WorkflowExecutor for MiningTransportCapacityWorkflow {
             let mut needed = intent.target_freighters.saturating_sub(current);
 
             for code in &intent.reuse_candidates {
+                if checkpoint.dispatch_child.is_some() {
+                    break;
+                }
                 if checkpoint.selected_freighters.len() >= needed {
                     break;
                 }
@@ -6237,6 +6312,9 @@ impl WorkflowExecutor for MiningTransportCapacityWorkflow {
                     continue;
                 };
                 if !mining_transport_candidate_is_safe(candidate, &intent.system) {
+                    continue;
+                }
+                if !try_claim_available(context, ResourceKey::Device(code.clone()))? {
                     continue;
                 }
                 checkpoint
@@ -6255,20 +6333,23 @@ impl WorkflowExecutor for MiningTransportCapacityWorkflow {
                     && !checkpoint.staging_children.contains_key(&candidate_code)
                 {
                     let child = context
-                        .create_child(new_logistics_manifest_workflow(LogisticsManifestIntent {
-                            origin,
-                            destination: controller_location.clone(),
-                            device_codes: vec![candidate_code.clone()],
-                            return_transports: true,
-                            allow_transport_staging: true,
-                            region: Some(canonical_region(&intent.region)),
-                            purpose: format!(
-                                "mining-transport-capacity:stage:{}:{}",
-                                mining_transport_capacity_route_key(&intent),
-                                candidate_code
-                            ),
-                            ..LogisticsManifestIntent::default()
-                        }))
+                        .create_child_with_claims(
+                            new_logistics_manifest_workflow(LogisticsManifestIntent {
+                                origin,
+                                destination: controller_location.clone(),
+                                device_codes: vec![candidate_code.clone()],
+                                return_transports: true,
+                                allow_transport_staging: true,
+                                region: Some(canonical_region(&intent.region)),
+                                purpose: format!(
+                                    "mining-transport-capacity:stage:{}:{}",
+                                    mining_transport_capacity_route_key(&intent),
+                                    candidate_code
+                                ),
+                                ..LogisticsManifestIntent::default()
+                            }),
+                            &[ResourceKey::Device(candidate_code.clone())],
+                        )
                         .map_err(string_error)?;
                     checkpoint.staging_children.insert(candidate_code, child.id);
                 }
@@ -6280,9 +6361,9 @@ impl WorkflowExecutor for MiningTransportCapacityWorkflow {
                 .map_err(string_error)?;
 
             let mut staging_pending = false;
-            for child_id in checkpoint.staging_children.values().copied() {
+            for (code, child_id) in &checkpoint.staging_children {
                 staging_pending |=
-                    mining_transport_child_pending(context, child_id, "capacity staging")?;
+                    mining_payload_child_pending(context, *child_id, code, "capacity staging")?;
             }
             if staging_pending {
                 context
@@ -6316,6 +6397,9 @@ impl WorkflowExecutor for MiningTransportCapacityWorkflow {
                     .map_err(string_error)?;
             }
 
+            for code in &checkpoint.selected_freighters {
+                client.devices().refresh(code).await.map_err(string_error)?;
+            }
             let staged_devices = dispatch_owned_device_snapshots(&client).await?;
             let staged_audit = transport_service_present(
                 &staged_devices,
@@ -6361,6 +6445,20 @@ impl WorkflowExecutor for MiningTransportCapacityWorkflow {
                         })
                 })
                 .count();
+            let expected_staged = checkpoint
+                .selected_freighters
+                .iter()
+                .filter(|code| !staged_audit.adopted_freighters.contains(code))
+                .count();
+            if staged_available < expected_staged {
+                // A successful child is not proof that its exact payload arrived.
+                // Keep its custody instead of interpreting stale placement as a print deficit.
+                context
+                    .advance_to("waiting_for_staged_capacity_arrival", &checkpoint)
+                    .map_err(string_error)?;
+                context.mark_waiting().map_err(string_error)?;
+                return Ok(());
+            }
             needed = mining_transport_remaining_deficit(
                 intent.target_freighters,
                 current,
@@ -6421,6 +6519,10 @@ impl WorkflowExecutor for MiningTransportCapacityWorkflow {
                 }
             }
 
+            refresh_mining_route_devices(&client, &intent.controller).await?;
+            for code in &checkpoint.selected_freighters {
+                client.devices().refresh(code).await.map_err(string_error)?;
+            }
             let refreshed = dispatch_owned_device_snapshots(&client).await?;
             let final_audit = transport_service_present(
                 &refreshed,
@@ -6660,7 +6762,8 @@ async fn reconcile_maintenance_tags(
 }
 
 fn mining_device_delivered(device: &Device, destination: &str) -> bool {
-    device_at(device, destination)
+    device.access == AccessScope::Owned
+        && device_at(device, destination)
         && device.travel.is_none()
         && device.relationships.attached_to.is_none()
         && device.relationships.stowed_in.is_none()
@@ -6672,9 +6775,13 @@ async fn ensure_maintenance_patrol(
     code: &str,
     expected_location: &str,
 ) -> Result<bool, String> {
-    let handle = client.devices().get(code).await.map_err(string_error)?;
+    let handle = client.devices().refresh(code).await.map_err(string_error)?;
     let snapshot = handle.snapshot().await.map_err(string_error)?;
-    if !mining_device_delivered(&snapshot, expected_location) {
+    if !mining_device_delivered(&snapshot, expected_location)
+        || snapshot.status.is_none()
+        || snapshot.relationships.controller.is_some()
+        || crate::mining::site_directive_evidence(&snapshot, "patrol") == EvidenceState::Unknown
+    {
         return Ok(false);
     }
     if maintenance_has_directive(&snapshot, "patrol")
@@ -6700,7 +6807,13 @@ async fn ensure_maintenance_patrol(
         .await
         .map_err(string_error)?;
     await_success(&operation).await?;
-    let refreshed = handle.snapshot().await.map_err(string_error)?;
+    let refreshed = handle
+        .refresh()
+        .await
+        .map_err(string_error)?
+        .snapshot()
+        .await
+        .map_err(string_error)?;
     Ok(mining_device_delivered(&refreshed, expected_location)
         && maintenance_has_directive(&refreshed, "patrol")
         && refreshed
@@ -6796,9 +6909,9 @@ fn maintenance_workflow_child_pending(
     mining_transport_child_pending(context, child_id, label)
 }
 
-fn maintenance_hub_available_healthy_count(
+fn maintenance_hub_available_count(
     context: &WorkflowContext,
-    audit: &MaintenanceHubPoolAudit,
+    codes: &[String],
 ) -> Result<usize, String> {
     let claimed_elsewhere = context
         .repository()
@@ -6811,8 +6924,7 @@ fn maintenance_hub_available_healthy_count(
             _ => None,
         })
         .collect::<BTreeSet<_>>();
-    Ok(audit
-        .healthy_patrol
+    Ok(codes
         .iter()
         .filter(|code| !claimed_elsewhere.contains(&code.to_ascii_uppercase()))
         .count())
@@ -6844,7 +6956,12 @@ async fn select_rotation_replacement(
         .iter()
         .filter(|code| !claimed_elsewhere.contains(&code.to_ascii_uppercase()))
         .count();
-    for code in &intent.replacement_candidates {
+    for code in intent
+        .replacement_candidates
+        .iter()
+        .chain(hub_pool.healthy_patrol.iter())
+        .chain(hub_pool.configurable_ready.iter())
+    {
         if code.eq_ignore_ascii_case(&intent.worn_drone) {
             continue;
         }
@@ -6854,9 +6971,30 @@ async fn select_rotation_replacement(
         else {
             continue;
         };
-        let safe = maintenance_hub_replacement_candidate(device, intent, available_hub_healthy)
-            || maintenance_idle_replacement_candidate(device);
-        if !safe || !try_claim_available(context, ResourceKey::Device(code.clone()))? {
+        let from_hub = maintenance_hub_replacement_candidate(device, intent, available_hub_healthy);
+        if from_hub {
+            let reserve = hub_pool
+                .healthy_patrol
+                .iter()
+                .cloned()
+                .map(ResourceKey::Device)
+                .collect::<Vec<_>>();
+            match context.repository().acquire_claim_preserving_reserve(
+                context.id(),
+                ResourceKey::Device(code.clone()),
+                &reserve,
+                HUB_MAINTENANCE_MIN_HEALTHY,
+            ) {
+                Ok(_) => {}
+                Err(
+                    RepositoryError::ClaimConflict { .. }
+                    | RepositoryError::ReserveUnavailable { .. },
+                ) => continue,
+                Err(error) => return Err(string_error(error)),
+            }
+        } else if !maintenance_idle_replacement_candidate(device)
+            || !try_claim_available(context, ResourceKey::Device(code.clone()))?
+        {
             continue;
         }
         checkpoint.replacement = Some(code.clone());
@@ -6996,6 +7134,25 @@ async fn deliver_rotation_replacement(
         .replacement
         .clone()
         .ok_or_else(|| "maintenance rotation lost its replacement identity".to_owned())?;
+    if let Some(child_id) = checkpoint.delivery_child
+        && mining_payload_child_pending(
+            context,
+            child_id,
+            &code,
+            "maintenance replacement delivery",
+        )?
+    {
+        context
+            .advance_to("delivering_replacement", checkpoint)
+            .map_err(string_error)?;
+        context.mark_waiting().map_err(string_error)?;
+        return Ok(false);
+    }
+    client
+        .devices()
+        .refresh(&code)
+        .await
+        .map_err(string_error)?;
     let devices = dispatch_owned_device_snapshots(client).await?;
     if devices
         .iter()
@@ -7009,21 +7166,7 @@ async fn deliver_rotation_replacement(
         claim_device(context, &code)?;
         return Ok(true);
     }
-    if let Some(child_id) = checkpoint.delivery_child {
-        context
-            .release_claim(&ResourceKey::Device(code.clone()))
-            .map_err(string_error)?;
-        if maintenance_workflow_child_pending(
-            context,
-            child_id,
-            "maintenance replacement delivery",
-        )? {
-            context
-                .advance_to("delivering_replacement", checkpoint)
-                .map_err(string_error)?;
-            context.mark_waiting().map_err(string_error)?;
-            return Ok(false);
-        }
+    if checkpoint.delivery_child.is_some() {
         context
             .advance_to("verifying_replacement_delivery", checkpoint)
             .map_err(string_error)?;
@@ -7034,22 +7177,64 @@ async fn deliver_rotation_replacement(
         .iter()
         .find(|device| device.key.id.as_str().eq_ignore_ascii_case(&code))
         .ok_or_else(|| format!("selected maintenance replacement {code} is no longer owned"))?;
+    if !maintenance_replacement_ready(replacement) {
+        context
+            .advance_to("waiting_for_replacement_readiness", checkpoint)
+            .map_err(string_error)?;
+        context.mark_waiting().map_err(string_error)?;
+        return Ok(false);
+    }
+    if device_at(replacement, &intent.hub_belt) && maintenance_has_directive(replacement, "patrol")
+    {
+        for device in devices.iter().filter(|device| {
+            device_at(device, &intent.hub_belt)
+                && device_is_type(device, replicant_mining_planner::MAINTENANCE_DRONE)
+        }) {
+            client
+                .devices()
+                .refresh(device.key.id.as_str())
+                .await
+                .map_err(string_error)?;
+        }
+        let fresh = dispatch_owned_device_snapshots(client).await?;
+        let pool = maintenance_hub_pool_audit(&fresh, &intent.hub_belt);
+        let reserve = pool
+            .healthy_patrol
+            .iter()
+            .cloned()
+            .map(ResourceKey::Device)
+            .collect::<Vec<_>>();
+        match context.repository().acquire_claim_preserving_reserve(
+            context.id(),
+            ResourceKey::Device(code.clone()),
+            &reserve,
+            HUB_MAINTENANCE_MIN_HEALTHY,
+        ) {
+            Ok(_) => {}
+            Err(RepositoryError::ReserveUnavailable { .. }) => {
+                context
+                    .advance_to("waiting_for_healthy_hub_reserve", checkpoint)
+                    .map_err(string_error)?;
+                context.mark_waiting().map_err(string_error)?;
+                return Ok(false);
+            }
+            Err(error) => return Err(string_error(error)),
+        }
+    }
     let origin = replacement
         .location
         .as_ref()
         .map(|location| location.id.as_str().to_owned())
         .ok_or_else(|| format!("selected maintenance replacement {code} has no location"))?;
     let child = context
-        .create_child(new_logistics_manifest_workflow(
-            maintenance_delivery_manifest(intent, &code, origin),
-        ))
+        .create_child_with_claims(
+            new_logistics_manifest_workflow(maintenance_delivery_manifest(intent, &code, origin)),
+            &[ResourceKey::Device(code.clone())],
+        )
         .map_err(string_error)?;
     checkpoint.delivery_child = Some(child.id);
     context
         .persist_checkpoint(checkpoint)
-        .map_err(string_error)?;
-    context
-        .release_claim(&ResourceKey::Device(code))
         .map_err(string_error)?;
     context
         .advance_to("delivering_replacement", checkpoint)
@@ -7116,6 +7301,50 @@ async fn recover_worn_maintenance(
     if !maintenance_rotation_recovery_allowed(checkpoint) {
         return Ok(false);
     }
+    if let Some(child_id) = checkpoint.recovery_child
+        && mining_payload_child_pending(
+            context,
+            child_id,
+            &intent.worn_drone,
+            "worn maintenance recovery",
+        )?
+    {
+        context
+            .advance_to("recovering_worn_drone", checkpoint)
+            .map_err(string_error)?;
+        context.mark_waiting().map_err(string_error)?;
+        return Ok(false);
+    }
+    if checkpoint.recovery_child.is_none() {
+        let replacement = checkpoint
+            .replacement
+            .as_deref()
+            .ok_or_else(|| "maintenance rotation lost its replacement identity".to_owned())?;
+        claim_device(context, replacement)?;
+        if !ensure_maintenance_patrol(context, client, replacement, &intent.site_belt).await? {
+            checkpoint.replacement_patrol_verified = false;
+            context
+                .advance_to("waiting_for_replacement_patrol", checkpoint)
+                .map_err(string_error)?;
+            context.mark_waiting().map_err(string_error)?;
+            return Ok(false);
+        }
+        let ready = client
+            .devices()
+            .get(replacement)
+            .await
+            .map_err(string_error)?
+            .snapshot()
+            .await
+            .map_err(string_error)?;
+        if !maintenance_replacement_ready(&ready) {
+            context
+                .advance_to("waiting_for_replacement_readiness", checkpoint)
+                .map_err(string_error)?;
+            context.mark_waiting().map_err(string_error)?;
+            return Ok(false);
+        }
+    }
     let devices = dispatch_owned_device_snapshots(client).await?;
     let Some(worn) = devices.iter().find(|device| {
         device
@@ -7146,9 +7375,6 @@ async fn recover_worn_maintenance(
         return Ok(true);
     }
     if let Some(child_id) = checkpoint.recovery_child {
-        context
-            .release_claim(&ResourceKey::Device(intent.worn_drone.clone()))
-            .map_err(string_error)?;
         if maintenance_workflow_child_pending(context, child_id, "worn maintenance recovery")? {
             context
                 .advance_to("recovering_worn_drone", checkpoint)
@@ -7173,16 +7399,14 @@ async fn recover_worn_maintenance(
             )
         })?;
     let child = context
-        .create_child(new_logistics_manifest_workflow(
-            maintenance_recovery_manifest(intent, origin),
-        ))
+        .create_child_with_claims(
+            new_logistics_manifest_workflow(maintenance_recovery_manifest(intent, origin)),
+            &[ResourceKey::Device(intent.worn_drone.clone())],
+        )
         .map_err(string_error)?;
     checkpoint.recovery_child = Some(child.id);
     context
         .persist_checkpoint(checkpoint)
-        .map_err(string_error)?;
-    context
-        .release_claim(&ResourceKey::Device(intent.worn_drone.clone()))
         .map_err(string_error)?;
     context
         .advance_to("recovering_worn_drone", checkpoint)
@@ -7325,6 +7549,61 @@ impl WorkflowExecutor for MiningMaintenanceRotationWorkflow {
             {
                 claim_device(context, &intent.worn_drone)?;
             }
+            let starting_rotation =
+                checkpoint.replacement.is_none() && checkpoint.provision_child.is_none();
+            if starting_rotation {
+                let worn = client
+                    .devices()
+                    .refresh(&intent.worn_drone)
+                    .await
+                    .map_err(string_error)?
+                    .snapshot()
+                    .await
+                    .map_err(string_error)?;
+                if worn.operational_capacity.is_none() {
+                    context
+                        .advance_to("waiting_for_worn_capacity_evidence", &checkpoint)
+                        .map_err(string_error)?;
+                    context.mark_waiting().map_err(string_error)?;
+                    return Ok(());
+                }
+                if !crate::mining::maintenance_rotation_due(&worn) {
+                    return context
+                        .mark_succeeded(Some(serde_json::json!({
+                            "worn_drone": intent.worn_drone, "rotation_required": false,
+                        })))
+                        .map_err(string_error);
+                }
+                client
+                    .devices()
+                    .refresh_many()
+                    .of_type(DeviceType::MaintenanceDrone)
+                    .at(&intent.hub_belt)
+                    .collect()
+                    .await
+                    .map_err(string_error)?;
+            }
+            let observed = dispatch_owned_device_snapshots(&client).await?;
+            for device in observed.iter().filter(|device| {
+                (!starting_rotation
+                    && device
+                        .key
+                        .id
+                        .as_str()
+                        .eq_ignore_ascii_case(&intent.worn_drone))
+                    || intent
+                        .replacement_candidates
+                        .iter()
+                        .any(|code| code.eq_ignore_ascii_case(device.key.id.as_str()))
+                    || (device_at(device, &intent.hub_belt)
+                        && device_is_type(device, replicant_mining_planner::MAINTENANCE_DRONE))
+            }) {
+                client
+                    .devices()
+                    .refresh(device.key.id.as_str())
+                    .await
+                    .map_err(string_error)?;
+            }
             let devices = dispatch_owned_device_snapshots(&client).await?;
             if checkpoint.replacement.is_none()
                 && (checkpoint.provision_child.is_some()
@@ -7398,10 +7677,35 @@ impl WorkflowExecutor for MiningMaintenancePoolWorkflow {
                     .persist_checkpoint(&checkpoint)
                     .map_err(string_error)?;
             }
+            if let Some(child_id) = checkpoint.provision_child
+                && maintenance_workflow_child_pending(
+                    context,
+                    child_id,
+                    "maintenance pool provisioning",
+                )?
+            {
+                context
+                    .advance_to("provisioning_hub_pool", &checkpoint)
+                    .map_err(string_error)?;
+                context.mark_waiting().map_err(string_error)?;
+                return Ok(());
+            }
+            for handle in client
+                .devices()
+                .refresh_many()
+                .of_type(DeviceType::MaintenanceDrone)
+                .at(&intent.hub_belt)
+                .collect()
+                .await
+                .map_err(string_error)?
+            {
+                handle.refresh().await.map_err(string_error)?;
+            }
 
             let mut devices = dispatch_owned_device_snapshots(&client).await?;
             let mut audit = maintenance_hub_pool_audit(&devices, &intent.hub_belt);
-            let mut available_healthy = maintenance_hub_available_healthy_count(context, &audit)?;
+            let mut available_healthy =
+                maintenance_hub_available_count(context, &audit.healthy_patrol)?;
             if available_healthy >= intent.target_healthy {
                 return context
                     .mark_succeeded(Some(serde_json::json!({
@@ -7411,6 +7715,13 @@ impl WorkflowExecutor for MiningMaintenancePoolWorkflow {
                         "decommissioned": false,
                     })))
                     .map_err(string_error);
+            }
+            if !audit.unknown_patrol.is_empty() {
+                context
+                    .advance_to("waiting_for_hub_pool_evidence", &checkpoint)
+                    .map_err(string_error)?;
+                context.mark_waiting().map_err(string_error)?;
+                return Ok(());
             }
 
             let deficit = intent.target_healthy.saturating_sub(available_healthy);
@@ -7422,7 +7733,11 @@ impl WorkflowExecutor for MiningMaintenancePoolWorkflow {
                 .collect::<Vec<_>>();
             candidates.sort();
             candidates.dedup();
-            for code in candidates.into_iter().take(deficit) {
+            let mut configured = 0;
+            for code in candidates {
+                if checkpoint.provision_child.is_some() || configured >= deficit {
+                    break;
+                }
                 let Some(device) = devices
                     .iter()
                     .find(|device| device.key.id.as_str().eq_ignore_ascii_case(&code))
@@ -7450,11 +7765,12 @@ impl WorkflowExecutor for MiningMaintenancePoolWorkflow {
                     context.mark_waiting().map_err(string_error)?;
                     return Ok(());
                 }
+                configured += 1;
             }
 
             devices = dispatch_owned_device_snapshots(&client).await?;
             audit = maintenance_hub_pool_audit(&devices, &intent.hub_belt);
-            available_healthy = maintenance_hub_available_healthy_count(context, &audit)?;
+            available_healthy = maintenance_hub_available_count(context, &audit.healthy_patrol)?;
             if available_healthy >= intent.target_healthy {
                 return context
                     .mark_succeeded(Some(serde_json::json!({
@@ -7519,7 +7835,7 @@ impl WorkflowExecutor for MiningMaintenancePoolWorkflow {
                 let refreshed = dispatch_owned_device_snapshots(&client).await?;
                 let refreshed_audit = maintenance_hub_pool_audit(&refreshed, &intent.hub_belt);
                 let refreshed_available =
-                    maintenance_hub_available_healthy_count(context, &refreshed_audit)?;
+                    maintenance_hub_available_count(context, &refreshed_audit.healthy_patrol)?;
                 if refreshed_available >= intent.target_healthy {
                     return context
                         .mark_succeeded(Some(serde_json::json!({
@@ -7536,8 +7852,19 @@ impl WorkflowExecutor for MiningMaintenancePoolWorkflow {
                 context.mark_waiting().map_err(string_error)?;
                 return Ok(());
             }
+            let working_patrol = available_healthy.saturating_add(maintenance_hub_available_count(
+                context,
+                &audit.repairing_patrol,
+            )?);
+            if working_patrol >= intent.target_healthy {
+                context
+                    .advance_to("waiting_for_hub_pool_health", &checkpoint)
+                    .map_err(string_error)?;
+                context.mark_waiting().map_err(string_error)?;
+                return Ok(());
+            }
 
-            let needed = intent.target_healthy.saturating_sub(available_healthy);
+            let needed = intent.target_healthy.saturating_sub(working_patrol);
             let quantity = i64::try_from(needed)
                 .map_err(|_| "maintenance pool deficit is too large".to_owned())?;
             let child = context
@@ -7739,8 +8066,41 @@ impl WorkflowExecutor for RegionalDispatchWorkflow {
             let report = execute_delivery(&client, &plan, DeliveryOptions::default())
                 .await
                 .map_err(string_error)?;
-            context.mark_succeeded(Some(report)).map_err(string_error)
+            complete_mining_payload_delivery(context, report, &checkpoint.devices)
         })
+    }
+}
+
+fn complete_mining_payload_delivery<R: Serialize>(
+    context: &mut WorkflowContext,
+    report: R,
+    codes: &[String],
+) -> Result<(), String> {
+    let parent = context
+        .repository()
+        .read(context.id())
+        .map_err(string_error)?
+        .and_then(|workflow| workflow.parent_id)
+        .map(|id| context.repository().read(id))
+        .transpose()
+        .map_err(string_error)?
+        .flatten();
+    let mining_parent = parent.is_some_and(|parent| {
+        parent.kind == mining_transport_capacity_workflow_kind()
+            || parent.kind == mining_maintenance_rotation_workflow_kind()
+            || parent.kind == mining_maintenance_pool_workflow_kind()
+    });
+    if mining_parent {
+        let resources = codes
+            .iter()
+            .cloned()
+            .map(ResourceKey::Device)
+            .collect::<Vec<_>>();
+        context
+            .mark_succeeded_returning_claims(Some(report), &resources)
+            .map_err(string_error)
+    } else {
+        context.mark_succeeded(Some(report)).map_err(string_error)
     }
 }
 
@@ -8345,7 +8705,7 @@ impl WorkflowExecutor for LogisticsManifestWorkflow {
                     return Ok(());
                 }
                 let report = checkpoint.delivery_report.clone().unwrap_or_default();
-                return context.mark_succeeded(Some(report)).map_err(string_error);
+                return complete_mining_payload_delivery(context, report, &intent.device_codes);
             }
 
             let plan =
@@ -8421,7 +8781,7 @@ impl WorkflowExecutor for LogisticsManifestWorkflow {
                     {
                         return Ok(());
                     }
-                    return context.mark_succeeded(Some(report)).map_err(string_error);
+                    return complete_mining_payload_delivery(context, report, &intent.device_codes);
                 }
             }
 
@@ -8615,7 +8975,7 @@ async fn execute_logistics_manifest_plan(
     {
         return Ok(());
     }
-    context.mark_succeeded(Some(report)).map_err(string_error)
+    complete_mining_payload_delivery(context, report, &intent.device_codes)
 }
 
 /// Derives the stable operation identity used for one workflow's exact
@@ -11044,15 +11404,17 @@ impl WorkflowExecutor for RegionEstablishWorkflow {
             context
                 .advance_to("bootstrapping", &checkpoint)
                 .map_err(string_error)?;
-            let mission = run_bootstrap(
-                &client,
-                &BootstrapExecutionRequest::new(
-                    plan_file,
-                    Duration::from_secs(DEFAULT_WAIT_SECONDS),
-                ),
-            )
-            .await
-            .map_err(string_error)?;
+            let mut request = BootstrapExecutionRequest::new(
+                plan_file,
+                Duration::from_secs(DEFAULT_WAIT_SECONDS),
+            );
+            request.mining_claims = Some(crate::mining::MiningWorkflowClaims {
+                repository: context.repository_handle(),
+                workflow_id: context.id(),
+            });
+            let mission = run_bootstrap(&client, &request)
+                .await
+                .map_err(string_error)?;
             checkpoint.mission_json = Some(serde_json::to_string(&mission).map_err(string_error)?);
             context
                 .persist_checkpoint(&checkpoint)

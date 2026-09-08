@@ -60,6 +60,12 @@ pub enum RepositoryError {
     /// A transactional active-workflow compatibility check could not prove safe reuse.
     #[error("workflow compatibility check failed: {0}")]
     Compatibility(String),
+    /// Claiming this asset would violate the required unclaimed reserve.
+    #[error("resource reserve requires {minimum} available assets")]
+    ReserveUnavailable {
+        /// Minimum assets that must remain unclaimed.
+        minimum: usize,
+    },
     /// A stable workflow kind was malformed.
     #[error("invalid workflow kind {0:?}")]
     InvalidKind(String),
@@ -815,6 +821,16 @@ impl WorkflowRepository {
         &self,
         workflow: NewWorkflow<C, P>,
     ) -> Result<WorkflowInstance, RepositoryError> {
+        self.create_with_parent_claims(workflow, &[])
+    }
+
+    /// Creates a child and atomically hands it the parent's exact resource claims.
+    /// A conflict rolls back both creation and every handoff.
+    pub fn create_with_parent_claims<C: Serialize, P: Serialize>(
+        &self,
+        workflow: NewWorkflow<C, P>,
+        resources: &[ResourceKey],
+    ) -> Result<WorkflowInstance, RepositoryError> {
         if workflow.schema_version == 0 {
             return Err(RepositoryError::InvalidWorkflowSchemaVersion);
         }
@@ -832,6 +848,12 @@ impl WorkflowRepository {
             config_json,
             checkpoint_json,
         )?;
+        if !resources.is_empty() {
+            let parent = workflow.parent_id.ok_or_else(|| {
+                RepositoryError::Compatibility("claim handoff requires a parent".into())
+            })?;
+            transfer_claims_in(&transaction, parent, id, resources, now)?;
+        }
         transaction.commit()?;
         Ok(instance)
     }
@@ -1228,6 +1250,18 @@ impl WorkflowRepository {
         workflow_id: WorkflowId,
         resource: ResourceKey,
     ) -> Result<ClaimAcquireOutcome, RepositoryError> {
+        self.acquire_claim_preserving_reserve(workflow_id, resource, &[], 0)
+    }
+
+    /// Claims an asset only if an exact observed reserve remains unclaimed.
+    /// Reserve accounting and acquisition share the same write transaction.
+    pub fn acquire_claim_preserving_reserve(
+        &self,
+        workflow_id: WorkflowId,
+        resource: ResourceKey,
+        reserve: &[ResourceKey],
+        minimum: usize,
+    ) -> Result<ClaimAcquireOutcome, RepositoryError> {
         let (namespace, key) = resource.persisted_parts()?;
         let now = now_millis()?;
         let mut connection = self.connection()?;
@@ -1236,6 +1270,51 @@ impl WorkflowRepository {
             read_in(&transaction, workflow_id)?.ok_or(RepositoryError::NotFound(workflow_id))?;
         if owner.status.is_terminal() {
             return Err(RepositoryError::TerminalClaimOwner { workflow_id });
+        }
+        if let Some(owner) = physical_claim_conflict_in(&transaction, &resource, workflow_id)? {
+            return Err(RepositoryError::ClaimConflict { resource, owner });
+        }
+        if minimum > 0 {
+            let mut available = BTreeSet::new();
+            for candidate in reserve {
+                let (candidate_namespace, candidate_key) = candidate.persisted_parts()?;
+                let physical = matches!(
+                    candidate_namespace.as_str(),
+                    "device" | "autofactory" | "replicant"
+                );
+                let same_namespace = candidate_namespace == namespace
+                    || (matches!(candidate_namespace.as_str(), "device" | "autofactory")
+                        && matches!(namespace.as_str(), "device" | "autofactory"));
+                if same_namespace
+                    && (candidate_key == key
+                        || (physical && candidate_key.eq_ignore_ascii_case(key)))
+                {
+                    continue;
+                }
+                let claimed = transaction.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM workflow_resource_claims
+                     WHERE (resource_key = ?2 OR (?1 IN ('device', 'autofactory', 'replicant')
+                       AND resource_key = ?2 COLLATE NOCASE))
+                       AND (resource_namespace = ?1 OR
+                         (?1 IN ('device', 'autofactory') AND resource_namespace IN ('device', 'autofactory'))))",
+                    params![candidate_namespace, candidate_key],
+                    |row| row.get::<_, bool>(0),
+                )?;
+                if !claimed {
+                    let identity = if matches!(
+                        candidate_namespace.as_str(),
+                        "device" | "autofactory" | "replicant"
+                    ) {
+                        candidate_key.to_ascii_uppercase()
+                    } else {
+                        candidate_key.to_owned()
+                    };
+                    available.insert((candidate_namespace, identity));
+                }
+            }
+            if available.len() < minimum {
+                return Err(RepositoryError::ReserveUnavailable { minimum });
+            }
         }
         let existing = transaction
             .query_row(
@@ -1279,6 +1358,21 @@ impl WorkflowRepository {
             acquired_at: now,
             updated_at: now,
         }))
+    }
+
+    /// Atomically transfers exact claims between a parent and its child.
+    /// Repeating an already completed handoff is idempotent.
+    pub fn transfer_claims(
+        &self,
+        from: WorkflowId,
+        to: WorkflowId,
+        resources: &[ResourceKey],
+    ) -> Result<(), RepositoryError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transfer_claims_in(&transaction, from, to, resources, now_millis()?)?;
+        transaction.commit()?;
+        Ok(())
     }
 
     /// Atomically releases a resource only when `workflow_id` owns it.
@@ -2296,17 +2390,12 @@ impl WorkflowRepository {
                     }
                 }
                 if is_exclusive_namespace(&namespace) {
-                    let claim_owner = transaction
-                        .query_row(
-                            "SELECT workflow_id FROM workflow_resource_claims
-                             WHERE resource_namespace = ?1 AND resource_key = ?2",
-                            params![namespace, key],
-                            |row| row.get::<_, String>(0),
-                        )
-                        .optional()?;
-                    if claim_owner
-                        .as_deref()
-                        .is_some_and(|owner| owner != item.spec.workflow_id.to_string())
+                    if physical_claim_conflict_in(
+                        &transaction,
+                        &candidate.resource,
+                        item.spec.workflow_id,
+                    )?
+                    .is_some()
                     {
                         diagnostics.claim_rejected = diagnostics.claim_rejected.saturating_add(1);
                         continue;
@@ -2499,17 +2588,12 @@ impl WorkflowRepository {
                 }
             }
             if is_exclusive_namespace(&namespace) {
-                let claim_owner = transaction
-                    .query_row(
-                        "SELECT workflow_id FROM workflow_resource_claims
-                         WHERE resource_namespace = ?1 AND resource_key = ?2",
-                        params![namespace, key],
-                        |row| row.get::<_, String>(0),
-                    )
-                    .optional()?;
-                if claim_owner
-                    .as_deref()
-                    .is_some_and(|owner| owner != item.spec.workflow_id.to_string())
+                if physical_claim_conflict_in(
+                    &transaction,
+                    &candidate.resource,
+                    item.spec.workflow_id,
+                )?
+                .is_some()
                 {
                     continue;
                 }
@@ -2693,7 +2777,7 @@ impl WorkflowRepository {
     ) -> Result<WorkflowInstance, RepositoryError> {
         let failure_disposition = (state.status == WorkflowStatus::Failed)
             .then_some(WorkflowFailureDisposition::Retryable);
-        self.update_state(id, expected_revision, state, None, failure_disposition)
+        self.update_state(id, expected_revision, state, None, failure_disposition, &[])
     }
 
     pub(crate) fn update_with_wait<P: Serialize, R: Serialize>(
@@ -2711,6 +2795,7 @@ impl WorkflowRepository {
             state,
             wait_intent,
             failure_disposition,
+            &[],
         )
     }
 
@@ -2727,7 +2812,24 @@ impl WorkflowRepository {
             state,
             None,
             Some(failure_disposition),
+            &[],
         )
+    }
+
+    /// Completes a child and returns exact payload claims to its live parent atomically.
+    pub fn complete_with_parent_claims<P: Serialize, R: Serialize>(
+        &self,
+        id: WorkflowId,
+        expected_revision: u64,
+        state: WorkflowState<P, R>,
+        resources: &[ResourceKey],
+    ) -> Result<WorkflowInstance, RepositoryError> {
+        if state.status != WorkflowStatus::Succeeded {
+            return Err(RepositoryError::Compatibility(
+                "payload return requires success".into(),
+            ));
+        }
+        self.update_state(id, expected_revision, state, None, None, resources)
     }
 
     fn update_state<P: Serialize, R: Serialize>(
@@ -2737,6 +2839,7 @@ impl WorkflowRepository {
         state: WorkflowState<P, R>,
         wait_intent: Option<&crate::WaitIntent>,
         failure_disposition: Option<WorkflowFailureDisposition>,
+        return_to_parent: &[ResourceKey],
     ) -> Result<WorkflowInstance, RepositoryError> {
         let failure_disposition = (state.status == WorkflowStatus::Failed)
             .then(|| failure_disposition.map(WorkflowFailureDisposition::as_str))
@@ -2786,6 +2889,12 @@ impl WorkflowRepository {
             ],
         )?;
         if state.status.is_terminal() {
+            if !return_to_parent.is_empty()
+                && let Some(parent) = current.parent_id
+                && read_in(&transaction, parent)?.is_some_and(|parent| !parent.status.is_terminal())
+            {
+                transfer_claims_in(&transaction, id, parent, return_to_parent, now)?;
+            }
             transaction.execute(
                 "UPDATE workflow_work_item_attempts
                  SET ended_at_ms = ?2, outcome = 'cancelled'
@@ -3335,19 +3444,14 @@ fn candidate_supports_affined_dependents(
             if available_quantity.saturating_sub(active_quantity) < requested_quantity {
                 continue;
             }
-            let (namespace, key) = dependent_candidate.resource.persisted_parts()?;
+            let (namespace, _) = dependent_candidate.resource.persisted_parts()?;
             if is_exclusive_namespace(&namespace) {
-                let claim_owner = transaction
-                    .query_row(
-                        "SELECT workflow_id FROM workflow_resource_claims
-                         WHERE resource_namespace = ?1 AND resource_key = ?2",
-                        params![namespace, key],
-                        |row| row.get::<_, String>(0),
-                    )
-                    .optional()?;
-                if claim_owner
-                    .as_deref()
-                    .is_some_and(|owner| owner != workflow_id.to_string())
+                if physical_claim_conflict_in(
+                    transaction,
+                    &dependent_candidate.resource,
+                    workflow_id,
+                )?
+                .is_some()
                 {
                     continue;
                 }
@@ -3984,6 +4088,97 @@ fn row_to_trigger(row: &rusqlite::Row<'_>) -> Result<AutomationTrigger, rusqlite
             to_sql_conversion_error(RepositoryError::InvalidStoredRevision(revision))
         })?,
     })
+}
+
+fn physical_claim_conflict_in(
+    transaction: &rusqlite::Transaction<'_>,
+    resource: &ResourceKey,
+    workflow_id: WorkflowId,
+) -> Result<Option<WorkflowId>, RepositoryError> {
+    let (namespace, key) = resource.persisted_parts()?;
+    let owner: Option<String> = transaction.query_row(
+        "SELECT workflow_id FROM workflow_resource_claims
+         WHERE (resource_key = ?2 OR
+           (?1 IN ('device', 'autofactory', 'replicant') AND resource_key = ?2 COLLATE NOCASE))
+           AND workflow_id != ?3
+           AND (resource_namespace = ?1
+             OR (?1 IN ('device', 'autofactory') AND resource_namespace IN ('device', 'autofactory')))
+         LIMIT 1",
+        params![namespace, key, workflow_id.to_string()],
+        |row| row.get(0),
+    ).optional()?;
+    Ok(owner.map(parse_id).transpose()?)
+}
+
+fn transfer_claims_in(
+    transaction: &rusqlite::Transaction<'_>,
+    from: WorkflowId,
+    to: WorkflowId,
+    resources: &[ResourceKey],
+    now: i64,
+) -> Result<(), RepositoryError> {
+    let source = read_in(transaction, from)?.ok_or(RepositoryError::NotFound(from))?;
+    let destination = read_in(transaction, to)?.ok_or(RepositoryError::NotFound(to))?;
+    if destination.status.is_terminal() {
+        return Err(RepositoryError::TerminalClaimOwner { workflow_id: to });
+    }
+    if source.parent_id != Some(to) && destination.parent_id != Some(from) {
+        return Err(RepositoryError::Compatibility(
+            "claim handoff requires a direct parent-child relationship".into(),
+        ));
+    }
+    for resource in resources {
+        let (namespace, key) = resource.persisted_parts()?;
+        let owner: Option<String> = transaction
+            .query_row(
+                "SELECT workflow_id FROM workflow_resource_claims
+                 WHERE (resource_key = ?2 OR (?1 IN ('device', 'autofactory', 'replicant')
+                   AND resource_key = ?2 COLLATE NOCASE)) AND workflow_id NOT IN (?3, ?4)
+                   AND (resource_namespace = ?1 OR
+                     (?1 IN ('device', 'autofactory') AND resource_namespace IN ('device', 'autofactory')))
+                 LIMIT 1",
+                params![namespace, key, from.to_string(), to.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(owner) = owner.map(parse_id).transpose()? {
+            return Err(RepositoryError::ClaimConflict {
+                resource: resource.clone(),
+                owner,
+            });
+        }
+        if transaction.query_row(
+            "SELECT COUNT(*) FROM workflow_resource_allocations
+             WHERE (resource_key = ?2 OR (?1 IN ('device', 'autofactory', 'replicant')
+               AND resource_key = ?2 COLLATE NOCASE)) AND state = 'active'
+               AND (resource_namespace = ?1 OR
+                 (?1 IN ('device', 'autofactory') AND resource_namespace IN ('device', 'autofactory')))",
+            params![namespace, key],
+            |row| row.get::<_, i64>(0),
+        )? != 0
+        {
+            return Err(RepositoryError::Compatibility(
+                "allocated resources cannot be handed off as direct claims".into(),
+            ));
+        }
+        transaction.execute(
+            "UPDATE workflow_resource_claims SET workflow_id = ?3, updated_at = ?4
+             WHERE (resource_key = ?2 OR (?1 IN ('device', 'autofactory', 'replicant')
+               AND resource_key = ?2 COLLATE NOCASE)) AND
+               (resource_namespace = ?1 OR
+                 (?1 IN ('device', 'autofactory') AND resource_namespace IN ('device', 'autofactory')))",
+            params![namespace, key, to.to_string(), now],
+        )?;
+        transaction.execute(
+            "INSERT INTO workflow_resource_claims
+             (resource_namespace, resource_key, workflow_id, acquired_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?4)
+             ON CONFLICT(resource_namespace, resource_key) DO UPDATE SET
+             workflow_id = excluded.workflow_id, updated_at = excluded.updated_at",
+            params![namespace, key, to.to_string(), now],
+        )?;
+    }
+    Ok(())
 }
 
 fn insert_workflow_in<C, P>(

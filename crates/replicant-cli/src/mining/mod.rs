@@ -198,7 +198,7 @@ pub(crate) async fn run_cli(arguments: Vec<String>) -> crate::AnyResult<()> {
             render_plan(&mission, &config)
         }
         Command::Run => {
-            let report = execute_expansion(&client, &request).await?;
+            let report = execute_expansion(&client, &request, None).await?;
             if config.json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {

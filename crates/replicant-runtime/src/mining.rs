@@ -43,9 +43,9 @@ pub(crate) const HUB_MAINTENANCE_ROLE: &str = "maintenance-pool";
 pub(crate) const CARGO_FREIGHTER_CAPACITY_UNITS: i64 = 500;
 pub(crate) const MIN_TRANSPORT_FREIGHTERS: usize = 1;
 pub(crate) const MAX_TRANSPORT_FREIGHTERS: usize = 6;
-pub(crate) const TRANSPORT_LOW_BACKLOG_LOADS: f64 = 2.0;
-pub(crate) const TRANSPORT_SCALE_UP_LOADS: f64 = 10.0;
-pub(crate) const TRANSPORT_CRITICAL_BACKLOG_LOADS: f64 = 30.0;
+pub(crate) const TRANSPORT_LOW_BACKLOG_LOADS: i64 = 2;
+pub(crate) const TRANSPORT_SCALE_UP_LOADS: i64 = 10;
+pub(crate) const TRANSPORT_CRITICAL_BACKLOG_LOADS: i64 = 30;
 pub(crate) const TRANSPORT_CAPACITY_COOLDOWN_MS: i64 = 15 * 60 * 1_000;
 pub(crate) const TRANSPORT_SCALE_DOWN_HOLD_MS: i64 = 60 * 60 * 1_000;
 pub(crate) const TRANSPORT_CAPACITY_DOCUMENT_NS: &str = "director.mining.transport_capacity";
@@ -63,6 +63,36 @@ fn app_error(kind: io::ErrorKind, message: impl Into<String>) -> AnyError {
     io::Error::new(kind, message.into()).into()
 }
 
+/// Durable physical-asset custody for a Mining Ops workflow invocation.
+#[derive(Clone)]
+pub struct MiningWorkflowClaims {
+    /// Workflow repository that arbitrates physical asset ownership.
+    pub repository: std::sync::Arc<replicant_workflow::WorkflowRepository>,
+    /// The workflow owning all resources used by this invocation.
+    pub workflow_id: replicant_workflow::WorkflowId,
+}
+
+impl std::fmt::Debug for MiningWorkflowClaims {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MiningWorkflowClaims")
+            .field("workflow_id", &self.workflow_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl MiningWorkflowClaims {
+    fn acquire_devices(&self, codes: &[String]) -> AnyResult<()> {
+        for code in codes {
+            self.repository.acquire_claim(
+                self.workflow_id,
+                replicant_workflow::ResourceKey::Device(code.clone()),
+            )?;
+        }
+        Ok(())
+    }
+}
+
 struct Config {
     systems: Vec<String>,
     replicant: Option<String>,
@@ -72,9 +102,17 @@ struct Config {
     replace_plan: bool,
     wait_timeout: Duration,
     max_concurrency: usize,
+    claims: Option<MiningWorkflowClaims>,
 }
 
 impl Config {
+    fn claim_devices(&self, codes: &[String]) -> AnyResult<()> {
+        if let Some(claims) = &self.claims {
+            claims.acquire_devices(codes)?;
+        }
+        Ok(())
+    }
+
     fn requested_systems(&self) -> AnyResult<Vec<String>> {
         let systems = self
             .systems
@@ -237,6 +275,9 @@ impl MaintenanceHubPoolAudit {
         available_healthy: usize,
         higher_priority_faults: bool,
     ) -> usize {
+        if !self.unknown_patrol.is_empty() {
+            return available_healthy;
+        }
         if available_healthy < HUB_MAINTENANCE_MIN_HEALTHY {
             HUB_MAINTENANCE_MIN_HEALTHY
         } else if available_healthy == HUB_MAINTENANCE_MIN_HEALTHY
@@ -253,6 +294,7 @@ impl MaintenanceHubPoolAudit {
 
 pub(crate) fn maintenance_replacement_ready(device: &Device) -> bool {
     site_asset_usable(device)
+        && device.status.is_some()
         && device
             .operational_capacity
             .is_some_and(|capacity| capacity.percent() >= HUB_MAINTENANCE_READY_PCT)
@@ -283,6 +325,10 @@ pub(crate) fn maintenance_hub_pool_audit(
                 .any(|tag| replicant_protocol::workflow_tag_reserved(tag) && tag != &pool_role)
     }) {
         let code = device.key.id.as_str().to_owned();
+        if device.status.is_none() {
+            audit.unknown_patrol.push(code);
+            continue;
+        }
         if has_directive(device, "patrol") {
             match device
                 .operational_capacity
@@ -333,12 +379,11 @@ pub(crate) fn transport_backlog_loads(backlog_units: i64) -> f64 {
 }
 
 pub(crate) fn transport_backlog_class(backlog_units: i64) -> TransportBacklogClass {
-    let loads = transport_backlog_loads(backlog_units);
-    if loads < TRANSPORT_LOW_BACKLOG_LOADS {
+    if backlog_units < TRANSPORT_LOW_BACKLOG_LOADS * CARGO_FREIGHTER_CAPACITY_UNITS {
         TransportBacklogClass::Low
-    } else if loads > TRANSPORT_CRITICAL_BACKLOG_LOADS {
+    } else if backlog_units > TRANSPORT_CRITICAL_BACKLOG_LOADS * CARGO_FREIGHTER_CAPACITY_UNITS {
         TransportBacklogClass::Critical
-    } else if loads > TRANSPORT_SCALE_UP_LOADS {
+    } else if backlog_units > TRANSPORT_SCALE_UP_LOADS * CARGO_FREIGHTER_CAPACITY_UNITS {
         TransportBacklogClass::ScaleUp
     } else {
         TransportBacklogClass::HealthyBand
@@ -913,6 +958,7 @@ pub async fn execute_mining_item(
     index: usize,
     allocations: &AllocationSet,
     wait_timeout: Duration,
+    claims: MiningWorkflowClaims,
 ) -> AnyResult<MiningMission> {
     let worker = mining_allocated_identity(allocations, "worker", "replicant")?;
     let mut lane = mission.clone();
@@ -1068,7 +1114,7 @@ pub async fn execute_mining_item(
         wait_timeout,
         max_concurrency: 1,
     };
-    let result = execute_expansion(client, &request).await;
+    let result = execute_expansion(client, &request, Some(claims)).await;
     let final_state = load_expansion(&plan_path);
     let _ = fs::remove_file(plan_path);
     result?;
@@ -1293,6 +1339,15 @@ async fn create_plan(client: &Client, config: &Config) -> AnyResult<MiningMissio
             None => select_belt(client, &system, &devices).await?,
         };
         let audit = audit_site(&devices, &system, &belt.designation);
+        if !audit.mutation_safe {
+            return Err(app_error(
+                io::ErrorKind::WouldBlock,
+                format!(
+                    "mining site {} requires authoritative evidence before provisioning: {:?}",
+                    belt.designation, audit.issues
+                ),
+            ));
+        }
         let missing = site_shortages(&audit);
         sites.push(SiteMission {
             system: system.clone(),
@@ -1328,6 +1383,15 @@ async fn create_plan(client: &Client, config: &Config) -> AnyResult<MiningMissio
             .get(site.system.as_str())
             .map_or(MIN_TRANSPORT_FREIGHTERS, |route| route.desired_freighters);
         let audit = transport_service_present(&devices, &site.system, &site.belt, &config.hub);
+        if audit.state == EvidenceState::Unknown {
+            return Err(app_error(
+                io::ErrorKind::WouldBlock,
+                format!(
+                    "mining route {} to {} requires authoritative evidence before provisioning",
+                    site.belt, config.hub
+                ),
+            ));
+        }
         let usable_freighters = audit.usable_freighters.clone();
         let freighter = usable_freighters.first().cloned();
         let additional_freighters = usable_freighters.into_iter().skip(1).collect::<Vec<_>>();
@@ -1938,6 +2002,41 @@ pub(crate) fn audit_site(devices: &[Device], system: &str, belt: &str) -> SiteAu
     let mut repairs = Vec::new();
     let mut issues = Vec::new();
     let mut mutation_safe = true;
+    for device in devices.iter().filter(|device| {
+        device.access == replicant_client::domain::AccessScope::Owned
+            && (device_location(device) == Some(belt) || device.tags.contains(&expected_site_tag))
+            && (matches!(
+                device_type(device),
+                Some(
+                    MINING_CONTROLLER
+                        | MINING_DRONE
+                        | SURVEY_CONTROLLER
+                        | SURVEY_DRONE
+                        | MAINTENANCE_DRONE
+                )
+            ) || (device.device_type.is_none() && device.tags.contains(&expected_site_tag)))
+    }) {
+        let field = if device.device_type.is_none() {
+            Some("device_type")
+        } else if device.location.is_none() {
+            Some("location")
+        } else if device.status.is_none() {
+            Some("status")
+        } else if device_type(device) == Some(MAINTENANCE_DRONE)
+            && device.operational_capacity.is_none()
+        {
+            Some("operational_capacity")
+        } else {
+            None
+        };
+        if let Some(field) = field {
+            mutation_safe = false;
+            issues.push(MiningSiteIssue::EvidenceIncomplete {
+                device: device.key.id.as_str().to_owned(),
+                field,
+            });
+        }
+    }
     let mining_drones = select_site_children(
         devices,
         &at_belt,
@@ -2029,7 +2128,13 @@ pub(crate) fn audit_site(devices: &[Device], system: &str, belt: &str) -> SiteAu
         .and_then(|code| find_device(devices, code))
         && !has_directive(maintenance, "patrol")
     {
-        if maintenance_patrol_capability(maintenance) == EvidenceState::Unknown {
+        if site_directive_evidence(maintenance, "patrol") == EvidenceState::Unknown {
+            mutation_safe = false;
+            issues.push(MiningSiteIssue::EvidenceIncomplete {
+                device: maintenance.key.id.as_str().to_owned(),
+                field: "active_directive",
+            });
+        } else if maintenance_patrol_capability(maintenance) == EvidenceState::Unknown {
             mutation_safe = false;
             issues.push(MiningSiteIssue::EvidenceIncomplete {
                 device: maintenance.key.id.as_str().to_owned(),
@@ -2239,6 +2344,21 @@ fn select_site_children(
         if selected.contains(&code) {
             continue;
         }
+        if devices.iter().any(|parent| {
+            parent
+                .relationships
+                .controlled_devices
+                .iter()
+                .any(|child| child.id.as_str() == code)
+        }) {
+            *mutation_safe = false;
+            issues.push(MiningSiteIssue::EvidenceIncomplete {
+                device: code.clone(),
+                field: "controller_relationship",
+            });
+            selected.push(code);
+            continue;
+        }
         repairs.push(MiningSiteRepair::Adopt {
             device: code.clone(),
             controller: controller.to_owned(),
@@ -2345,6 +2465,26 @@ fn adoption_correct(devices: &[Device], controller: Option<&str>, selected: &[St
     })
 }
 
+/// Configuration evidence, not merely the absence of a matching directive.
+/// The contract defines `idle` as deployed with no active task.
+pub(crate) fn site_directive_evidence(device: &Device, expected: &str) -> EvidenceState {
+    match device.active_directive.as_ref() {
+        Some(active) => match active.directive.as_ref() {
+            Some(directive) if directive.as_str() == expected => EvidenceState::Present,
+            Some(_) => EvidenceState::Absent,
+            None => EvidenceState::Unknown,
+        },
+        None if device
+            .status
+            .as_ref()
+            .is_some_and(|status| status.as_str() == "idle") =>
+        {
+            EvidenceState::Absent
+        }
+        None => EvidenceState::Unknown,
+    }
+}
+
 fn audit_controller_health(
     devices: &[Device],
     controller: Option<&str>,
@@ -2356,11 +2496,19 @@ fn audit_controller_health(
     let Some(controller) = controller.and_then(|code| find_device(devices, code)) else {
         return;
     };
-    if !has_directive(controller, expected_directive) {
-        repairs.push(MiningSiteRepair::SetDirective {
+    match site_directive_evidence(controller, expected_directive) {
+        EvidenceState::Present => {}
+        EvidenceState::Absent => repairs.push(MiningSiteRepair::SetDirective {
             device: controller.key.id.as_str().to_owned(),
             directive: expected_directive,
-        });
+        }),
+        EvidenceState::Unknown => {
+            *mutation_safe = false;
+            issues.push(MiningSiteIssue::EvidenceIncomplete {
+                device: controller.key.id.as_str().to_owned(),
+                field: "active_directive",
+            });
+        }
     }
     match controller.status.as_ref().map(DeviceStatus::as_str) {
         Some("coordinating") => {}
@@ -2517,7 +2665,8 @@ pub(crate) fn transport_service_present(
         .iter()
         .filter(|device| {
             device.access == replicant_client::domain::AccessScope::Owned
-                && device_type(device) == Some(TRANSPORT_CONTROLLER)
+                && (device_type(device) == Some(TRANSPORT_CONTROLLER)
+                    || device.device_type.is_none())
         })
         .filter_map(|controller| {
             let active = controller.active_directive.as_ref();
@@ -2580,9 +2729,16 @@ pub(crate) fn transport_service_present(
     }
 
     let selected_controller_code = controller.key.id.as_str().to_owned();
-    let controller_operational = transport_controller_status_state(controller);
+    let controller_operational = if controller.device_type.is_none() {
+        EvidenceState::Unknown
+    } else {
+        transport_controller_status_state(controller)
+    };
     let (controller_directive, controller_configuration) =
         match controller.active_directive.as_ref() {
+            None if controller_operational == EvidenceState::Present => {
+                (EvidenceState::Unknown, EvidenceState::Unknown)
+            }
             None => (EvidenceState::Absent, EvidenceState::Absent),
             Some(active) => {
                 let directive = active.directive.as_ref().map(|value| value.as_str());
@@ -2595,15 +2751,20 @@ pub(crate) fn transport_service_present(
                 } else {
                     EvidenceState::Absent
                 };
-                let configuration_state = if config.is_none() {
-                    EvidenceState::Unknown
-                } else if config.is_some_and(|config| {
-                    config.get("collect").and_then(Value::as_str) == Some(collect)
-                        && config.get("deliver").and_then(Value::as_str) == Some(deliver)
+                let configuration_state = match config.map(|config| {
+                    (
+                        config.get("collect").and_then(Value::as_str),
+                        config.get("deliver").and_then(Value::as_str),
+                    )
                 }) {
-                    EvidenceState::Present
-                } else {
-                    EvidenceState::Absent
+                    Some((Some(actual_collect), Some(actual_deliver))) => {
+                        if actual_collect == collect && actual_deliver == deliver {
+                            EvidenceState::Present
+                        } else {
+                            EvidenceState::Absent
+                        }
+                    }
+                    _ => EvidenceState::Unknown,
                 };
                 (directive_state, configuration_state)
             }
@@ -2630,11 +2791,36 @@ pub(crate) fn transport_service_present(
     usable_freighters.sort();
     unknown_freighters.sort();
     unusable_freighters.sort();
+    // Both directions must agree before a count can authorize capacity changes.
+    // An omitted/partial controller list must not hide previously adopted ships.
+    let relationships_incomplete = controller.relationships.controlled_devices.is_empty()
+        || controller
+            .relationships
+            .controlled_devices
+            .iter()
+            .any(|child| {
+                find_device(devices, child.id.as_str()).is_none_or(|device| {
+                    controller_code(device) != Some(selected_controller_code.as_str())
+                        || device.device_type.is_none()
+                })
+            })
+        || devices.iter().any(|device| {
+            controller_code(device) == Some(selected_controller_code.as_str())
+                && device.device_type.is_none()
+        })
+        || adopted_freighters.iter().any(|code| {
+            !controller
+                .relationships
+                .controlled_devices
+                .iter()
+                .any(|child| child.id.as_str() == code)
+        });
 
     let state = if controller_operational == EvidenceState::Unknown
         || controller_directive == EvidenceState::Unknown
         || controller_configuration == EvidenceState::Unknown
         || !unknown_freighters.is_empty()
+        || relationships_incomplete
     {
         EvidenceState::Unknown
     } else if controller_operational == EvidenceState::Present
@@ -2869,6 +3055,7 @@ pub async fn plan_expansion(
         replace_plan: replace_existing,
         wait_timeout: request.wait_timeout,
         max_concurrency: request.max_concurrency,
+        claims: None,
     };
     create_plan(client, &config).await
 }
@@ -2892,6 +3079,7 @@ pub(crate) async fn plan_expansion_from_managed_state(
         replace_plan: replace_existing,
         wait_timeout: request.wait_timeout,
         max_concurrency: request.max_concurrency,
+        claims: None,
     };
     create_plan(client, &config).await
 }
@@ -2900,6 +3088,7 @@ pub(crate) async fn plan_expansion_from_managed_state(
 pub async fn execute_expansion(
     client: &Client,
     request: &MiningExpansionRequest,
+    claims: Option<MiningWorkflowClaims>,
 ) -> AnyResult<MiningExpansionReport> {
     validate_request(request)?;
     if request.systems.is_empty() && !request.mission_file.exists() {
@@ -2921,6 +3110,7 @@ pub async fn execute_expansion(
         replace_plan: false,
         wait_timeout: request.wait_timeout,
         max_concurrency: request.max_concurrency,
+        claims,
     };
     let _lock = MissionLock::acquire(&request.mission_file)?;
     let mut mission = load_expansion(&request.mission_file)?;
@@ -3205,6 +3395,8 @@ mod tests {
         directive(&mut survey_controller, "belt_search");
 
         let mut maintenance = device("MD", MAINTENANCE_DRONE, belt);
+        maintenance.operational_capacity =
+            replicant_client::domain::OperationalCapacity::new(100.0);
         maintenance.tags = vec![stable_site_tag.clone(), role_tag("maintenance")];
         directive(&mut maintenance, "patrol");
 
@@ -3468,6 +3660,36 @@ mod tests {
     }
 
     #[test]
+    fn mining_site_omitted_location_or_status_blocks_replacement_mutations() {
+        for field in [
+            "location",
+            "device_type",
+            "status",
+            "operational_capacity",
+            "controller_relationship",
+        ] {
+            let mut devices = healthy_site_devices("SOL", "SOL-BELT-1");
+            match field {
+                "location" => devices[2].location = None,
+                "device_type" => devices[2].device_type = None,
+                "status" => devices[2].status = None,
+                "operational_capacity" => devices[2].operational_capacity = None,
+                _ => {
+                    let child = devices[3].key.clone();
+                    devices[0].relationships.controlled_devices.push(child);
+                    devices[3].relationships.controller = None;
+                }
+            }
+            let audit = audit_site(&devices, "SOL", "SOL-BELT-1");
+            assert!(!audit.mutation_safe, "{field}");
+            assert!(!audit.operational, "{field}");
+            assert!(audit.issues.iter().any(|issue| matches!(
+                issue, MiningSiteIssue::EvidenceIncomplete { field: missing, .. } if *missing == field
+            )));
+        }
+    }
+
+    #[test]
     fn three_healthy_hub_patrol_drones_can_spare_one_but_two_cannot() {
         let hub = "HUB-BELT-1";
         let pool_role = role_tag(HUB_MAINTENANCE_ROLE);
@@ -3710,6 +3932,7 @@ mod tests {
         let hub = "SCEPTURUM-BELT-1";
         let belt = "ILPHARD-BELT-1";
         let mut controller = device("TC", TRANSPORT_CONTROLLER, hub);
+        controller.relationships.controlled_devices = vec![DeviceKey::live(DeviceId::from("CF"))];
         controller.active_directive = Some(ActiveDeviceDirective {
             directive: Some(DeviceDirective::from("ferry")),
             status: Some("active".into()),
@@ -3795,6 +4018,14 @@ mod tests {
         assert_eq!(audit.usable_freighter_count(), 3);
         assert!(audit.unknown_freighters.is_empty());
         assert!(audit.unusable_freighters.is_empty());
+        let mut incomplete = devices;
+        incomplete[1].device_type = None;
+        incomplete[0].relationships.controlled_devices.remove(0);
+        assert_eq!(
+            transport_service_present(&incomplete, system, belt, hub).state,
+            EvidenceState::Unknown,
+            "an untyped inverse relationship is not proof of spare route capacity",
+        );
     }
 
     #[test]
@@ -3840,29 +4071,37 @@ mod tests {
 
     #[test]
     fn transport_backlog_thresholds_use_exact_freighter_load_bands() {
-        assert_eq!(transport_backlog_class(999), TransportBacklogClass::Low);
-        assert_eq!(
-            transport_backlog_class(1_000),
-            TransportBacklogClass::HealthyBand
-        );
-        assert_eq!(
-            transport_backlog_class(5_000),
-            TransportBacklogClass::HealthyBand
-        );
-        assert_eq!(
-            transport_backlog_class(5_001),
-            TransportBacklogClass::ScaleUp
-        );
-        assert_eq!(
-            transport_backlog_class(15_000),
-            TransportBacklogClass::ScaleUp
-        );
-        assert_eq!(
-            transport_backlog_class(15_001),
-            TransportBacklogClass::Critical
-        );
-        assert_eq!(transport_scale_up_delta(5_001), 1);
-        assert_eq!(transport_scale_up_delta(15_001), 2);
+        for (units, class, delta) in [
+            (-1, TransportBacklogClass::Low, 0),
+            (0, TransportBacklogClass::Low, 0),
+            (999, TransportBacklogClass::Low, 0),
+            (1_000, TransportBacklogClass::HealthyBand, 0),
+            (5_000, TransportBacklogClass::HealthyBand, 0),
+            (5_001, TransportBacklogClass::ScaleUp, 1),
+            (15_000, TransportBacklogClass::ScaleUp, 1),
+            (15_001, TransportBacklogClass::Critical, 2),
+            (i64::MAX, TransportBacklogClass::Critical, 2),
+        ] {
+            assert_eq!(transport_backlog_class(units), class, "{units}");
+            assert_eq!(transport_scale_up_delta(units), delta, "{units}");
+            for count in 1..=MAX_TRANSPORT_FREIGHTERS {
+                let evaluation = evaluate_transport_capacity(
+                    units,
+                    count,
+                    0,
+                    &TransportCapacityTrend::default(),
+                );
+                let expected = delta.min(MAX_TRANSPORT_FREIGHTERS - count);
+                assert_eq!(
+                    evaluation.action,
+                    if expected == 0 {
+                        TransportCapacityAction::Hold
+                    } else {
+                        TransportCapacityAction::Add(expected)
+                    }
+                );
+            }
+        }
     }
 
     #[test]
@@ -3898,7 +4137,7 @@ mod tests {
         assert_eq!(falling.action, TransportCapacityAction::Hold);
 
         let flat_after_cooldown =
-            evaluate_transport_capacity(20_000, 2, TRANSPORT_CAPACITY_COOLDOWN_MS + 1, &previous);
+            evaluate_transport_capacity(20_000, 2, TRANSPORT_CAPACITY_COOLDOWN_MS, &previous);
         assert_eq!(flat_after_cooldown.action, TransportCapacityAction::Add(2));
         assert!(flat_after_cooldown.refresh_before_decision);
         assert_eq!(
@@ -3947,6 +4186,15 @@ mod tests {
         let minimum =
             evaluate_transport_capacity(500, 1, TRANSPORT_SCALE_DOWN_HOLD_MS, &before_hold.trend);
         assert_eq!(minimum.action, TransportCapacityAction::Hold);
+        let interruption =
+            evaluate_transport_capacity(1_000, 2, TRANSPORT_SCALE_DOWN_HOLD_MS, &before_hold.trend);
+        let low_again = evaluate_transport_capacity(
+            999,
+            2,
+            TRANSPORT_SCALE_DOWN_HOLD_MS + 1,
+            &interruption.trend,
+        );
+        assert_eq!(low_again.action, TransportCapacityAction::Hold);
 
         let mut changed = due.trend;
         record_transport_capacity_change(&mut changed, TRANSPORT_SCALE_DOWN_HOLD_MS);

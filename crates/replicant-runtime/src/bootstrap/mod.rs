@@ -57,6 +57,7 @@ struct Config {
     verbose: bool,
     log_file: Option<PathBuf>,
     json: bool,
+    mining_claims: Option<crate::mining::MiningWorkflowClaims>,
 }
 
 impl Config {
@@ -87,6 +88,7 @@ impl Config {
             operator: "Chats-1".into(),
             explorer: "Chats-2".into(),
             mission_file: PathBuf::from("regional-bootstrap.json"),
+            mining_claims: None,
             database: env::var_os("REPLICANT_DB")
                 .map(PathBuf::from)
                 .unwrap_or_else(replicant_client::default_database_path),
@@ -267,6 +269,7 @@ pub async fn plan_bootstrap(
         verbose: false,
         log_file: None,
         json: false,
+        mining_claims: None,
     };
     create_plan(client, &config).await?;
     load_mission(&request.mission_file)
@@ -279,6 +282,8 @@ pub struct BootstrapExecutionRequest {
     pub mission_file: PathBuf,
     /// Maximum wait for one manufacturing, travel, or SSE-backed state transition.
     pub wait_timeout: Duration,
+    /// Durable custody inherited by mining stages when running inside a workflow.
+    pub mining_claims: Option<crate::mining::MiningWorkflowClaims>,
 }
 
 impl BootstrapExecutionRequest {
@@ -288,6 +293,7 @@ impl BootstrapExecutionRequest {
         Self {
             mission_file: mission_file.into(),
             wait_timeout,
+            mining_claims: None,
         }
     }
 }
@@ -735,6 +741,7 @@ fn execution_config(
         verbose: false,
         log_file: None,
         json: false,
+        mining_claims: request.mining_claims.clone(),
     }
 }
 
