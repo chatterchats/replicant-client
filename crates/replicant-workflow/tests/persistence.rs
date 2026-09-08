@@ -82,6 +82,63 @@ fn complete(
 }
 
 #[test]
+fn batch_claim_conflict_rolls_back_the_entire_footprint() {
+    let repository = WorkflowRepository::open_in_memory().expect("repository");
+    let owner = create(&repository, None);
+    let rival = create(&repository, None);
+    let free = ResourceKey::Device("FREE".into());
+    let held = ResourceKey::Device("HELD".into());
+    repository
+        .acquire_claim(rival.id, held.clone())
+        .expect("rival custody");
+    assert!(matches!(
+        repository.acquire_claims(owner.id, &[free.clone(), held]),
+        Err(RepositoryError::ClaimConflict { .. })
+    ));
+    assert!(
+        repository
+            .claims(owner.id)
+            .expect("owner claims")
+            .is_empty()
+    );
+    assert!(matches!(
+        repository.acquire_claim(rival.id, free),
+        Ok(ClaimAcquireOutcome::Acquired(_))
+    ));
+}
+
+#[test]
+fn claim_handoff_requires_source_custody() {
+    let repository = WorkflowRepository::open_in_memory().expect("repository");
+    let parent = create(&repository, None);
+    let payload = ResourceKey::Device("UNCLAIMED-PAYLOAD".into());
+    let result = repository.create_with_parent_claims(
+        NewWorkflow {
+            kind: kind(),
+            schema_version: 2,
+            config: Config {
+                system: "SOL".into(),
+            },
+            checkpoint: Checkpoint { visits: 0 },
+            current_step: None,
+            parent_id: Some(parent.id),
+        },
+        std::slice::from_ref(&payload),
+    );
+    assert!(matches!(
+        result,
+        Err(RepositoryError::Compatibility(message))
+            if message.contains("source custody")
+    ));
+    assert!(
+        repository
+            .list_children(parent.id)
+            .expect("children")
+            .is_empty()
+    );
+}
+
+#[test]
 fn mining_claim_handoff_survives_competing_selection_and_returns_payload_atomically() {
     let repository = WorkflowRepository::open_in_memory().expect("repository");
     let parent = create(&repository, None);
@@ -223,6 +280,27 @@ fn mining_claim_concurrency_preserves_hub_minimum_and_factory_identity() {
             Err(RepositoryError::ClaimConflict { .. })
         ));
     }
+    assert!(matches!(
+        repository.acquire_claim(
+            owners[0],
+            ResourceKey::Device("case-sensitive-asset".into()),
+        ),
+        Ok(ClaimAcquireOutcome::AlreadyOwned(_))
+    ));
+    assert_eq!(
+        repository
+            .claims(owners[0])
+            .expect("same-owner physical claims")
+            .iter()
+            .filter(|claim| {
+                matches!(
+                    &claim.resource,
+                    ResourceKey::Device(code) if code.eq_ignore_ascii_case("case-sensitive-asset")
+                )
+            })
+            .count(),
+        1
+    );
 }
 
 #[test]

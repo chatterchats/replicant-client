@@ -27,8 +27,8 @@ use super::{
     AnyResult, Config, EvidenceState, ExecutionPrintBatch, MiningMission, MissionPhase,
     PrintPurpose, RoutePhase, SiteAssets, SitePhase, app_error, audit_site, controller_code,
     device_is_in_system, device_location, device_snapshots, device_type, fetch_blueprints,
-    find_device, has_directive, has_reservation_tag, is_opaque_mining_mission_tag, save_plan,
-    site_shortages, stable_hash, transport_service_present,
+    find_device, has_reservation_tag, is_opaque_mining_mission_tag, save_plan, site_shortages,
+    stable_hash, transport_service_present,
 };
 
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
@@ -172,8 +172,6 @@ pub(crate) async fn execute(
     if mission.phase.is_terminal() {
         return Ok(());
     }
-    config.claim_devices(&mission_resource_codes(mission))?;
-
     let replicant = validation::replicant(
         client,
         &mission.selected_replicant,
@@ -181,19 +179,27 @@ pub(crate) async fn execute(
     )
     .await?;
     if let Some(claims) = &config.claims {
-        claims.repository.acquire_claim(
-            claims.workflow_id,
-            replicant_workflow::ResourceKey::Replicant(mission.selected_replicant.clone()),
-        )?;
         let vessel = replicant.hosted_device.as_ref().ok_or_else(|| {
             app_error(
                 io::ErrorKind::WouldBlock,
                 "mining worker has no authoritative hosted vessel",
             )
         })?;
-        config.claim_devices(&[vessel.id.as_str().to_owned()])?;
+        let mut resources = mission_resource_codes(mission)
+            .into_iter()
+            .map(replicant_workflow::ResourceKey::Device)
+            .collect::<Vec<_>>();
+        resources.push(replicant_workflow::ResourceKey::Replicant(
+            mission.selected_replicant.clone(),
+        ));
+        resources.push(replicant_workflow::ResourceKey::Device(
+            vessel.id.as_str().to_owned(),
+        ));
+        claims
+            .repository
+            .acquire_claims(claims.workflow_id, &resources)?;
     }
-    migrate_legacy_mission_devices(client, mission).await?;
+    migrate_legacy_mission_devices(client, mission, config.claims.as_ref()).await?;
     save_plan(&config.plan_path, mission)?;
     reconcile(client, config, mission).await?;
     config.claim_devices(&mission_resource_codes(mission))?;
@@ -389,7 +395,7 @@ async fn reconcile_print_batches(
         .iter()
         .map(|batch| batch.batch_tag.clone())
         .collect::<BTreeSet<_>>();
-    migrate_legacy_mission_devices(client, mission).await?;
+    migrate_legacy_mission_devices(client, mission, claims).await?;
     let aliases = mission_tag_aliases(mission);
     let devices = device_snapshots(client).await?;
     let mut produced = BTreeMap::<String, Vec<String>>::new();
@@ -1999,6 +2005,7 @@ fn mission_tag_aliases(mission: &MiningMission) -> Vec<String> {
 async fn migrate_legacy_mission_devices(
     client: &Client,
     mission: &MiningMission,
+    claims: Option<&super::MiningWorkflowClaims>,
 ) -> AnyResult<usize> {
     if mission.legacy_mission_tags.is_empty() {
         return Ok(0);
@@ -2021,6 +2028,9 @@ async fn migrate_legacy_mission_devices(
         }
         let current =
             validation::device(client, device.key.id.as_str(), ValidationReason::Mutation).await?;
+        if let Some(claims) = claims {
+            claims.acquire_devices(&[device.key.id.as_str().to_owned()])?;
+        }
         let handle = match client.devices().cached(device.key.id.as_str()) {
             Some(handle) => handle,
             None => client.devices().get(device.key.id.as_str()).await?,

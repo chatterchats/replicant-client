@@ -694,7 +694,12 @@ describe("Director goal controls", () => {
     container.remove();
   });
 
-  it.each(["critical backlog", "maintenance rotation", "legacy"] as const)(
+  it.each([
+    "critical backlog",
+    "maintenance rotation",
+    "unknown evidence",
+    "legacy",
+  ] as const)(
     "renders Mining Ops with %s without deriving health from prose",
     async (scenario) => {
       vi.useFakeTimers();
@@ -714,10 +719,15 @@ describe("Director goal controls", () => {
           scenario === "critical backlog"
             ? { location: "KHIKHKUWU-BELT-1", quantity: 54979 }
             : null,
-        backlog_known: true,
+        backlog_known: scenario !== "unknown evidence",
         healthy_remote_maintenance: scenario === "maintenance rotation" ? 5 : 6,
         total_remote_sites: 6,
-        hub_ready: scenario === "maintenance rotation" ? 2 : 3,
+        hub_ready:
+          scenario === "unknown evidence"
+            ? null
+            : scenario === "maintenance rotation"
+              ? 2
+              : 3,
         hub_minimum: 2,
         hub_target: 3,
         priority_protected: 4,
@@ -830,6 +840,10 @@ describe("Director goal controls", () => {
               "Expansion deferred by critical backlog",
             );
             expect(metric("Hub reserve")).toBe("3 / 3 ready · minimum 2");
+          } else if (scenario === "unknown evidence") {
+            expect(metric("Maintenance")).toBe("6 / 6 healthy");
+            expect(metric("Hub reserve")).toBe("Unknown / 3 ready · minimum 2");
+            expect(metric("Cargo backlog")).toBe("Unknown");
           } else {
             expect(metric("Maintenance")).toBe("5 / 6 healthy");
             expect(metric("Hub reserve")).toBe("2 / 3 ready · minimum 2");

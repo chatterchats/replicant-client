@@ -83,12 +83,13 @@ impl std::fmt::Debug for MiningWorkflowClaims {
 
 impl MiningWorkflowClaims {
     fn acquire_devices(&self, codes: &[String]) -> AnyResult<()> {
-        for code in codes {
-            self.repository.acquire_claim(
-                self.workflow_id,
-                replicant_workflow::ResourceKey::Device(code.clone()),
-            )?;
-        }
+        let resources = codes
+            .iter()
+            .cloned()
+            .map(replicant_workflow::ResourceKey::Device)
+            .collect::<Vec<_>>();
+        self.repository
+            .acquire_claims(self.workflow_id, &resources)?;
         Ok(())
     }
 }
@@ -262,14 +263,6 @@ pub(crate) struct MaintenanceHubPoolAudit {
 }
 
 impl MaintenanceHubPoolAudit {
-    pub(crate) fn healthy_count(&self) -> usize {
-        self.healthy_patrol.len()
-    }
-
-    pub(crate) fn dispatch_preserves_minimum(&self) -> bool {
-        self.healthy_count() > HUB_MAINTENANCE_MIN_HEALTHY
-    }
-
     pub(crate) fn desired_healthy_count(
         &self,
         available_healthy: usize,
@@ -306,6 +299,15 @@ pub(crate) fn maintenance_rotation_due(device: &Device) -> bool {
         && device
             .operational_capacity
             .is_some_and(|capacity| capacity.percent() < MINING_MAINTENANCE_ROTATION_THRESHOLD_PCT)
+}
+
+pub(crate) fn maintenance_remote_healthy(device: &Device) -> bool {
+    site_asset_usable(device)
+        && device.status.is_some()
+        && has_directive(device, "patrol")
+        && device
+            .operational_capacity
+            .is_some_and(|capacity| capacity.percent() >= MINING_MAINTENANCE_ROTATION_THRESHOLD_PCT)
 }
 
 pub(crate) fn maintenance_hub_pool_audit(
@@ -2631,12 +2633,24 @@ fn transport_controller_status_state(device: &Device) -> EvidenceState {
     }
 }
 
-/// Audits exact owned AMI transport coverage, retaining reusable identities.
+/// Audits exact owned AMI transport coverage conservatively when device
+/// membership may be incomplete.
 pub(crate) fn transport_service_present(
     devices: &[Device],
     system: &str,
     collect: &str,
     deliver: &str,
+) -> TransportServiceAudit {
+    transport_service_present_with_authority(devices, system, collect, deliver, false)
+}
+
+/// Audits exact owned AMI transport coverage after an authoritative freighter census.
+pub(crate) fn transport_service_present_with_authority(
+    devices: &[Device],
+    system: &str,
+    collect: &str,
+    deliver: &str,
+    membership_authoritative: bool,
 ) -> TransportServiceAudit {
     if collect == deliver {
         return TransportServiceAudit {
@@ -2792,8 +2806,9 @@ pub(crate) fn transport_service_present(
     unknown_freighters.sort();
     unusable_freighters.sort();
     // Both directions must agree before a count can authorize capacity changes.
-    // An omitted/partial controller list must not hide previously adopted ships.
-    let relationships_incomplete = controller.relationships.controlled_devices.is_empty()
+    // An empty relationship is known zero only after an authoritative census.
+    let relationships_incomplete = (!membership_authoritative
+        && controller.relationships.controlled_devices.is_empty())
         || controller
             .relationships
             .controlled_devices
@@ -3705,15 +3720,15 @@ mod tests {
             .collect::<Vec<_>>();
 
         let audit = maintenance_hub_pool_audit(&devices, hub);
-        assert_eq!(audit.healthy_count(), 3);
-        assert!(audit.dispatch_preserves_minimum());
+        assert_eq!(audit.healthy_patrol.len(), 3);
+        assert!(audit.healthy_patrol.len() > HUB_MAINTENANCE_MIN_HEALTHY);
 
         devices.pop();
         let audit = maintenance_hub_pool_audit(&devices, hub);
-        assert_eq!(audit.healthy_count(), 2);
-        assert!(!audit.dispatch_preserves_minimum());
+        assert_eq!(audit.healthy_patrol.len(), 2);
+        assert!(audit.healthy_patrol.len() <= HUB_MAINTENANCE_MIN_HEALTHY);
         assert_eq!(
-            audit.desired_healthy_count(audit.healthy_count(), false),
+            audit.desired_healthy_count(audit.healthy_patrol.len(), false),
             HUB_MAINTENANCE_TARGET_HEALTHY
         );
     }
@@ -3753,9 +3768,12 @@ mod tests {
         }
 
         let audit = maintenance_hub_pool_audit(&devices, hub);
-        assert_eq!(audit.healthy_count(), 2);
+        assert_eq!(audit.healthy_patrol.len(), 2);
         assert_eq!(audit.repairing_patrol, ["REPAIR"]);
-        assert_eq!(audit.desired_healthy_count(audit.healthy_count(), false), 2);
+        assert_eq!(
+            audit.desired_healthy_count(audit.healthy_patrol.len(), false),
+            2
+        );
     }
 
     #[test]
@@ -3767,7 +3785,7 @@ mod tests {
         directive(&mut drone, "patrol");
 
         let audit = maintenance_hub_pool_audit(&[drone], hub);
-        assert_eq!(audit.healthy_count(), 0);
+        assert!(audit.healthy_patrol.is_empty());
     }
 
     #[test]
@@ -4026,6 +4044,24 @@ mod tests {
             EvidenceState::Unknown,
             "an untyped inverse relationship is not proof of spare route capacity",
         );
+    }
+
+    #[test]
+    fn authoritative_empty_transport_membership_is_known_zero_capacity() {
+        let system = "ILPHARD";
+        let belt = "ILPHARD-BELT-1";
+        let hub = "SCEPTURUM-BELT-1";
+        let controller = healthy_transport_controller("TC", system, belt, hub, &[]);
+
+        let conservative =
+            transport_service_present(std::slice::from_ref(&controller), system, belt, hub);
+        assert_eq!(conservative.state, EvidenceState::Unknown);
+
+        let authoritative =
+            transport_service_present_with_authority(&[controller], system, belt, hub, true);
+        assert_eq!(authoritative.state, EvidenceState::Absent);
+        assert_eq!(authoritative.usable_freighter_count(), 0);
+        assert!(authoritative.adopted_freighters.is_empty());
     }
 
     #[test]

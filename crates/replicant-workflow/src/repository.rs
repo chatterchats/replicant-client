@@ -1250,7 +1250,37 @@ impl WorkflowRepository {
         workflow_id: WorkflowId,
         resource: ResourceKey,
     ) -> Result<ClaimAcquireOutcome, RepositoryError> {
-        self.acquire_claim_preserving_reserve(workflow_id, resource, &[], 0)
+        self.acquire_claims(workflow_id, std::slice::from_ref(&resource))?
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                RepositoryError::Compatibility("claim acquisition returned no result".into())
+            })
+    }
+
+    /// Atomically acquires an exact set of exclusive resource claims.
+    ///
+    /// The entire set rolls back when any resource conflicts.
+    pub fn acquire_claims(
+        &self,
+        workflow_id: WorkflowId,
+        resources: &[ResourceKey],
+    ) -> Result<Vec<ClaimAcquireOutcome>, RepositoryError> {
+        let now = now_millis()?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let owner =
+            read_in(&transaction, workflow_id)?.ok_or(RepositoryError::NotFound(workflow_id))?;
+        if owner.status.is_terminal() {
+            return Err(RepositoryError::TerminalClaimOwner { workflow_id });
+        }
+        let outcomes = resources
+            .iter()
+            .cloned()
+            .map(|resource| acquire_claim_in(&transaction, workflow_id, resource, now))
+            .collect::<Result<Vec<_>, _>>()?;
+        transaction.commit()?;
+        Ok(outcomes)
     }
 
     /// Claims an asset only if an exact observed reserve remains unclaimed.
@@ -4090,6 +4120,71 @@ fn row_to_trigger(row: &rusqlite::Row<'_>) -> Result<AutomationTrigger, rusqlite
     })
 }
 
+fn acquire_claim_in(
+    transaction: &rusqlite::Transaction<'_>,
+    workflow_id: WorkflowId,
+    resource: ResourceKey,
+    now: i64,
+) -> Result<ClaimAcquireOutcome, RepositoryError> {
+    let (namespace, key) = resource.persisted_parts()?;
+    if let Some(owner) = physical_claim_conflict_in(transaction, &resource, workflow_id)? {
+        return Err(RepositoryError::ClaimConflict { resource, owner });
+    }
+    let existing = transaction
+        .query_row(
+            "SELECT workflow_id, acquired_at, resource_namespace, resource_key
+             FROM workflow_resource_claims
+             WHERE (resource_key = ?2 OR (?1 IN ('device', 'autofactory', 'replicant')
+               AND resource_key = ?2 COLLATE NOCASE))
+               AND (resource_namespace = ?1 OR
+                 (?1 IN ('device', 'autofactory')
+                   AND resource_namespace IN ('device', 'autofactory')))
+             LIMIT 1",
+            params![namespace, key],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    if let Some((existing_owner, acquired_at, stored_namespace, stored_key)) = existing {
+        let existing_owner = parse_id(existing_owner)?;
+        if existing_owner != workflow_id {
+            return Err(RepositoryError::ClaimConflict {
+                resource,
+                owner: existing_owner,
+            });
+        }
+        transaction.execute(
+            "UPDATE workflow_resource_claims SET updated_at = ?1
+             WHERE resource_namespace = ?2 AND resource_key = ?3",
+            params![now, stored_namespace, stored_key],
+        )?;
+        return Ok(ClaimAcquireOutcome::AlreadyOwned(ResourceClaim {
+            resource,
+            workflow_id,
+            acquired_at,
+            updated_at: now,
+        }));
+    }
+    transaction.execute(
+        "INSERT INTO workflow_resource_claims (
+            resource_namespace, resource_key, workflow_id, acquired_at, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?4)",
+        params![namespace, key, workflow_id.to_string(), now],
+    )?;
+    Ok(ClaimAcquireOutcome::Acquired(ResourceClaim {
+        resource,
+        workflow_id,
+        acquired_at: now,
+        updated_at: now,
+    }))
+}
+
 fn physical_claim_conflict_in(
     transaction: &rusqlite::Transaction<'_>,
     resource: &ResourceKey,
@@ -4129,23 +4224,40 @@ fn transfer_claims_in(
     }
     for resource in resources {
         let (namespace, key) = resource.persisted_parts()?;
-        let owner: Option<String> = transaction
-            .query_row(
+        let owners = {
+            let mut statement = transaction.prepare(
                 "SELECT workflow_id FROM workflow_resource_claims
                  WHERE (resource_key = ?2 OR (?1 IN ('device', 'autofactory', 'replicant')
-                   AND resource_key = ?2 COLLATE NOCASE)) AND workflow_id NOT IN (?3, ?4)
+                   AND resource_key = ?2 COLLATE NOCASE))
                    AND (resource_namespace = ?1 OR
-                     (?1 IN ('device', 'autofactory') AND resource_namespace IN ('device', 'autofactory')))
-                 LIMIT 1",
-                params![namespace, key, from.to_string(), to.to_string()],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if let Some(owner) = owner.map(parse_id).transpose()? {
-            return Err(RepositoryError::ClaimConflict {
-                resource: resource.clone(),
-                owner,
-            });
+                     (?1 IN ('device', 'autofactory') AND resource_namespace IN ('device', 'autofactory')))",
+            )?;
+            statement
+                .query_map(params![namespace, key], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let mut source_owns = false;
+        let mut destination_owns = false;
+        for owner in owners {
+            let owner = parse_id(owner)?;
+            if owner == from {
+                source_owns = true;
+            } else if owner == to {
+                destination_owns = true;
+            } else {
+                return Err(RepositoryError::ClaimConflict {
+                    resource: resource.clone(),
+                    owner,
+                });
+            }
+        }
+        if destination_owns && !source_owns {
+            continue;
+        }
+        if !source_owns {
+            return Err(RepositoryError::Compatibility(
+                "claim handoff requires source custody".into(),
+            ));
         }
         if transaction.query_row(
             "SELECT COUNT(*) FROM workflow_resource_allocations
@@ -4164,18 +4276,10 @@ fn transfer_claims_in(
         transaction.execute(
             "UPDATE workflow_resource_claims SET workflow_id = ?3, updated_at = ?4
              WHERE (resource_key = ?2 OR (?1 IN ('device', 'autofactory', 'replicant')
-               AND resource_key = ?2 COLLATE NOCASE)) AND
-               (resource_namespace = ?1 OR
+               AND resource_key = ?2 COLLATE NOCASE)) AND workflow_id = ?5
+               AND (resource_namespace = ?1 OR
                  (?1 IN ('device', 'autofactory') AND resource_namespace IN ('device', 'autofactory')))",
-            params![namespace, key, to.to_string(), now],
-        )?;
-        transaction.execute(
-            "INSERT INTO workflow_resource_claims
-             (resource_namespace, resource_key, workflow_id, acquired_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?4)
-             ON CONFLICT(resource_namespace, resource_key) DO UPDATE SET
-             workflow_id = excluded.workflow_id, updated_at = excluded.updated_at",
-            params![namespace, key, to.to_string(), now],
+            params![namespace, key, to.to_string(), now, from.to_string()],
         )?;
     }
     Ok(())

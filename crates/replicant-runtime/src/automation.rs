@@ -68,8 +68,9 @@ use crate::{
     mining::{
         AmiTransportRouteIntent, EvidenceState, HUB_MAINTENANCE_MIN_HEALTHY,
         HUB_MAINTENANCE_READY_PCT, HUB_MAINTENANCE_ROLE, MAX_TRANSPORT_FREIGHTERS,
-        MIN_TRANSPORT_FREIGHTERS, MiningExpansionRequest, MiningMission, execute_expansion,
-        maintenance_hub_pool_audit, maintenance_replacement_ready, transport_service_present,
+        MIN_TRANSPORT_FREIGHTERS, MiningExpansionRequest, MiningMission, TransportBacklogClass,
+        execute_expansion, maintenance_hub_pool_audit, maintenance_replacement_ready,
+        transport_backlog_class, transport_service_present_with_authority,
     },
     observatory::auto_prospect,
     relay::{
@@ -735,6 +736,9 @@ pub struct RegionalDispatchIntent {
     /// Optional operator tag applied to every device manufactured for this dispatch.
     #[serde(default)]
     pub print_tag: Option<String>,
+    /// Return exact delivered payload claims to the live parent on success.
+    #[serde(default)]
+    pub return_claims_to_parent: bool,
 }
 
 /// Restart-safe provisioning and delivery state for a regional dispatch.
@@ -935,6 +939,9 @@ pub struct LogisticsManifestIntent {
     /// Human-readable reason this manifest exists.
     #[serde(default)]
     pub purpose: String,
+    /// Return exact delivered payload claims to the live parent on success.
+    #[serde(default)]
+    pub return_claims_to_parent: bool,
 }
 
 /// Durable state for one recovery manifest tag-cleanup operation.
@@ -5775,6 +5782,24 @@ fn mining_transport_capacity_route_key(intent: &MiningTransportCapacityIntent) -
     )
 }
 
+fn mining_transport_capacity_direction_authorized(
+    backlog_units: i64,
+    current_freighters: usize,
+    target_freighters: usize,
+) -> bool {
+    let backlog = transport_backlog_class(backlog_units);
+    if target_freighters > current_freighters {
+        matches!(
+            backlog,
+            TransportBacklogClass::ScaleUp | TransportBacklogClass::Critical
+        )
+    } else if target_freighters < current_freighters {
+        backlog == TransportBacklogClass::Low
+    } else {
+        true
+    }
+}
+
 fn mining_transport_remaining_deficit(
     target_freighters: usize,
     current_freighters: usize,
@@ -6084,6 +6109,7 @@ async fn finish_mining_transport_scale_down(
                 return_transports: true,
                 allow_transport_staging: true,
                 region: Some(canonical_region(&intent.region)),
+                return_claims_to_parent: true,
                 purpose: format!(
                     "mining-transport-capacity:return:{}:{}",
                     mining_transport_capacity_route_key(intent),
@@ -6194,11 +6220,12 @@ impl WorkflowExecutor for MiningTransportCapacityWorkflow {
             refresh_mining_route_devices(&client, &intent.controller).await?;
 
             let devices = dispatch_owned_device_snapshots(&client).await?;
-            let audit = transport_service_present(
+            let audit = transport_service_present_with_authority(
                 &devices,
                 &intent.system,
                 &intent.collect,
                 &intent.deliver,
+                true,
             );
             if audit.state == EvidenceState::Unknown {
                 context
@@ -6230,6 +6257,43 @@ impl WorkflowExecutor for MiningTransportCapacityWorkflow {
             }
 
             let mut current = audit.usable_freighter_count();
+            let pristine = current != intent.target_freighters
+                && checkpoint.release_freighter.is_none()
+                && checkpoint.selected_freighters.is_empty()
+                && checkpoint.staging_children.is_empty()
+                && checkpoint.dispatch_child.is_none()
+                && !checkpoint.release_complete
+                && checkpoint.return_child.is_none();
+            if pristine {
+                let inventories = fetch_inventories_at_location(&client, &intent.collect).await?;
+                if inventories.is_empty() {
+                    context
+                        .advance_to("waiting_for_capacity_backlog_evidence", &checkpoint)
+                        .map_err(string_error)?;
+                    context.mark_waiting().map_err(string_error)?;
+                    return Ok(());
+                }
+                let backlog_units = inventory_at_location(&inventories, &intent.collect)
+                    .into_values()
+                    .filter(|quantity| *quantity > 0)
+                    .fold(0_i64, i64::saturating_add);
+                if !mining_transport_capacity_direction_authorized(
+                    backlog_units,
+                    current,
+                    intent.target_freighters,
+                ) {
+                    return context
+                        .mark_succeeded(Some(serde_json::json!({
+                            "route": mining_transport_capacity_route_key(&intent),
+                            "target_freighters": intent.target_freighters,
+                            "usable_freighters": audit.usable_freighter_count(),
+                            "observed_backlog_units": backlog_units,
+                            "superseded": true,
+                        })))
+                        .map_err(string_error);
+                }
+            }
+
             if current == intent.target_freighters {
                 for code in checkpoint
                     .selected_freighters
@@ -6341,6 +6405,7 @@ impl WorkflowExecutor for MiningTransportCapacityWorkflow {
                                 return_transports: true,
                                 allow_transport_staging: true,
                                 region: Some(canonical_region(&intent.region)),
+                                return_claims_to_parent: true,
                                 purpose: format!(
                                     "mining-transport-capacity:stage:{}:{}",
                                     mining_transport_capacity_route_key(&intent),
@@ -6401,11 +6466,12 @@ impl WorkflowExecutor for MiningTransportCapacityWorkflow {
                 client.devices().refresh(code).await.map_err(string_error)?;
             }
             let staged_devices = dispatch_owned_device_snapshots(&client).await?;
-            let staged_audit = transport_service_present(
+            let staged_audit = transport_service_present_with_authority(
                 &staged_devices,
                 &intent.system,
                 &intent.collect,
                 &intent.deliver,
+                true,
             );
             if staged_audit.state == EvidenceState::Unknown {
                 context
@@ -6503,6 +6569,7 @@ impl WorkflowExecutor for MiningTransportCapacityWorkflow {
                                 quantity,
                                 device_type: "cargo_freighter".to_owned(),
                             }],
+                            return_claims_to_parent: true,
                             print_tag: Some(replicant_mining_planner::site_tag(&intent.system)),
                             ..RegionalDispatchIntent::default()
                         }))
@@ -6524,11 +6591,12 @@ impl WorkflowExecutor for MiningTransportCapacityWorkflow {
                 client.devices().refresh(code).await.map_err(string_error)?;
             }
             let refreshed = dispatch_owned_device_snapshots(&client).await?;
-            let final_audit = transport_service_present(
+            let final_audit = transport_service_present_with_authority(
                 &refreshed,
                 &intent.system,
                 &intent.collect,
                 &intent.deliver,
+                true,
             );
             if final_audit.state == EvidenceState::Unknown {
                 context
@@ -6647,11 +6715,10 @@ impl WorkflowExecutor for MiningTransportCapacityWorkflow {
 
 fn mining_maintenance_rotation_key(intent: &MiningMaintenanceRotationIntent) -> String {
     format!(
-        "{}|{}|{}|{}",
+        "{}|{}|{}",
         canonical_region(&intent.region),
         intent.system.trim().to_ascii_uppercase(),
         intent.site_belt.trim().to_ascii_uppercase(),
-        intent.worn_drone.trim().to_ascii_uppercase()
     )
 }
 
@@ -6901,14 +6968,6 @@ fn recover_mining_maintenance_pool_child(
     Ok(false)
 }
 
-fn maintenance_workflow_child_pending(
-    context: &WorkflowContext,
-    child_id: WorkflowId,
-    label: &str,
-) -> Result<bool, String> {
-    mining_transport_child_pending(context, child_id, label)
-}
-
 fn maintenance_hub_available_count(
     context: &WorkflowContext,
     codes: &[String],
@@ -7018,7 +7077,7 @@ async fn provision_rotation_replacement(
     checkpoint: &mut MiningMaintenanceRotationCheckpoint,
 ) -> Result<bool, String> {
     if let Some(child_id) = checkpoint.provision_child {
-        if maintenance_workflow_child_pending(context, child_id, "maintenance replacement")? {
+        if mining_transport_child_pending(context, child_id, "maintenance replacement")? {
             context
                 .advance_to("provisioning_replacement", checkpoint)
                 .map_err(string_error)?;
@@ -7054,6 +7113,7 @@ async fn provision_rotation_replacement(
                 quantity: 1,
                 device_type: replicant_mining_planner::MAINTENANCE_DRONE.to_owned(),
             }],
+            return_claims_to_parent: true,
             ..RegionalDispatchIntent::default()
         }))
         .map_err(string_error)?;
@@ -7087,6 +7147,7 @@ fn maintenance_delivery_manifest(
             mining_maintenance_rotation_key(intent),
             code
         ),
+        return_claims_to_parent: true,
         ..LogisticsManifestIntent::default()
     }
 }
@@ -7109,6 +7170,7 @@ fn maintenance_recovery_manifest(
             mining_maintenance_rotation_key(intent),
             intent.worn_drone
         ),
+        return_claims_to_parent: true,
         ..LogisticsManifestIntent::default()
     }
 }
@@ -7375,7 +7437,7 @@ async fn recover_worn_maintenance(
         return Ok(true);
     }
     if let Some(child_id) = checkpoint.recovery_child {
-        if maintenance_workflow_child_pending(context, child_id, "worn maintenance recovery")? {
+        if mining_transport_child_pending(context, child_id, "worn maintenance recovery")? {
             context
                 .advance_to("recovering_worn_drone", checkpoint)
                 .map_err(string_error)?;
@@ -7560,14 +7622,19 @@ impl WorkflowExecutor for MiningMaintenanceRotationWorkflow {
                     .snapshot()
                     .await
                     .map_err(string_error)?;
-                if worn.operational_capacity.is_none() {
+                let still_at_site = worn.access == AccessScope::Owned
+                    && device_at(&worn, &intent.site_belt)
+                    && worn.travel.is_none()
+                    && worn.relationships.attached_to.is_none()
+                    && worn.relationships.stowed_in.is_none();
+                if worn.operational_capacity.is_none() && still_at_site {
                     context
                         .advance_to("waiting_for_worn_capacity_evidence", &checkpoint)
                         .map_err(string_error)?;
                     context.mark_waiting().map_err(string_error)?;
                     return Ok(());
                 }
-                if !crate::mining::maintenance_rotation_due(&worn) {
+                if !still_at_site || !crate::mining::maintenance_rotation_due(&worn) {
                     return context
                         .mark_succeeded(Some(serde_json::json!({
                             "worn_drone": intent.worn_drone, "rotation_required": false,
@@ -7678,7 +7745,7 @@ impl WorkflowExecutor for MiningMaintenancePoolWorkflow {
                     .map_err(string_error)?;
             }
             if let Some(child_id) = checkpoint.provision_child
-                && maintenance_workflow_child_pending(
+                && mining_transport_child_pending(
                     context,
                     child_id,
                     "maintenance pool provisioning",
@@ -7783,7 +7850,7 @@ impl WorkflowExecutor for MiningMaintenancePoolWorkflow {
             }
 
             if let Some(child_id) = checkpoint.provision_child {
-                if maintenance_workflow_child_pending(
+                if mining_transport_child_pending(
                     context,
                     child_id,
                     "maintenance pool provisioning",
@@ -7875,6 +7942,7 @@ impl WorkflowExecutor for MiningMaintenancePoolWorkflow {
                         quantity,
                         device_type: replicant_mining_planner::MAINTENANCE_DRONE.to_owned(),
                     }],
+                    return_claims_to_parent: true,
                     ..RegionalDispatchIntent::default()
                 }))
                 .map_err(string_error)?;
@@ -8066,31 +8134,23 @@ impl WorkflowExecutor for RegionalDispatchWorkflow {
             let report = execute_delivery(&client, &plan, DeliveryOptions::default())
                 .await
                 .map_err(string_error)?;
-            complete_mining_payload_delivery(context, report, &checkpoint.devices)
+            complete_payload_delivery(
+                context,
+                report,
+                &checkpoint.devices,
+                intent.return_claims_to_parent,
+            )
         })
     }
 }
 
-fn complete_mining_payload_delivery<R: Serialize>(
+fn complete_payload_delivery<R: Serialize>(
     context: &mut WorkflowContext,
     report: R,
     codes: &[String],
+    return_claims_to_parent: bool,
 ) -> Result<(), String> {
-    let parent = context
-        .repository()
-        .read(context.id())
-        .map_err(string_error)?
-        .and_then(|workflow| workflow.parent_id)
-        .map(|id| context.repository().read(id))
-        .transpose()
-        .map_err(string_error)?
-        .flatten();
-    let mining_parent = parent.is_some_and(|parent| {
-        parent.kind == mining_transport_capacity_workflow_kind()
-            || parent.kind == mining_maintenance_rotation_workflow_kind()
-            || parent.kind == mining_maintenance_pool_workflow_kind()
-    });
-    if mining_parent {
+    if return_claims_to_parent {
         let resources = codes
             .iter()
             .cloned()
@@ -8705,7 +8765,12 @@ impl WorkflowExecutor for LogisticsManifestWorkflow {
                     return Ok(());
                 }
                 let report = checkpoint.delivery_report.clone().unwrap_or_default();
-                return complete_mining_payload_delivery(context, report, &intent.device_codes);
+                return complete_payload_delivery(
+                    context,
+                    report,
+                    &intent.device_codes,
+                    intent.return_claims_to_parent,
+                );
             }
 
             let plan =
@@ -8781,7 +8846,12 @@ impl WorkflowExecutor for LogisticsManifestWorkflow {
                     {
                         return Ok(());
                     }
-                    return complete_mining_payload_delivery(context, report, &intent.device_codes);
+                    return complete_payload_delivery(
+                        context,
+                        report,
+                        &intent.device_codes,
+                        intent.return_claims_to_parent,
+                    );
                 }
             }
 
@@ -8975,7 +9045,12 @@ async fn execute_logistics_manifest_plan(
     {
         return Ok(());
     }
-    complete_mining_payload_delivery(context, report, &intent.device_codes)
+    complete_payload_delivery(
+        context,
+        report,
+        &intent.device_codes,
+        intent.return_claims_to_parent,
+    )
 }
 
 /// Derives the stable operation identity used for one workflow's exact
@@ -13159,6 +13234,7 @@ async fn ensure_trade_payment_ready(
                     intent.controller, intent.trade_code
                 ),
                 local_control_replicant: None,
+                return_claims_to_parent: false,
             }))
             .map_err(string_error)?;
         for code in &payment_codes {
@@ -14815,6 +14891,7 @@ async fn ensure_shop_trade_criteria(
                     intent.device_type, shop.controller_code, shop.trade_code
                 ),
                 local_control_replicant: None,
+                return_claims_to_parent: false,
             }))
             .map_err(string_error)?;
         checkpoint.criteria_logistics_child = Some(child.id);
@@ -14863,6 +14940,7 @@ async fn ensure_shop_trade_criteria(
                     intent.device_type, shop.controller_code, shop.trade_code
                 ),
                 local_control_replicant: None,
+                return_claims_to_parent: false,
             }))
             .map_err(string_error)?;
         for code in &staged_codes {
@@ -15076,19 +15154,38 @@ async fn fetch_account_inventories(
     Err("account inventory exceeded the 100-page safety bound".to_owned())
 }
 
+async fn fetch_inventories_at_location(
+    client: &Client,
+    location: &str,
+) -> Result<Vec<replicant_client::domain::Inventory>, String> {
+    let mut cursor = None;
+    let mut inventories = Vec::new();
+    for _ in 0..100 {
+        let (mut page, next_cursor) = client
+            .inventory()
+            .list(&replicant_client::raw::inventory::AccountInventoryQuery {
+                location: Some(location.to_owned()),
+                cursor,
+                limit: Some(100),
+            })
+            .await
+            .map_err(string_error)?;
+        inventories.append(&mut page);
+        let Some(next) = next_cursor else {
+            return Ok(inventories);
+        };
+        cursor = Some(next);
+    }
+    Err(format!(
+        "inventory at {location} exceeded the 100-page safety bound"
+    ))
+}
+
 async fn fetch_inventory_at_location(
     client: &Client,
     location: &str,
 ) -> Result<ResourceMap, String> {
-    let (inventories, _) = client
-        .inventory()
-        .list(&replicant_client::raw::inventory::AccountInventoryQuery {
-            location: Some(location.to_owned()),
-            cursor: None,
-            limit: Some(100),
-        })
-        .await
-        .map_err(string_error)?;
+    let inventories = fetch_inventories_at_location(client, location).await?;
     Ok(inventory_at_location(&inventories, location))
 }
 
@@ -16168,6 +16265,7 @@ async fn ensure_scan_tour_fleet_capacity(
             region: None,
             purpose: format!("scan-tour-fleet:{}", context.id()),
             local_control_replicant: None,
+            return_claims_to_parent: false,
         }))
         .map_err(string_error)?;
     for code in &printed_codes {
@@ -17629,12 +17727,28 @@ async fn manufacture_regional_dispatch(
 ) -> Result<bool, String> {
     if !checkpoint.print_requests.is_empty() {
         let print_tags = regional_dispatch_print_tags(intent, checkpoint);
-        let mut options = QueueOptions::at(intent.source.clone());
-        options.tags = print_tags.clone();
-        options.wait_timeout = Duration::from_secs(DEFAULT_WAIT_SECONDS);
-        queue_prints_with_components(client, &checkpoint.print_requests, &options)
-            .await
-            .map_err(string_error)?;
+        let status = printing_status_in_system(
+            client,
+            &intent.source,
+            &checkpoint.print_requests,
+            &print_tags,
+        )
+        .await
+        .map_err(string_error)?;
+        let remaining = status
+            .remaining_requests
+            .into_iter()
+            .filter(|(_, quantity)| *quantity > 0)
+            .map(|(device_type, quantity)| PrintRequest::new(device_type, quantity))
+            .collect::<Vec<_>>();
+        if !remaining.is_empty() {
+            let mut options = QueueOptions::at(intent.source.clone());
+            options.tags = print_tags.clone();
+            options.wait_timeout = Duration::from_secs(DEFAULT_WAIT_SECONDS);
+            queue_prints_with_components(client, &remaining, &options)
+                .await
+                .map_err(string_error)?;
+        }
         loop {
             let status = printing_status_in_system(
                 client,
@@ -23175,6 +23289,24 @@ mod tests {
                 "regional-stock:delta".to_owned()
             ]
         );
+    }
+
+    #[test]
+    fn mining_capacity_mutation_rechecks_current_backlog_direction() {
+        let cases = [
+            ("scale up remains authorized", 5_001, 1, 2, true),
+            ("scale up is superseded", 5_000, 1, 2, false),
+            ("scale down remains authorized", 999, 2, 1, true),
+            ("scale down is superseded", 1_000, 2, 1, false),
+            ("already at target", 54_979, 2, 2, true),
+        ];
+        for (name, backlog, current, target, expected) in cases {
+            assert_eq!(
+                mining_transport_capacity_direction_authorized(backlog, current, target),
+                expected,
+                "{name}"
+            );
+        }
     }
 
     fn dispatch_test_device(code: &str, device_type: &str, location: &str) -> Device {

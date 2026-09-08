@@ -438,7 +438,8 @@ pub struct DirectorMiningOpsSummary {
     pub healthy_remote_maintenance: usize,
     /// Managed sites outside the exact manufacturing/home belt.
     pub total_remote_sites: usize,
-    /// Unclaimed replacement-ready hub patrol drones; absent without an exact home.
+    /// Unclaimed replacement-ready hub patrol drones; absent when the exact
+    /// home or authoritative device health evidence is unavailable.
     pub hub_ready: Option<usize>,
     /// Client-policy hard minimum for the healthy hub patrol pool.
     pub hub_minimum: usize,
@@ -3849,7 +3850,8 @@ mod tests {
         assert!(decoded.urgency.is_empty());
         assert!(decoded.workforce.regions.is_empty());
         assert_eq!(
-            serde_json::to_value(DirectorGoalKind::ExpandMiningOps).expect("persisted goal identity"),
+            serde_json::to_value(DirectorGoalKind::ExpandMiningOps)
+                .expect("persisted goal identity"),
             serde_json::json!("expand_mining_ops")
         );
     }

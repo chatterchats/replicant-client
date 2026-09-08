@@ -73,7 +73,9 @@ impl ResourceBroker {
             .into_iter()
             .chain(self.repository.autofactory_claims()?)
             .filter_map(|claim| match claim.resource {
-                ResourceKey::Device(code) | ResourceKey::Autofactory(code) => Some(code),
+                ResourceKey::Device(code) | ResourceKey::Autofactory(code) => {
+                    Some(code.to_ascii_uppercase())
+                }
                 _ => None,
             })
             .collect::<BTreeSet<_>>();
@@ -108,7 +110,7 @@ impl ResourceBroker {
             // Keep them out of every pool until durable custody exists; once
             // claimed, the allocation transaction admits only that owner.
             if replicant_protocol::workflow_reserved(&device.tags)
-                && !claimed_devices.contains(&device_code)
+                && !claimed_devices.contains(&device_code.to_ascii_uppercase())
             {
                 continue;
             }

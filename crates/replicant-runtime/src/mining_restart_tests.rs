@@ -105,6 +105,84 @@ async fn resume_once(
 }
 
 #[tokio::test]
+async fn regional_dispatch_restart_adopts_tagged_output_without_reprinting() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/blueprints"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"blueprints": []})),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/inventory"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"locations": [], "next_cursor": null})),
+        )
+        .mount(&server)
+        .await;
+    let client = client_at(&server).await;
+    seed_device(
+        &server,
+        &client,
+        serde_json::json!({
+            "device_code": "PRINTED",
+            "device_type": "maintenance_drone",
+            "location": "HUB-BELT-1",
+            "status": "idle",
+            "tags": ["dispatch:crash"]
+        }),
+    )
+    .await;
+    let repository = Arc::new(WorkflowRepository::open_in_memory().expect("repository"));
+    let mut request = new_regional_dispatch_workflow(RegionalDispatchIntent {
+        source: "HUB-BELT-1".into(),
+        destination: "HUB-BELT-1".into(),
+        devices: vec![DeviceRequest {
+            device_type: "maintenance_drone".into(),
+            quantity: 1,
+        }],
+        ..Default::default()
+    });
+    request.checkpoint = RegionalDispatchCheckpoint {
+        source_location: Some("HUB-BELT-1".into()),
+        print_tag: "dispatch:crash".into(),
+        selection_complete: true,
+        print_requests: vec![PrintRequest::new("maintenance_drone", 1)],
+        plan: Some(DeliveryPlan {
+            origin: "HUB-BELT-1".into(),
+            destination: "HUB-BELT-1".into(),
+            payload_devices: vec![PayloadDevice {
+                code: "PRINTED".into(),
+                device_type: "maintenance_drone".into(),
+                origin: "HUB-BELT-1".into(),
+            }],
+            device_carriers: vec!["UNUSED".into()],
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let workflow = repository.create(request).expect("regional dispatch");
+
+    let resumed = resume_once(repository, client.clone(), workflow.id).await;
+    assert_eq!(resumed.status, WorkflowStatus::Succeeded);
+    let checkpoint: RegionalDispatchCheckpoint = resumed.checkpoint().expect("checkpoint");
+    assert!(checkpoint.manufacturing_complete);
+    assert_eq!(checkpoint.devices, ["PRINTED"]);
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("requests")
+            .iter()
+            .all(|request| request.method == "GET"),
+        "accepted tagged output must suppress another print submission"
+    );
+    client.close().await.expect("close");
+}
+
+#[tokio::test]
 async fn mining_restart_keeps_provisioned_replacement_when_fresh_stock_appears() {
     let server = MockServer::start().await;
     let client = client_at(&server).await;
@@ -180,8 +258,11 @@ async fn mining_restart_after_replacement_delivery_and_patrol_recovers_only_worn
         intent.site_belt.clone(),
     ));
     recovery.parent_id = Some(parent.id);
+    repository
+        .acquire_claim(parent.id, ResourceKey::Device(intent.worn_drone.clone()))
+        .expect("parent worn-drone custody");
     let child = repository
-        .create(recovery)
+        .create_with_parent_claims(recovery, &[ResourceKey::Device(intent.worn_drone.clone())])
         .expect("recovery created before checkpoint");
     let child_id = child.id;
     settle_child(&repository, child, WorkflowStatus::Paused);
@@ -434,11 +515,36 @@ async fn mining_authority_hub_patrol_health_never_becomes_a_spurious_print_defic
 
 #[tokio::test]
 async fn mining_rotation_rechecks_wear_and_discovers_dynamic_hub_stock() {
-    for (capacity, stocked, expected_status, needs_child) in [
-        (None, false, WorkflowStatus::Waiting, false),
-        (Some(30.0), false, WorkflowStatus::Succeeded, false),
-        (Some(29.9), false, WorkflowStatus::Waiting, true),
-        (Some(29.9), true, WorkflowStatus::Waiting, true),
+    for (capacity, location, stocked, expected_status, needs_child) in [
+        (None, "REMOTE-BELT-1", false, WorkflowStatus::Waiting, false),
+        (
+            Some(30.0),
+            "REMOTE-BELT-1",
+            false,
+            WorkflowStatus::Succeeded,
+            false,
+        ),
+        (
+            Some(29.9),
+            "HUB-BELT-1",
+            false,
+            WorkflowStatus::Succeeded,
+            false,
+        ),
+        (
+            Some(29.9),
+            "REMOTE-BELT-1",
+            false,
+            WorkflowStatus::Waiting,
+            true,
+        ),
+        (
+            Some(29.9),
+            "REMOTE-BELT-1",
+            true,
+            WorkflowStatus::Waiting,
+            true,
+        ),
     ] {
         let server = MockServer::start().await;
         let client = client_at(&server).await;
@@ -447,7 +553,7 @@ async fn mining_rotation_rechecks_wear_and_discovers_dynamic_hub_stock() {
             &client,
             serde_json::json!({
                 "device_code": "WORN", "device_type": "maintenance_drone",
-                "location": "REMOTE-BELT-1", "status": "idle", "operational_capacity": capacity,
+                "location": location, "status": "idle", "operational_capacity": capacity,
                 "ami_directive": {"directive": "patrol"}, "ami_directive_status": "active"
             }),
         )
@@ -486,7 +592,7 @@ async fn mining_rotation_rechecks_wear_and_discovers_dynamic_hub_stock() {
         let resumed = resume_once(repository.clone(), client.clone(), workflow.id).await;
         assert_eq!(
             resumed.status, expected_status,
-            "{capacity:?}, stocked={stocked}"
+            "{capacity:?}, location={location}, stocked={stocked}"
         );
         let children = repository.list_children(workflow.id).expect("children");
         assert_eq!(children.len(), usize::from(needs_child));

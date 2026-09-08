@@ -1382,7 +1382,7 @@ const workflowDisplayNames: Record<string, string> = {
   "logistics.regional_dispatch": "Provision Regional Dispatch",
   "mining.campaign": "Manage Mining Ops",
   "mining.deploy": "Deploy Mining Operation",
-  "mining.expansion": "Expand Mining Operations",
+  "mining.expansion": "Manage Mining Operations",
   "mining.route": "Deploy Mining Route",
   "mining.site": "Deploy Mining Site",
   "mining.stage": "Stage Mining Equipment",
@@ -1415,6 +1415,8 @@ const workflowStepNames: Record<string, string> = {
   waiting_for_released_capacity_location:
     "Waiting for released Cargo Freighter location",
   waiting_for_route_evidence: "Waiting for authoritative AMI route health",
+  waiting_for_capacity_backlog_evidence:
+    "Waiting for authoritative mining backlog",
   provisioning_capacity: "Provisioning the Cargo Freighter shortfall",
   staging_reusable_capacity: "Delivering reusable Cargo Freighters",
   waiting_for_capacity_adoption_evidence: "Confirming Cargo Freighter adoption",

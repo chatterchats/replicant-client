@@ -3916,6 +3916,7 @@ fn reconcile_stranded_device_recovery(
         ),
         placement_recovery: Some(candidate.metadata.clone()),
         local_control_replicant: None,
+        return_claims_to_parent: false,
     };
     let created = context.repository.create_or_reuse_active(
         new_logistics_manifest_workflow(intent),
@@ -4217,6 +4218,7 @@ fn reconcile_maintain_system_hubs(
                     region: Some(region.region.clone()),
                     purpose,
                     local_control_replicant: None,
+                    return_claims_to_parent: false,
                 },
             ))?;
             tracing::info!(
@@ -5986,6 +5988,7 @@ fn reconcile_unserviced_resources(
         allow_transport_staging: true,
         region: Some(region.region.clone()),
         purpose: purpose.clone(),
+        return_claims_to_parent: false,
     };
     let created = context.repository.create_or_reuse_active(
         new_logistics_manifest_workflow(manifest),
@@ -6069,26 +6072,20 @@ fn save_mining_transport_capacity_trend(
 }
 
 fn mining_collection_backlog_units(inventories: &[Inventory], collect: &str) -> Option<i64> {
-    let matching = inventories
-        .iter()
-        .filter(|inventory| {
-            matches!(
-                &inventory.owner,
-                InventoryOwner::Location(owner)
-                    if owner.id.as_str().eq_ignore_ascii_case(collect)
-            )
-        })
-        .collect::<Vec<_>>();
-    if matching.is_empty() {
-        return None;
-    }
-    Some(
-        matching
-            .into_iter()
+    let mut matching = inventories.iter().filter(|inventory| {
+        matches!(
+            &inventory.owner,
+            InventoryOwner::Location(owner)
+                if owner.id.as_str().eq_ignore_ascii_case(collect)
+        )
+    });
+    matching.next().map(|first| {
+        std::iter::once(first)
+            .chain(matching)
             .flat_map(|inventory| &inventory.items)
             .filter(|item| item.quantity > 0)
-            .fold(0_i64, |total, item| total.saturating_add(item.quantity)),
-    )
+            .fold(0_i64, |total, item| total.saturating_add(item.quantity))
+    })
 }
 
 fn mining_transport_route_identity_matches(
@@ -6160,7 +6157,6 @@ fn mining_maintenance_rotation_workflow_matches(
     region: &str,
     system: &str,
     site_belt: &str,
-    worn_drone: &str,
 ) -> bool {
     if workflow.status.is_terminal() || workflow.kind != mining_maintenance_rotation_workflow_kind()
     {
@@ -6173,7 +6169,6 @@ fn mining_maintenance_rotation_workflow_matches(
             canonical_region(&intent.region) == canonical_region(region)
                 && intent.system.eq_ignore_ascii_case(system)
                 && intent.site_belt.eq_ignore_ascii_case(site_belt)
-                && intent.worn_drone.eq_ignore_ascii_case(worn_drone)
         })
 }
 
@@ -6427,8 +6422,8 @@ async fn refresh_mining_transport_service(
     for code in controlled {
         refreshed.push(client.devices().get(&code).await?.snapshot().await?);
     }
-    Ok(crate::mining::transport_service_present(
-        &refreshed, system, collect, deliver,
+    Ok(crate::mining::transport_service_present_with_authority(
+        &refreshed, system, collect, deliver, true,
     ))
 }
 
@@ -6793,7 +6788,6 @@ async fn reconcile_expand_mining(
                     &region.region,
                     system,
                     site_belt,
-                    worn_drone,
                 )
             });
             if already_active {
@@ -6891,11 +6885,12 @@ async fn reconcile_expand_mining(
                         deliver: deliver.to_owned(),
                         desired_freighters: crate::mining::MIN_TRANSPORT_FREIGHTERS,
                     };
-                    let mut audit = crate::mining::transport_service_present(
+                    let mut audit = crate::mining::transport_service_present_with_authority(
                         devices,
-                        &route.system,
+                        system,
                         &route.collect,
                         &route.deliver,
+                        device_authority_complete,
                     );
                     if !device_authority_complete
                         && audit.state == crate::mining::EvidenceState::Absent
@@ -7353,17 +7348,19 @@ async fn reconcile_expand_mining(
     }
     let critical_backlog = !critical_backlogs.is_empty()
         || capacity_priority == Some(MiningTransportCapacityPriority::CriticalBacklog);
+    let expansion_pending =
+        !pending_expansion.is_empty() || !incomplete_expansion_evidence.is_empty();
     if enabled && runtime.mining_priority != Some(priority) {
         tracing::info!(
             region = %region.region,
             priority = ?priority,
-            healthy_hub_pool = ?hub_pool_available_healthy,
+            unclaimed_healthy_hub_pool = ?hub_pool_available_healthy,
             expansion_candidates = pending_expansion.len(),
-            expansion_suppression_reason = if critical_backlog {
+            expansion_suppression_reason = if expansion_pending && critical_backlog {
                 "critical_backlog"
-            } else if higher_priority_mining_faults {
+            } else if expansion_pending && higher_priority_mining_faults {
                 "existing_operations_unhealthy"
-            } else if priority == MiningOpsPriority::ConnectivityProtection {
+            } else if expansion_pending && priority == MiningOpsPriority::ConnectivityProtection {
                 "connectivity_or_priority_protection"
             } else { "none" },
             critical_backlog,
@@ -7493,27 +7490,7 @@ async fn reconcile_expand_mining(
                     .clone()
                     .or_else(|| region.hub_system.clone())
             {
-                let transport_routes = region
-                    .hub_location
-                    .as_ref()
-                    .filter(|location| !location.trim().is_empty())
-                    .map(|deliver| {
-                        targets
-                            .iter()
-                            .filter_map(|system| {
-                                belt_designations
-                                    .get(system)
-                                    .and_then(|belts| belts.first())
-                                    .map(|collect| crate::mining::AmiTransportRouteIntent {
-                                        system: system.clone(),
-                                        collect: collect.clone(),
-                                        deliver: deliver.clone(),
-                                        desired_freighters: crate::mining::MIN_TRANSPORT_FREIGHTERS,
-                                    })
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                let transport_routes = Vec::new();
                 let target_systems = targets.iter().cloned().collect::<BTreeSet<_>>();
                 let result = repository.create_or_reuse_active(
                     new_mining_campaign_workflow(MiningCampaignIntent {
@@ -7624,7 +7601,6 @@ async fn reconcile_expand_mining(
                         &region.region,
                         &rotation.system,
                         &rotation.site_belt,
-                        &rotation.worn_drone,
                     ))
                 },
             )?;
@@ -7875,6 +7851,7 @@ async fn reconcile_expand_mining(
                     return_transports: relocation.origin.contains('-'),
                     allow_transport_staging: true,
                     region: Some(region.region.clone()),
+                    return_claims_to_parent: false,
                     purpose: mining_ward_relocation_purpose(
                         &region.region,
                         &relocation.ward_code,
@@ -8161,16 +8138,7 @@ fn mining_ops_summary(
                     devices
                         .iter()
                         .find(|device| device.key.id.as_str() == code)
-                        .is_some_and(|device| {
-                            device.operational_capacity.is_some_and(|capacity| {
-                                capacity.percent()
-                                    >= crate::mining::MINING_MAINTENANCE_ROTATION_THRESHOLD_PCT
-                            }) && device
-                                .active_directive
-                                .as_ref()
-                                .and_then(|active| active.directive.as_ref())
-                                .is_some_and(|directive| directive.as_str() == "patrol")
-                        })
+                        .is_some_and(crate::mining::maintenance_remote_healthy)
                 });
                 summary.healthy_remote_maintenance += usize::from(healthy);
             }
@@ -8186,8 +8154,13 @@ fn mining_ops_summary(
                     deliver: deliver.clone(),
                     desired_freighters: crate::mining::MIN_TRANSPORT_FREIGHTERS,
                 };
-                let transport =
-                    crate::mining::transport_service_present(devices, system, belt, deliver);
+                let transport = crate::mining::transport_service_present_with_authority(
+                    devices,
+                    system,
+                    belt,
+                    deliver,
+                    device_authority_complete,
+                );
                 summary.healthy_routes += usize::from(
                     transport.state == crate::mining::EvidenceState::Present
                         && mining_route_connectivity_target(&route, &relays, location_systems)
@@ -11654,14 +11627,6 @@ mod tests {
         for (name, signals, expected) in cases {
             assert_eq!(mining_ops_priority(signals), expected, "{name}");
         }
-        assert_eq!(
-            crate::mining::transport_backlog_class(5_000),
-            crate::mining::TransportBacklogClass::HealthyBand
-        );
-        assert_eq!(
-            crate::mining::transport_backlog_class(54_979),
-            crate::mining::TransportBacklogClass::Critical
-        );
     }
 
     #[test]
@@ -12192,7 +12157,7 @@ mod tests {
         }
         let mut location_systems = location_system_map(&locations);
         location_systems.insert("HUB-L4".into(), "HUB".into());
-        for backlog in [54_979, 5_000] {
+        for backlog in [54_979, 5_001, 5_000] {
             let repository = WorkflowRepository::open_in_memory().expect("repository");
             let mut observed = devices.clone();
             if backlog == 54_979 {
@@ -12235,12 +12200,15 @@ mod tests {
                     1,
                     "backlog={backlog}, pass={pass}, {summary:?}"
                 );
-                if backlog == 54_979 {
+                if backlog > 5_000 {
                     assert_eq!(workflows[0].kind, mining_transport_capacity_workflow_kind());
                     let intent = workflows[0]
                         .config::<MiningTransportCapacityIntent>()
                         .expect("capacity intent");
-                    assert_eq!(intent.target_freighters, 3);
+                    assert_eq!(
+                        intent.target_freighters,
+                        if backlog == 54_979 { 3 } else { 2 }
+                    );
                     assert!(
                         !requirements
                             .current_connectivity_requirements("alpha")
@@ -12272,6 +12240,7 @@ mod tests {
             ("missing_site", false, true),
             ("missing_ftl", false, true),
             ("known_repair", true, false),
+            ("zero_capacity", true, true),
         ] {
             let repository = WorkflowRepository::open_in_memory().expect("repository");
             let mut observed = devices.clone();
@@ -12279,6 +12248,22 @@ mod tests {
                 "missing_route" => observed.retain(|device| device.key.id.as_str() != "TC-0"),
                 "missing_site" => observed.retain(|device| device.key.id.as_str() != "MD-0"),
                 "missing_ftl" => observed.retain(|device| device.key.id.as_str() != "RELAY-0"),
+                "zero_capacity" => {
+                    observed.retain(|device| {
+                        device
+                            .relationships
+                            .controller
+                            .as_ref()
+                            .is_none_or(|controller| controller.id.as_str() != "TC-0")
+                    });
+                    observed
+                        .iter_mut()
+                        .find(|device| device.key.id.as_str() == "TC-0")
+                        .expect("transport controller")
+                        .relationships
+                        .controlled_devices
+                        .clear();
+                }
                 _ => mining_ops_directive(
                     observed
                         .iter_mut()
@@ -12312,15 +12297,18 @@ mod tests {
             .await
             .expect("authority reconcile");
             let workflows = repository.list().expect("workflows");
-            if fault == "known_repair" {
+            if matches!(fault, "known_repair" | "zero_capacity") {
                 assert_eq!(workflows.len(), 1);
-                assert_eq!(
-                    workflows[0]
-                        .config::<MiningCampaignIntent>()
-                        .expect("repair")
-                        .systems,
-                    vec!["SITE-0"]
-                );
+                let intent = workflows[0]
+                    .config::<MiningCampaignIntent>()
+                    .expect("repair");
+                assert_eq!(intent.systems, vec!["SITE-0"]);
+                if fault == "zero_capacity" {
+                    assert_eq!(intent.transport_routes.len(), 1);
+                    assert_eq!(intent.transport_routes[0].desired_freighters, 1);
+                } else {
+                    assert!(intent.transport_routes.is_empty());
+                }
             } else {
                 assert_eq!(
                     summary.status,
@@ -13033,6 +13021,38 @@ mod tests {
         assert!(mining_density_allowed(3, through_moderate));
         assert!(mining_density_allowed(2, through_moderate));
         assert!(!mining_density_allowed(1, through_moderate));
+        let belt_systems = ["HUB", "DENSE", "MODERATE", "SPARSE"]
+            .map(str::to_owned)
+            .into_iter()
+            .collect();
+        let managed_systems = ["MODERATE", "SPARSE"]
+            .map(str::to_owned)
+            .into_iter()
+            .collect();
+        let density = BTreeMap::from([
+            ("HUB".to_owned(), 3),
+            ("DENSE".to_owned(), 3),
+            ("MODERATE".to_owned(), 2),
+            ("SPARSE".to_owned(), 1),
+        ]);
+        let catalogue = vec![
+            positioned_star("HUB", 0.0, Some("delta")),
+            positioned_star("DENSE", 1.0, Some("delta")),
+            positioned_star("MODERATE", 2.0, Some("delta")),
+            positioned_star("SPARSE", 3.0, Some("delta")),
+        ];
+        assert_eq!(
+            desired_mining_systems(
+                &belt_systems,
+                &managed_systems,
+                &density,
+                Some("HUB"),
+                &catalogue,
+                dense_only,
+            ),
+            belt_systems,
+            "density policy filters only new expansion, not managed sites"
+        );
     }
 
     #[test]
@@ -13915,6 +13935,7 @@ mod tests {
                 region: Some("alpha".to_owned()),
                 purpose: hub_supply_purpose("alpha", "HUB1"),
                 local_control_replicant: None,
+                return_claims_to_parent: false,
             }))
             .expect("create manifest");
         let workflows = repository.list().expect("list workflows");
@@ -16369,7 +16390,6 @@ mod tests {
                         "alpha",
                         "REMOTE",
                         "REMOTE-BELT-1",
-                        "WORN",
                     ))
                 },
             )
