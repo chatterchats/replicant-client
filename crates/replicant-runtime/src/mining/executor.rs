@@ -27,8 +27,8 @@ use super::{
     AnyResult, Config, EvidenceState, ExecutionPrintBatch, MiningMission, MissionPhase,
     PrintPurpose, RoutePhase, SiteAssets, SitePhase, app_error, audit_site, controller_code,
     device_is_in_system, device_location, device_snapshots, device_type, fetch_blueprints,
-    find_device, has_reservation_tag, is_opaque_mining_mission_tag, save_plan, site_shortages,
-    stable_hash, transport_service_present,
+    find_device, has_reservation_tag, is_opaque_mining_mission_tag, site_shortages, stable_hash,
+    transport_service_present,
 };
 
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
@@ -200,7 +200,7 @@ pub(crate) async fn execute(
             .acquire_claims(claims.workflow_id, &resources)?;
     }
     migrate_legacy_mission_devices(client, mission, config.claims.as_ref()).await?;
-    save_plan(&config.plan_path, mission)?;
+    config.persist_mission(mission)?;
     reconcile(client, config, mission).await?;
     config.claim_devices(&mission_resource_codes(mission))?;
     tag_existing_automation(client, mission).await?;
@@ -228,7 +228,7 @@ pub(crate) async fn execute(
     } else {
         MissionPhase::CompletedWithWarnings
     };
-    save_plan(&config.plan_path, mission)?;
+    config.persist_mission(mission)?;
     Ok(())
 }
 
@@ -253,7 +253,7 @@ fn set_phase(config: &Config, mission: &mut MiningMission, phase: MissionPhase) 
         "mining mission phase"
     );
     mission.phase = mission.phase.advance_to(phase);
-    save_plan(&config.plan_path, mission)
+    config.persist_mission(mission)
 }
 
 async fn reconcile(client: &Client, config: &Config, mission: &mut MiningMission) -> AnyResult<()> {
@@ -288,7 +288,7 @@ async fn reconcile(client: &Client, config: &Config, mission: &mut MiningMission
         }
     }
     reconcile_carrier_claims(client, mission).await?;
-    save_plan(&config.plan_path, mission)?;
+    config.persist_mission(mission)?;
     Ok(())
 }
 
@@ -331,7 +331,7 @@ async fn execute_print_phase(
             "split pending print quantities into queue-safe unit batches"
         );
     }
-    save_plan(&config.plan_path, mission)?;
+    config.persist_mission(mission)?;
     if phase_batches(mission, purpose).is_empty() {
         return Ok(());
     }
@@ -617,7 +617,9 @@ async fn submit_print_batches(
                         role_tag(role_for_type(&batch.device_type)),
                         batch.batch_tag.clone(),
                     ];
-                    save_plan(&config.plan_path, mission).map_err(|error| error.to_string())?;
+                    config
+                        .persist_mission(mission)
+                        .map_err(|error| error.to_string())?;
                     Ok(Some(tags))
                 }
                 TrackedPrintUpdate::OperationRecorded {
@@ -627,7 +629,9 @@ async fn submit_print_batches(
                     let batch = &mut mission.print_batches[schedulable[assignment.request_index]];
                     batch.operation_id = Some(operation_id);
                     batch.submitted = true;
-                    save_plan(&config.plan_path, mission).map_err(|error| error.to_string())?;
+                    config
+                        .persist_mission(mission)
+                        .map_err(|error| error.to_string())?;
                     Ok(None)
                 }
             },
@@ -693,7 +697,7 @@ async fn wait_for_print_outputs(
         if purpose == PrintPurpose::Site {
             progress_site_pipeline(client, config, mission).await?;
         }
-        save_plan(&config.plan_path, mission)?;
+        config.persist_mission(mission)?;
         let incomplete = phase_batches(mission, purpose)
             .into_iter()
             .filter(|index| {
@@ -910,7 +914,7 @@ async fn allocate_available_site_assets(
         config.claim_devices(&site_resource_codes(&mission.sites[index]))?;
         mission.sites[index].phase = SitePhase::Ready;
         allocated += 1;
-        save_plan(&config.plan_path, mission)?;
+        config.persist_mission(mission)?;
         ensure_asset_ownership(
             client,
             &mission.sites[index].assets.codes(),
@@ -1222,7 +1226,7 @@ async fn resume_site_delivery(
     )
     .await?;
     mission.sites[index].phase = SitePhase::Deploying;
-    save_plan(&config.plan_path, mission)
+    config.persist_mission(mission)
 }
 
 async fn dispatch_ready_sites(
@@ -1309,7 +1313,7 @@ async fn dispatch_ready_sites(
         if payload.is_empty() {
             mission.sites[index].carrier = None;
             mission.sites[index].phase = SitePhase::Deploying;
-            save_plan(&config.plan_path, mission)?;
+            config.persist_mission(mission)?;
             configure_site(client, config, mission, index).await?;
             continue;
         }
@@ -1328,7 +1332,7 @@ async fn dispatch_ready_sites(
         mission.sites[index].carrier = Some(carrier.clone());
         config.claim_devices(std::slice::from_ref(&carrier))?;
         mission.sites[index].phase = SitePhase::Outbound;
-        save_plan(&config.plan_path, mission)?;
+        config.persist_mission(mission)?;
         add_tags(
             client,
             &carrier,
@@ -1363,7 +1367,7 @@ async fn dispatch_ready_sites(
     for ((index, carrier, payload, _), result) in deliveries.into_iter().zip(results) {
         result?;
         mission.sites[index].phase = SitePhase::Deploying;
-        save_plan(&config.plan_path, mission)?;
+        config.persist_mission(mission)?;
         configure_site(client, config, mission, index).await?;
         info!(
             system = %mission.sites[index].system,
@@ -1421,7 +1425,7 @@ async fn configure_site(
         mission.sites[index].assets = preflight.assets;
         mission.sites[index].missing = missing;
         mission.sites[index].phase = SitePhase::Verifying;
-        save_plan(&config.plan_path, mission)?;
+        config.persist_mission(mission)?;
         return Err(app_error(
             io::ErrorKind::WouldBlock,
             format!(
@@ -1436,7 +1440,7 @@ async fn configure_site(
     config.claim_devices(&site_resource_codes(&site))?;
     mission.sites[index].assets = site.assets.clone();
     mission.sites[index].missing = site.missing.clone();
-    save_plan(&config.plan_path, mission)?;
+    config.persist_mission(mission)?;
     let ward_assigned = site.assets.system_ward.is_some();
     let mut ward_pending = false;
     for code in site.assets.codes() {
@@ -1463,7 +1467,7 @@ async fn configure_site(
         ensure_site_protection(client, &site).await?;
     }
     mission.sites[index].phase = SitePhase::Adopting;
-    save_plan(&config.plan_path, mission)?;
+    config.persist_mission(mission)?;
     let mining_controller =
         site.assets.mining_controller.as_deref().ok_or_else(|| {
             app_error(io::ErrorKind::InvalidData, "site has no mining controller")
@@ -1487,7 +1491,7 @@ async fn configure_site(
     )
     .await?;
     mission.sites[index].phase = SitePhase::Verifying;
-    save_plan(&config.plan_path, mission)?;
+    config.persist_mission(mission)?;
     let mining_controller = site.assets.mining_controller.as_deref().unwrap_or_default();
     let mining_snapshot =
         validation::device(client, mining_controller, ValidationReason::StateConflict).await?;
@@ -1571,7 +1575,7 @@ async fn configure_site(
 
     if ward_pending {
         mission.sites[index].phase = SitePhase::Configuring;
-        save_plan(&config.plan_path, mission)?;
+        config.persist_mission(mission)?;
         return Ok(());
     }
 
@@ -1602,7 +1606,7 @@ async fn configure_site(
     }
     info!(system = %site.system, belt = %site.belt, "mining site operational");
     mission.sites[index].phase = SitePhase::Operational;
-    save_plan(&config.plan_path, mission)?;
+    config.persist_mission(mission)?;
     Ok(())
 }
 
@@ -1759,7 +1763,7 @@ async fn allocate_route_assets(
             .collect::<Vec<_>>();
         config.claim_devices(&codes)?;
         mission.routes[index].phase = RoutePhase::Ready;
-        save_plan(&config.plan_path, mission)?;
+        config.persist_mission(mission)?;
         ensure_asset_ownership(client, &codes, &mission.selected_replicant).await?;
         tag_route_assets(client, &mission.routes[index]).await?;
     }
@@ -1797,7 +1801,7 @@ async fn activate_routes(
             continue;
         }
         mission.routes[index].phase = RoutePhase::Activating;
-        save_plan(&config.plan_path, mission)?;
+        config.persist_mission(mission)?;
         configure_route(
             client,
             &mission.mission_id,
@@ -1806,7 +1810,7 @@ async fn activate_routes(
         )
         .await?;
         mission.routes[index].phase = RoutePhase::Active;
-        save_plan(&config.plan_path, mission)?;
+        config.persist_mission(mission)?;
     }
     Ok(())
 }
@@ -1976,7 +1980,7 @@ async fn return_and_release_carriers(
                 start_travel(client, &carrier, &mission.hub_location).await?;
             }
         }
-        save_plan(&config.plan_path, mission)?;
+        config.persist_mission(mission)?;
         if pending == 0 {
             return Ok(());
         }
@@ -2602,10 +2606,7 @@ mod tests {
             }],
             "site_print_requirements": {}, "route_print_requirements": {}, "total_material_cost": {}, "warnings": []
         })).expect("mission");
-        let claims = super::super::MiningWorkflowClaims {
-            repository: repository.clone(),
-            workflow_id: owner.id,
-        };
+        let claims = super::super::MiningWorkflowClaims::for_workflow(repository.clone(), owner.id);
         for _ in 0..2 {
             reconcile_print_batches(&client, &mut mission, Some(&claims))
                 .await
@@ -2685,7 +2686,7 @@ mod tests {
             max_concurrency: 1,
             claims: None,
         };
-        save_plan(&plan_path, &mission).expect("persist outbound intent");
+        super::super::save_plan(&plan_path, &mission).expect("persist outbound intent");
         mission = serde_json::from_slice(&std::fs::read(&plan_path).expect("checkpoint"))
             .expect("restart");
         resume_site_delivery(&client, &config, &mut mission, 0)

@@ -70,7 +70,8 @@ use crate::{
         HUB_MAINTENANCE_READY_PCT, HUB_MAINTENANCE_ROLE, MAX_TRANSPORT_FREIGHTERS,
         MIN_TRANSPORT_FREIGHTERS, MiningExpansionRequest, MiningMission, TransportBacklogClass,
         execute_expansion, maintenance_hub_pool_audit, maintenance_replacement_ready,
-        transport_backlog_class, transport_service_present_with_authority,
+        reusable_maintenance_candidate, reusable_transport_freighter, transport_backlog_class,
+        transport_service_present_with_authority,
     },
     observatory::auto_prospect,
     relay::{
@@ -1923,7 +1924,7 @@ fn logistics_manifest_placement(
             if delivered != expected
                 || planned != expected
                 || plan.destination != config.destination
-                || !checkpoint.started
+                || (!checkpoint.started && !checkpoint.delivery_complete)
             {
                 // Recovery resolution is all-or-nothing: every exact code
                 // must be in the persisted payload plan and in the delivery
@@ -2024,7 +2025,10 @@ fn logistics_manifest_placement(
                     }
                 }
             }
-            if phase != PlacementProjectionPhase::Live && !checkpoint.started {
+            if phase != PlacementProjectionPhase::Live
+                && !checkpoint.started
+                && !checkpoint.delivery_complete
+            {
                 return;
             }
             let Some(plan) = plan else { return };
@@ -2384,6 +2388,8 @@ fn mining_transport_capacity_placement(
     items: &[WorkItem],
 ) -> Result<WorkflowPlacementIntentProjection, String> {
     let intent: MiningTransportCapacityIntent = instance.config().map_err(string_error)?;
+    let checkpoint: MiningTransportCapacityCheckpoint =
+        instance.checkpoint().map_err(string_error)?;
     workflow_placement_projection(
         instance,
         items,
@@ -2396,7 +2402,7 @@ fn mining_transport_capacity_placement(
                     None,
                 ));
             }
-            for code in &intent.reuse_candidates {
+            for code in &checkpoint.selected_freighters {
                 if let Some(subject) = placement_device(code) {
                     intents.push(placement_intent(
                         subject,
@@ -2422,10 +2428,7 @@ fn mining_maintenance_rotation_placement(
         instance,
         items,
         |intents| {
-            for code in std::iter::once(&intent.worn_drone)
-                .chain(intent.replacement_candidates.iter())
-                .chain(checkpoint.replacement.iter())
-            {
+            for code in std::iter::once(&intent.worn_drone).chain(checkpoint.replacement.iter()) {
                 if let Some(subject) = placement_device(code) {
                     intents.push(placement_intent(
                         subject,
@@ -2444,18 +2447,14 @@ fn mining_maintenance_pool_placement(
     instance: &replicant_workflow::WorkflowInstance,
     items: &[WorkItem],
 ) -> Result<WorkflowPlacementIntentProjection, String> {
-    let intent: MiningMaintenancePoolIntent = instance.config().map_err(string_error)?;
+    let _: MiningMaintenancePoolIntent = instance.config().map_err(string_error)?;
     let checkpoint: MiningMaintenancePoolCheckpoint =
         instance.checkpoint().map_err(string_error)?;
     workflow_placement_projection(
         instance,
         items,
         |intents| {
-            for code in intent
-                .reuse_candidates
-                .iter()
-                .chain(checkpoint.selected_drones.iter())
-            {
+            for code in &checkpoint.selected_drones {
                 if let Some(subject) = placement_device(code) {
                     intents.push(placement_intent(
                         subject,
@@ -5147,10 +5146,10 @@ impl WorkflowExecutor for MiningDeployWorkflow {
             let execution = execute_expansion(
                 &client,
                 &request,
-                Some(crate::mining::MiningWorkflowClaims {
-                    repository: context.repository_handle(),
-                    workflow_id: context.id(),
-                }),
+                Some(crate::mining::MiningWorkflowClaims::for_workflow(
+                    context.repository_handle(),
+                    context.id(),
+                )),
             );
             tokio::pin!(execution);
             let mut checkpoint_interval = tokio::time::interval(Duration::from_secs(2));
@@ -5819,30 +5818,6 @@ fn mining_transport_release_command(code: &str) -> replicant_client::raw::device
     )
 }
 
-fn mining_transport_candidate_is_safe(device: &Device, system: &str) -> bool {
-    let expected_site_tag = replicant_mining_planner::site_tag(system);
-    let expected_role_tag = replicant_mining_planner::role_tag("cargo-freighter");
-    device.access == AccessScope::Owned
-        && device_is_type(device, "cargo_freighter")
-        && device.relationships.controller.is_none()
-        && device.relationships.attached_to.is_none()
-        && device.relationships.stowed_in.is_none()
-        && device.travel.is_none()
-        && device
-            .status
-            .as_ref()
-            .is_some_and(|status| status.as_str() == "idle")
-        && !device.tags.iter().any(|tag| {
-            (tag.starts_with("mine-s:") && tag != &expected_site_tag)
-                || (tag.starts_with("mine-r:") && tag != &expected_role_tag)
-                || tag.starts_with("evt-")
-                || tag.starts_with("evt_")
-                || tag.starts_with("relay-")
-                || tag.starts_with("mine-m:")
-                || tag.starts_with("mine-b:")
-        })
-}
-
 async fn configure_mining_transport_freighter_tags(
     client: &Client,
     code: &str,
@@ -6043,14 +6018,14 @@ async fn finish_mining_transport_scale_down(
         .release_freighter
         .clone()
         .ok_or_else(|| "capacity checkpoint lost its released freighter".to_owned())?;
-    if let Some(child_id) = checkpoint.return_child {
-        if mining_payload_child_pending(context, child_id, &code, "capacity return")? {
-            context
-                .advance_to("returning_released_capacity", checkpoint)
-                .map_err(string_error)?;
-            context.mark_waiting().map_err(string_error)?;
-            return Ok(());
-        }
+    if let Some(child_id) = checkpoint.return_child
+        && mining_payload_child_pending(context, child_id, &code, "capacity return")?
+    {
+        context
+            .advance_to("returning_released_capacity", checkpoint)
+            .map_err(string_error)?;
+        context.mark_waiting().map_err(string_error)?;
+        return Ok(());
     }
 
     let snapshot = client
@@ -6246,6 +6221,40 @@ impl WorkflowExecutor for MiningTransportCapacityWorkflow {
                 ));
             }
             if let Some(release) = checkpoint.release_freighter.clone() {
+                let inventories = fetch_inventories_at_location(&client, &intent.collect).await?;
+                if inventories.is_empty() {
+                    context
+                        .advance_to("waiting_for_capacity_backlog_evidence", &checkpoint)
+                        .map_err(string_error)?;
+                    context.mark_waiting().map_err(string_error)?;
+                    return Ok(());
+                }
+                let backlog_units = inventory_at_location(&inventories, &intent.collect)
+                    .into_values()
+                    .filter(|quantity| *quantity > 0)
+                    .fold(0_i64, i64::saturating_add);
+                if !mining_transport_capacity_direction_authorized(
+                    backlog_units,
+                    audit.usable_freighter_count(),
+                    intent.target_freighters,
+                ) {
+                    checkpoint.release_freighter = None;
+                    context
+                        .persist_checkpoint(&checkpoint)
+                        .map_err(string_error)?;
+                    context
+                        .release_claim(&ResourceKey::Device(release))
+                        .map_err(string_error)?;
+                    return context
+                        .mark_succeeded(Some(serde_json::json!({
+                            "route": mining_transport_capacity_route_key(&intent),
+                            "target_freighters": intent.target_freighters,
+                            "usable_freighters": audit.usable_freighter_count(),
+                            "observed_backlog_units": backlog_units,
+                            "superseded": true,
+                        })))
+                        .map_err(string_error);
+                }
                 return release_mining_transport_capacity(
                     context,
                     &client,
@@ -6257,6 +6266,7 @@ impl WorkflowExecutor for MiningTransportCapacityWorkflow {
             }
 
             let mut current = audit.usable_freighter_count();
+
             let pristine = current != intent.target_freighters
                 && checkpoint.release_freighter.is_none()
                 && checkpoint.selected_freighters.is_empty()
@@ -6375,7 +6385,7 @@ impl WorkflowExecutor for MiningTransportCapacityWorkflow {
                 else {
                     continue;
                 };
-                if !mining_transport_candidate_is_safe(candidate, &intent.system) {
+                if !reusable_transport_freighter(candidate, &intent.system) {
                     continue;
                 }
                 if !try_claim_available(context, ResourceKey::Device(code.clone()))? {
@@ -6441,12 +6451,9 @@ impl WorkflowExecutor for MiningTransportCapacityWorkflow {
             // Once staging children are terminal, reserve the exact reusable payloads in
             // the capacity workflow itself. This prevents a subsequent regional-dispatch
             // child from selecting the same local stock as part of the print deficit.
-            loop {
-                let Some((conflicted, owner)) =
-                    claim_devices_until_conflict(context, checkpoint.selected_freighters.iter())?
-                else {
-                    break;
-                };
+            while let Some((conflicted, owner)) =
+                claim_devices_until_conflict(context, checkpoint.selected_freighters.iter())?
+            {
                 checkpoint
                     .selected_freighters
                     .retain(|code| !code.eq_ignore_ascii_case(&conflicted));
@@ -6507,7 +6514,7 @@ impl WorkflowExecutor for MiningTransportCapacityWorkflow {
                                     .as_str()
                                     .eq_ignore_ascii_case(&controller_location)
                             }) && device.relationships.controller.is_none()
-                                && mining_transport_candidate_is_safe(device, &intent.system)
+                                && reusable_transport_freighter(device, &intent.system)
                         })
                 })
                 .count();
@@ -6654,7 +6661,7 @@ impl WorkflowExecutor for MiningTransportCapacityWorkflow {
                                     .as_str()
                                     .eq_ignore_ascii_case(&controller_location)
                             }) && device.relationships.controller.is_none()
-                                && mining_transport_candidate_is_safe(device, &intent.system)
+                                && reusable_transport_freighter(device, &intent.system)
                         })
                         .map(|device| device.key.id.as_str().to_owned())
                 })
@@ -6738,32 +6745,13 @@ fn maintenance_has_directive(device: &Device, directive: &str) -> bool {
         .is_some_and(|active| active.as_str().eq_ignore_ascii_case(directive))
 }
 
-fn maintenance_candidate_has_foreign_commitment(device: &Device) -> bool {
-    let pool_role = replicant_mining_planner::role_tag(HUB_MAINTENANCE_ROLE);
-    device.tags.iter().any(|tag| {
-        tag.starts_with("evt-")
-            || tag.starts_with("evt_")
-            || tag.starts_with("relay-")
-            || tag.starts_with("mine-m:")
-            || tag.starts_with("mine-b:")
-            || tag.starts_with("mine-s:")
-            || (tag.starts_with("mine-r:") && tag != &pool_role)
-    })
-}
-
 fn maintenance_idle_replacement_candidate(device: &Device) -> bool {
-    device_is_type(device, replicant_mining_planner::MAINTENANCE_DRONE)
-        && maintenance_replacement_ready(device)
-        && device.relationships.controller.is_none()
-        && device.relationships.attached_to.is_none()
-        && device.relationships.stowed_in.is_none()
-        && device.travel.is_none()
+    reusable_maintenance_candidate(device)
         && device
             .status
             .as_ref()
             .is_some_and(|status| matches!(status.as_str(), "idle" | "inactive"))
         && !maintenance_has_directive(device, "patrol")
-        && !maintenance_candidate_has_foreign_commitment(device)
 }
 
 fn maintenance_hub_replacement_candidate(
@@ -6771,19 +6759,13 @@ fn maintenance_hub_replacement_candidate(
     intent: &MiningMaintenanceRotationIntent,
     hub_healthy_count: usize,
 ) -> bool {
-    device_is_type(device, replicant_mining_planner::MAINTENANCE_DRONE)
+    reusable_maintenance_candidate(device)
         && device
             .location
             .as_ref()
             .is_some_and(|location| location.id.as_str().eq_ignore_ascii_case(&intent.hub_belt))
-        && maintenance_replacement_ready(device)
         && maintenance_has_directive(device, "patrol")
         && hub_healthy_count > HUB_MAINTENANCE_MIN_HEALTHY
-        && device.relationships.controller.is_none()
-        && device.relationships.attached_to.is_none()
-        && device.relationships.stowed_in.is_none()
-        && device.travel.is_none()
-        && !maintenance_candidate_has_foreign_commitment(device)
 }
 
 async fn reconcile_maintenance_tags(
@@ -7676,10 +7658,9 @@ impl WorkflowExecutor for MiningMaintenanceRotationWorkflow {
                 && (checkpoint.provision_child.is_some()
                     || !select_rotation_replacement(context, &intent, &mut checkpoint, &devices)
                         .await?)
+                && !provision_rotation_replacement(context, &intent, &mut checkpoint).await?
             {
-                if !provision_rotation_replacement(context, &intent, &mut checkpoint).await? {
-                    return Ok(());
-                }
+                return Ok(());
             }
             context
                 .persist_checkpoint(&checkpoint)
@@ -11483,10 +11464,10 @@ impl WorkflowExecutor for RegionEstablishWorkflow {
                 plan_file,
                 Duration::from_secs(DEFAULT_WAIT_SECONDS),
             );
-            request.mining_claims = Some(crate::mining::MiningWorkflowClaims {
-                repository: context.repository_handle(),
-                workflow_id: context.id(),
-            });
+            request.mining_claims = Some(crate::mining::MiningWorkflowClaims::for_workflow(
+                context.repository_handle(),
+                context.id(),
+            ));
             let mission = run_bootstrap(&client, &request)
                 .await
                 .map_err(string_error)?;
@@ -15158,27 +15139,18 @@ async fn fetch_inventories_at_location(
     client: &Client,
     location: &str,
 ) -> Result<Vec<replicant_client::domain::Inventory>, String> {
-    let mut cursor = None;
-    let mut inventories = Vec::new();
-    for _ in 0..100 {
-        let (mut page, next_cursor) = client
-            .inventory()
-            .list(&replicant_client::raw::inventory::AccountInventoryQuery {
-                location: Some(location.to_owned()),
-                cursor,
-                limit: Some(100),
-            })
-            .await
-            .map_err(string_error)?;
-        inventories.append(&mut page);
-        let Some(next) = next_cursor else {
-            return Ok(inventories);
-        };
-        cursor = Some(next);
-    }
-    Err(format!(
-        "inventory at {location} exceeded the 100-page safety bound"
-    ))
+    // Every caller supplies one specific location code. The v3 API contract defines that
+    // filter as a single-location response, so a cursor on that response is not actionable.
+    let (inventories, _) = client
+        .inventory()
+        .list(&replicant_client::raw::inventory::AccountInventoryQuery {
+            location: Some(location.to_owned()),
+            cursor: None,
+            limit: Some(100),
+        })
+        .await
+        .map_err(string_error)?;
+    Ok(inventories)
 }
 
 async fn fetch_inventory_at_location(
@@ -21589,16 +21561,16 @@ mod tests {
     #[test]
     fn mining_transport_reuse_rejects_foreign_route_or_role_tags() {
         let mut candidate = dispatch_test_device("CF-FREE", "cargo_freighter", "ALPHA-HUB");
-        assert!(mining_transport_candidate_is_safe(&candidate, "ALPHA"));
+        assert!(reusable_transport_freighter(&candidate, "ALPHA"));
 
         candidate.tags = vec![replicant_mining_planner::site_tag("BETA")];
-        assert!(!mining_transport_candidate_is_safe(&candidate, "ALPHA"));
+        assert!(!reusable_transport_freighter(&candidate, "ALPHA"));
 
         candidate.tags = vec![
             replicant_mining_planner::site_tag("ALPHA"),
             replicant_mining_planner::role_tag("survey-drone"),
         ];
-        assert!(!mining_transport_candidate_is_safe(&candidate, "ALPHA"));
+        assert!(!reusable_transport_freighter(&candidate, "ALPHA"));
     }
 
     #[test]
@@ -22551,7 +22523,6 @@ mod tests {
                 "location": "ALPHA-BELT-1",
                 "status": "stationary"
             })))
-            .expect(1)
             .mount(server)
             .await;
         client
@@ -22570,7 +22541,6 @@ mod tests {
                 "location": "ALPHA-BELT-1",
                 "status": "idle"
             })))
-            .expect(1)
             .mount(server)
             .await;
         client
@@ -22633,7 +22603,16 @@ mod tests {
             }
             tokio::task::yield_now().await;
         }
-        panic!("workflow did not reach a terminal state");
+        let workflow = repository
+            .read(workflow_id)
+            .expect("workflow row")
+            .expect("workflow");
+        panic!(
+            "workflow did not reach a terminal state: status={:?}, step={:?}, error={:?}",
+            workflow.status,
+            workflow.current_step.as_deref(),
+            workflow.last_error.as_deref()
+        );
     }
 
     #[tokio::test]

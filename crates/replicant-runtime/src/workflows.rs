@@ -1181,7 +1181,14 @@ async fn run_mining_item(
     mut allocations: AllocationSet,
     wait_timeout: Duration,
 ) -> Result<(String, usize, MiningMission), String> {
-    let revision = item.state.revision;
+    let mut mission = item
+        .state
+        .checkpoint_json
+        .as_ref()
+        .map(|checkpoint| serde_json::from_value(checkpoint.clone()))
+        .transpose()
+        .map_err(string_error)?
+        .unwrap_or(mission);
     let allocation_affinities =
         mining_allocation_affinities(&item_type, &item.spec.requirements_json);
     if item_type == "site"
@@ -1195,7 +1202,7 @@ async fn run_mining_item(
         repository
             .transition_work_item(
                 item.id,
-                revision,
+                item.state.revision,
                 WorkItemTransition::Waiting {
                     checkpoint_json: Some(serde_json::to_value(&mission).map_err(string_error)?),
                     reason: format!(
@@ -1209,20 +1216,29 @@ async fn run_mining_item(
         return Ok((item_type, index, mission));
     }
     loop {
-        match item_executor
+        let outcome = item_executor
             .execute(
                 &client,
                 &mission,
                 (&item_type, index),
                 &allocations,
                 wait_timeout,
-                crate::mining::MiningWorkflowClaims {
-                    repository: repository.clone(),
-                    workflow_id: item.spec.workflow_id,
-                },
+                crate::mining::MiningWorkflowClaims::for_item(
+                    repository.clone(),
+                    item.spec.workflow_id,
+                    item.id,
+                ),
             )
-            .await
-        {
+            .await;
+        let current_item = repository
+            .read_work_item(item.id)
+            .map_err(string_error)?
+            .ok_or_else(|| format!("mining work item {} disappeared", item.id))?;
+        if let Some(checkpoint) = current_item.state.checkpoint_json.as_ref() {
+            mission = serde_json::from_value(checkpoint.clone()).map_err(string_error)?;
+        }
+        let revision = current_item.state.revision;
+        match outcome {
             Ok(lane) if mining_item_completed(&lane, &item_type) => {
                 repository
                     .transition_work_item(
@@ -4822,6 +4838,27 @@ mod tests {
         }
     }
 
+    struct CheckpointThenFailMiningItemExecutor;
+
+    impl MiningItemExecutor for CheckpointThenFailMiningItemExecutor {
+        fn execute<'a>(
+            &'a self,
+            _client: &'a replicant_client::Client,
+            mission: &'a MiningMission,
+            _item: (&'a str, usize),
+            _allocations: &'a AllocationSet,
+            _wait_timeout: Duration,
+            claims: crate::mining::MiningWorkflowClaims,
+        ) -> MiningItemFuture<'a> {
+            let mut checkpoint = mission.clone();
+            checkpoint.warnings.push("durable phase reached".into());
+            Box::pin(async move {
+                claims.persist_mission(&checkpoint)?;
+                Err(std::io::Error::other("injected executor failure").into())
+            })
+        }
+    }
+
     fn mining_pool_mission() -> MiningMission {
         MiningMission {
             version: 1,
@@ -4905,6 +4942,74 @@ mod tests {
             });
         mission.total_material_cost.insert("structural".into(), 10);
         mission
+    }
+
+    #[tokio::test]
+    async fn mining_item_failure_preserves_the_latest_executor_checkpoint() {
+        let server = MockServer::start().await;
+        let client = mining_pool_client(&server).await;
+        let repository =
+            Arc::new(replicant_workflow::WorkflowRepository::open_in_memory().expect("repository"));
+        let mission = mining_pool_mission();
+        let workflow = repository
+            .create(new_mining_workflow(MiningWorkflowConfig {
+                systems: vec!["PENDING".into()],
+                region: "Alpha".into(),
+                hub: "ROOT-1-L4".into(),
+                transport_routes: Vec::new(),
+                mission_file: std::env::temp_dir().join("mining-checkpoint-unused.json"),
+                wait_timeout_seconds: 1,
+                max_concurrency: 1,
+            }))
+            .expect("workflow");
+        let specs = mining_work_item_specs(workflow.id, &mission, "Alpha").expect("specs");
+        repository
+            .reconcile_work_items(workflow.id, &specs, 1)
+            .expect("reconcile items");
+        let assigned = repository
+            .claim_next_work_item(workflow.id, 2)
+            .expect("claim item")
+            .expect("assigned item");
+        let running = repository
+            .start_work_item(
+                assigned.id,
+                assigned.state.revision,
+                "test",
+                "test-assignment",
+                3,
+            )
+            .expect("start item");
+        let broker = crate::assignment::ResourceBroker::with_managed_client(
+            repository.clone(),
+            client.clone(),
+        );
+
+        let (_, _, returned) = run_mining_item(
+            repository.clone(),
+            client.clone(),
+            broker,
+            Arc::new(CheckpointThenFailMiningItemExecutor),
+            Vec::new(),
+            mission,
+            running.clone(),
+            "route".into(),
+            0,
+            AllocationSet::default(),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("run item");
+
+        assert_eq!(returned.warnings, ["durable phase reached"]);
+        let stored = repository
+            .read_work_item(running.id)
+            .expect("read item")
+            .expect("stored item");
+        let checkpoint: MiningMission =
+            serde_json::from_value(stored.state.checkpoint_json.expect("checkpoint"))
+                .expect("mission checkpoint");
+        assert_eq!(checkpoint.warnings, ["durable phase reached"]);
+        client.close().await.expect("close");
     }
 
     #[test]

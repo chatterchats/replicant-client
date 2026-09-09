@@ -4,12 +4,12 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, BufWriter, Write},
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use replicant_client::{
     Client, Star,
-    domain::{Device, DeviceStatus, DeviceType, Location},
+    domain::{AccessScope, Device, DeviceStatus, DeviceType, Location},
 };
 #[cfg(test)]
 use replicant_mining_planner::role_tag;
@@ -21,8 +21,8 @@ use replicant_mining_planner::{
 };
 use replicant_printing::managed::discover_factories;
 use replicant_workflow::{
-    AllocationSet, RequirementScope, ResourceKey, ResourceRequirement, WorkItemSpec, WorkflowId,
-    WorkflowKind, WorkflowServiceIntent,
+    AllocationSet, RequirementScope, ResourceKey, ResourceRequirement, WorkItemId, WorkItemSpec,
+    WorkItemTransition, WorkflowId, WorkflowKind, WorkflowServiceIntent,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -63,6 +63,14 @@ fn app_error(kind: io::ErrorKind, message: impl Into<String>) -> AnyError {
     io::Error::new(kind, message.into()).into()
 }
 
+fn current_time_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+        .unwrap_or(i64::MAX)
+}
+
 /// Durable physical-asset custody for a Mining Ops workflow invocation.
 #[derive(Clone)]
 pub struct MiningWorkflowClaims {
@@ -70,6 +78,7 @@ pub struct MiningWorkflowClaims {
     pub repository: std::sync::Arc<replicant_workflow::WorkflowRepository>,
     /// The workflow owning all resources used by this invocation.
     pub workflow_id: replicant_workflow::WorkflowId,
+    item_id: Option<WorkItemId>,
 }
 
 impl std::fmt::Debug for MiningWorkflowClaims {
@@ -77,11 +86,54 @@ impl std::fmt::Debug for MiningWorkflowClaims {
         formatter
             .debug_struct("MiningWorkflowClaims")
             .field("workflow_id", &self.workflow_id)
+            .field("item_id", &self.item_id)
             .finish_non_exhaustive()
     }
 }
 
 impl MiningWorkflowClaims {
+    pub(crate) fn for_workflow(
+        repository: std::sync::Arc<replicant_workflow::WorkflowRepository>,
+        workflow_id: WorkflowId,
+    ) -> Self {
+        Self {
+            repository,
+            workflow_id,
+            item_id: None,
+        }
+    }
+
+    pub(crate) fn for_item(
+        repository: std::sync::Arc<replicant_workflow::WorkflowRepository>,
+        workflow_id: WorkflowId,
+        item_id: WorkItemId,
+    ) -> Self {
+        Self {
+            repository,
+            workflow_id,
+            item_id: Some(item_id),
+        }
+    }
+
+    pub(crate) fn persist_mission(&self, mission: &MiningMission) -> AnyResult<()> {
+        let Some(item_id) = self.item_id else {
+            return Ok(());
+        };
+        let item = self
+            .repository
+            .read_work_item(item_id)?
+            .ok_or_else(|| app_error(io::ErrorKind::NotFound, "mining work item disappeared"))?;
+        self.repository.transition_work_item(
+            item_id,
+            item.state.revision,
+            WorkItemTransition::CheckpointCommitted {
+                checkpoint_json: serde_json::to_value(mission)?,
+            },
+            current_time_millis(),
+        )?;
+        Ok(())
+    }
+
     fn acquire_devices(&self, codes: &[String]) -> AnyResult<()> {
         let resources = codes
             .iter()
@@ -112,6 +164,13 @@ impl Config {
             claims.acquire_devices(codes)?;
         }
         Ok(())
+    }
+
+    fn persist_mission(&self, mission: &MiningMission) -> AnyResult<()> {
+        if let Some(claims) = &self.claims {
+            claims.persist_mission(mission)?;
+        }
+        save_plan(&self.plan_path, mission)
     }
 
     fn requested_systems(&self) -> AnyResult<Vec<String>> {
@@ -263,11 +322,7 @@ pub(crate) struct MaintenanceHubPoolAudit {
 }
 
 impl MaintenanceHubPoolAudit {
-    pub(crate) fn desired_healthy_count(
-        &self,
-        available_healthy: usize,
-        higher_priority_faults: bool,
-    ) -> usize {
+    pub(crate) fn desired_healthy_count(&self, available_healthy: usize) -> usize {
         if !self.unknown_patrol.is_empty() {
             return available_healthy;
         }
@@ -275,8 +330,6 @@ impl MaintenanceHubPoolAudit {
             HUB_MAINTENANCE_MIN_HEALTHY
         } else if available_healthy == HUB_MAINTENANCE_MIN_HEALTHY
             && self.repairing_patrol.is_empty()
-            && self.unknown_patrol.is_empty()
-            && !higher_priority_faults
         {
             HUB_MAINTENANCE_TARGET_HEALTHY
         } else {
@@ -291,6 +344,50 @@ pub(crate) fn maintenance_replacement_ready(device: &Device) -> bool {
         && device
             .operational_capacity
             .is_some_and(|capacity| capacity.percent() >= HUB_MAINTENANCE_READY_PCT)
+}
+
+pub(crate) fn reusable_maintenance_candidate(device: &Device) -> bool {
+    let pool_role = replicant_mining_planner::role_tag(HUB_MAINTENANCE_ROLE);
+    device.access == AccessScope::Owned
+        && device_type(device) == Some(MAINTENANCE_DRONE)
+        && maintenance_replacement_ready(device)
+        && device.relationships.controller.is_none()
+        && device.relationships.attached_to.is_none()
+        && device.relationships.stowed_in.is_none()
+        && device.travel.is_none()
+        && !device.tags.iter().any(|tag| {
+            tag.starts_with("evt-")
+                || tag.starts_with("evt_")
+                || tag.starts_with("relay-")
+                || tag.starts_with("mine-m:")
+                || tag.starts_with("mine-b:")
+                || tag.starts_with("mine-s:")
+                || (tag.starts_with("mine-r:") && tag != &pool_role)
+        })
+}
+
+pub(crate) fn reusable_transport_freighter(device: &Device, system: &str) -> bool {
+    let expected_site_tag = site_tag(system);
+    let expected_role_tag = replicant_mining_planner::role_tag("cargo-freighter");
+    device.access == AccessScope::Owned
+        && device_type(device) == Some(CARGO_FREIGHTER)
+        && device.relationships.controller.is_none()
+        && device.relationships.attached_to.is_none()
+        && device.relationships.stowed_in.is_none()
+        && device.travel.is_none()
+        && device
+            .status
+            .as_ref()
+            .is_some_and(|status| status.as_str() == "idle")
+        && !device.tags.iter().any(|tag| {
+            (tag.starts_with("mine-s:") && tag != &expected_site_tag)
+                || (tag.starts_with("mine-r:") && tag != &expected_role_tag)
+                || tag.starts_with("evt-")
+                || tag.starts_with("evt_")
+                || tag.starts_with("relay-")
+                || tag.starts_with("mine-m:")
+                || tag.starts_with("mine-b:")
+        })
 }
 
 pub(crate) fn maintenance_rotation_due(device: &Device) -> bool {
@@ -1101,6 +1198,7 @@ pub async fn execute_mining_item(
         "replicant-mining-item-{}-{item_type}-{index}.json",
         lane.mission_id
     ));
+    claims.persist_mission(&lane)?;
     save_plan(&plan_path, &lane)?;
     let request = MiningExpansionRequest {
         systems: lane
@@ -1969,15 +2067,15 @@ impl SiteAudit {
         }) {
             return Some(reason);
         }
-        self.repairs.iter().find_map(|repair| match repair {
+        self.repairs.first().map(|repair| match repair {
             MiningSiteRepair::SetDirective { device, directive } => {
-                Some(format!("set {device} directive to {directive}"))
+                format!("set {device} directive to {directive}")
             }
             MiningSiteRepair::LaunchController { device } => {
-                Some(format!("restore controller {device} to coordinating state"))
+                format!("restore controller {device} to coordinating state")
             }
             MiningSiteRepair::Adopt { device, controller } => {
-                Some(format!("re-adopt {device} to {controller}"))
+                format!("re-adopt {device} to {controller}")
             }
         })
     }
@@ -2043,25 +2141,17 @@ pub(crate) fn audit_site(devices: &[Device], system: &str, belt: &str) -> SiteAu
         devices,
         &at_belt,
         mining_controller.as_deref(),
-        MINING_CONTROLLER,
-        MINING_DRONE,
-        4,
+        (MINING_CONTROLLER, MINING_DRONE, 4),
         &expected_site_tag,
-        &mut repairs,
-        &mut issues,
-        &mut mutation_safe,
+        (&mut repairs, &mut issues, &mut mutation_safe),
     );
     let survey_drones = select_site_children(
         devices,
         &at_belt,
         survey_controller.as_deref(),
-        SURVEY_CONTROLLER,
-        SURVEY_DRONE,
-        2,
+        (SURVEY_CONTROLLER, SURVEY_DRONE, 2),
         &expected_site_tag,
-        &mut repairs,
-        &mut issues,
-        &mut mutation_safe,
+        (&mut repairs, &mut issues, &mut mutation_safe),
     );
     let maintenance = at_belt
         .iter()
@@ -2279,13 +2369,13 @@ fn select_site_children(
     devices: &[Device],
     at_belt: &[&Device],
     controller: Option<&str>,
-    controller_type_name: &str,
-    child_type: &str,
-    required: usize,
+    (controller_type_name, child_type, required): (&str, &str, usize),
     expected_site_tag: &str,
-    repairs: &mut Vec<MiningSiteRepair>,
-    issues: &mut Vec<MiningSiteIssue>,
-    mutation_safe: &mut bool,
+    (repairs, issues, mutation_safe): (
+        &mut Vec<MiningSiteRepair>,
+        &mut Vec<MiningSiteIssue>,
+        &mut bool,
+    ),
 ) -> Vec<String> {
     let Some(controller) = controller else {
         return Vec::new();
@@ -3728,7 +3818,7 @@ mod tests {
         assert_eq!(audit.healthy_patrol.len(), 2);
         assert!(audit.healthy_patrol.len() <= HUB_MAINTENANCE_MIN_HEALTHY);
         assert_eq!(
-            audit.desired_healthy_count(audit.healthy_patrol.len(), false),
+            audit.desired_healthy_count(audit.healthy_patrol.len()),
             HUB_MAINTENANCE_TARGET_HEALTHY
         );
     }
@@ -3770,10 +3860,7 @@ mod tests {
         let audit = maintenance_hub_pool_audit(&devices, hub);
         assert_eq!(audit.healthy_patrol.len(), 2);
         assert_eq!(audit.repairing_patrol, ["REPAIR"]);
-        assert_eq!(
-            audit.desired_healthy_count(audit.healthy_patrol.len(), false),
-            2
-        );
+        assert_eq!(audit.desired_healthy_count(audit.healthy_patrol.len()), 2);
     }
 
     #[test]

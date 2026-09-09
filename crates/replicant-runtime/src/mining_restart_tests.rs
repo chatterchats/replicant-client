@@ -406,6 +406,20 @@ async fn seed_route(server: &MockServer, client: &Client, adopted_new: bool) {
         .mount(server).await;
 }
 
+async fn seed_route_inventory(server: &MockServer, quantity: i64) {
+    Mock::given(method("GET"))
+        .and(path("/v1/inventory"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "locations": [{
+                "location": "REMOTE-BELT-1",
+                "items": [{"resource_type": "ore", "quantity": quantity}]
+            }],
+            "next_cursor": null
+        })))
+        .mount(server)
+        .await;
+}
+
 #[tokio::test]
 async fn mining_authority_remote_census_discovers_hidden_freighter_before_provisioning() {
     let server = MockServer::start().await;
@@ -728,6 +742,7 @@ async fn mining_restart_after_excess_release_never_selects_a_second_freighter() 
     let server = MockServer::start().await;
     let client = client_at(&server).await;
     seed_route(&server, &client, false).await;
+    seed_route_inventory(&server, 0).await;
     seed_device(
         &server,
         &client,
@@ -748,6 +763,36 @@ async fn mining_restart_after_excess_release_never_selects_a_second_freighter() 
     let checkpoint: MiningTransportCapacityCheckpoint = resumed.checkpoint().expect("checkpoint");
     assert_eq!(checkpoint.release_freighter.as_deref(), Some("EXTRA"));
     assert!(checkpoint.release_complete);
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("requests")
+            .iter()
+            .all(|request| request.method == "GET")
+    );
+    client.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn mining_restart_cancels_pending_scale_down_when_backlog_has_rebounded() {
+    let server = MockServer::start().await;
+    let client = client_at(&server).await;
+    seed_route(&server, &client, true).await;
+    seed_route_inventory(&server, 15_000).await;
+    let repository = Arc::new(WorkflowRepository::open_in_memory().expect("repository"));
+    let mut request = new_mining_transport_capacity_workflow(capacity_intent());
+    request.checkpoint.release_freighter = Some("NEW".into());
+    let parent = repository
+        .create(request)
+        .expect("capacity before pending release");
+
+    let resumed = resume_once(repository.clone(), client.clone(), parent.id).await;
+
+    assert_eq!(resumed.status, WorkflowStatus::Succeeded);
+    let checkpoint: MiningTransportCapacityCheckpoint = resumed.checkpoint().expect("checkpoint");
+    assert_eq!(checkpoint.release_freighter, None);
+    assert!(!checkpoint.release_complete);
     assert!(
         server
             .received_requests()

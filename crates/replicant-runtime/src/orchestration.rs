@@ -6224,36 +6224,16 @@ fn reusable_regional_maintenance_drones(
     limit: usize,
 ) -> Result<Vec<String>, ApplicationError> {
     let claims = active_device_claim_codes(repository)?;
-    let pool_role = replicant_mining_planner::role_tag(crate::mining::HUB_MAINTENANCE_ROLE);
     let mut candidates = devices
         .iter()
         .filter(|device| {
-            device.access == replicant_client::domain::AccessScope::Owned
-                && device.device_type.as_ref().is_some_and(|kind| {
-                    kind.as_str() == replicant_mining_planner::MAINTENANCE_DRONE
-                })
-                && crate::mining::maintenance_replacement_ready(device)
-                && device.relationships.controller.is_none()
-                && device.relationships.attached_to.is_none()
-                && device.relationships.stowed_in.is_none()
-                && device.travel.is_none()
+            crate::mining::reusable_maintenance_candidate(device)
                 && device
                     .status
                     .as_ref()
                     .is_some_and(|status| matches!(status.as_str(), "idle" | "inactive"))
                 && !claims.contains(&device.key.id.as_str().to_ascii_uppercase())
                 && !exclude.contains(&device.key.id.as_str().to_ascii_uppercase())
-        })
-        .filter(|device| {
-            !device.tags.iter().any(|tag| {
-                tag.starts_with("mine-s:")
-                    || (tag.starts_with("mine-r:") && tag != &pool_role)
-                    || tag.starts_with("mine-m:")
-                    || tag.starts_with("mine-b:")
-                    || tag.starts_with("evt-")
-                    || tag.starts_with("evt_")
-                    || tag.starts_with("relay-")
-            })
         })
         .filter_map(|device| {
             let system = device_system(device, location_systems)?;
@@ -6321,44 +6301,12 @@ fn reusable_mining_transport_freighters(
     system_regions: &BTreeMap<String, String>,
     limit: usize,
 ) -> Result<Vec<String>, ApplicationError> {
-    let claims = repository
-        .device_claims()?
-        .into_iter()
-        .filter_map(|claim| match claim.resource {
-            ResourceKey::Device(code) => Some(code.to_ascii_uppercase()),
-            _ => None,
-        })
-        .collect::<BTreeSet<_>>();
-    let site_tag = replicant_mining_planner::site_tag(system);
-    let role_tag = replicant_mining_planner::role_tag("cargo-freighter");
+    let claims = active_device_claim_codes(repository)?;
     let mut candidates = devices
         .iter()
         .filter(|device| {
-            device.access == replicant_client::domain::AccessScope::Owned
-                && device
-                    .device_type
-                    .as_ref()
-                    .is_some_and(|device_type| device_type.as_str() == "cargo_freighter")
-                && device.relationships.controller.is_none()
-                && device.relationships.attached_to.is_none()
-                && device.relationships.stowed_in.is_none()
-                && device.travel.is_none()
-                && device
-                    .status
-                    .as_ref()
-                    .is_some_and(|status| status.as_str() == "idle")
+            crate::mining::reusable_transport_freighter(device, system)
                 && !claims.contains(&device.key.id.as_str().to_ascii_uppercase())
-        })
-        .filter(|device| {
-            !device.tags.iter().any(|tag| {
-                (tag.starts_with("mine-s:") && tag != &site_tag)
-                    || (tag.starts_with("mine-r:") && tag != &role_tag)
-                    || tag.starts_with("evt-")
-                    || tag.starts_with("evt_")
-                    || tag.starts_with("relay-")
-                    || tag.starts_with("mine-m:")
-                    || tag.starts_with("mine-b:")
-            })
         })
         .filter_map(|device| {
             let location = device.location.as_ref()?.id.as_str().to_owned();
@@ -7249,7 +7197,7 @@ async fn reconcile_expand_mining(
             (maintenance_hub_belt.as_ref(), hub_pool_audit.as_ref())
         {
             let available_healthy = hub_pool_available_healthy.unwrap_or_default();
-            let target = pool.desired_healthy_count(available_healthy, false);
+            let target = pool.desired_healthy_count(available_healthy);
             if target > available_healthy {
                 Some(MiningMaintenancePoolCandidate {
                     hub_belt: hub_belt.clone(),
@@ -7836,8 +7784,13 @@ async fn reconcile_expand_mining(
             if !pre_deactivate_device_codes.contains(&relocation.ward_code) {
                 pre_deactivate_device_codes.push(relocation.ward_code.clone());
             }
-            let workflow =
-                repository.create(new_logistics_manifest_workflow(LogisticsManifestIntent {
+            let purpose = mining_ward_relocation_purpose(
+                &region.region,
+                &relocation.ward_code,
+                &relocation.target_system,
+            );
+            let result = repository.create_or_reuse_active(
+                new_logistics_manifest_workflow(LogisticsManifestIntent {
                     origin: relocation.origin.clone(),
                     destination: relocation.target_belt.clone(),
                     resources: ResourceMap::new(),
@@ -7852,14 +7805,20 @@ async fn reconcile_expand_mining(
                     allow_transport_staging: true,
                     region: Some(region.region.clone()),
                     return_claims_to_parent: false,
-                    purpose: mining_ward_relocation_purpose(
-                        &region.region,
-                        &relocation.ward_code,
-                        &relocation.target_system,
-                    ),
-                }))?;
-            tracing::info!(workflow_id = %workflow.id, region = %region.region, ward = %relocation.ward_code, source_system = %relocation.source_system, target_system = %relocation.target_system, "Director launched mining System Ward rebalance");
-            runtime.active_workflows = vec![workflow.id];
+                    purpose: purpose.clone(),
+                }),
+                |workflow| {
+                    let Ok(existing) = workflow.config::<LogisticsManifestIntent>() else {
+                        return Ok(false);
+                    };
+                    Ok(
+                        workflow.kind == crate::automation::logistics_manifest_workflow_kind()
+                            && existing.purpose == purpose,
+                    )
+                },
+            )?;
+            tracing::info!(workflow_id = %result.instance.id, region = %region.region, ward = %relocation.ward_code, source_system = %relocation.source_system, target_system = %relocation.target_system, created = result.created, "Director reconciled mining System Ward rebalance");
+            runtime.active_workflows = vec![result.instance.id];
             runtime.last_launch_at_ms = Some(now);
         }
         DirectorGoalStatus::Active
@@ -7926,6 +7885,25 @@ fn mining_workflow_next_action(workflow: &WorkflowInstance) -> Option<String> {
             "waiting_for_replacement_patrol" | "waiting_for_replacement_patrol_repair" => {
                 "Verify replacement patrol before removing worn maintenance at"
             }
+            "waiting_for_replacement_readiness" => {
+                return Some(format!(
+                    "Wait for replacement maintenance at {} to reach >=95% operational capacity",
+                    intent.hub_belt,
+                ));
+            }
+            "waiting_for_healthy_hub_reserve" => {
+                return Some(format!(
+                    "Keep at least {} replacement-ready patrol drones at {} before dispatching a replacement",
+                    crate::mining::HUB_MAINTENANCE_MIN_HEALTHY,
+                    intent.hub_belt,
+                ));
+            }
+            "waiting_for_worn_capacity_evidence" => {
+                return Some(format!(
+                    "Refresh operational capacity for worn drone {} at {} before rotating it",
+                    intent.worn_drone, intent.site_belt,
+                ));
+            }
             "recovering_worn_drone" | "verifying_worn_return" => "Return worn maintenance from",
             "repair_pending" => {
                 return Some(format!(
@@ -7948,12 +7926,17 @@ fn mining_workflow_next_action(workflow: &WorkflowInstance) -> Option<String> {
         let action = match step {
             "releasing_excess_capacity"
             | "returning_released_capacity"
+            | "verifying_released_capacity_return"
             | "waiting_for_released_capacity"
             | "waiting_for_released_capacity_location" => {
                 "Return excess Cargo Freighters to regional stock from"
             }
             "provisioning_capacity" => "Provision additional Cargo Freighters for",
             "staging_reusable_capacity" => "Deliver reusable Cargo Freighters to",
+            "waiting_for_staged_capacity_arrival" => "Confirm reusable Cargo Freighters arrived at",
+            "verifying_capacity_adoption" | "waiting_for_capacity_adoption_evidence" => {
+                "Verify Cargo Freighter adoption for"
+            }
             "adopting_capacity" => "Adopt additional Cargo Freighters for",
             _ => "Confirm Cargo Freighter capacity for",
         };
@@ -7964,8 +7947,15 @@ fn mining_workflow_next_action(workflow: &WorkflowInstance) -> Option<String> {
     }
     if workflow.kind == mining_maintenance_pool_workflow_kind() {
         let intent = workflow.config::<MiningMaintenancePoolIntent>().ok()?;
+        let action = match step {
+            "waiting_for_hub_pool_evidence" => {
+                "Refresh authoritative maintenance-patrol evidence at"
+            }
+            "waiting_for_hub_pool_health" => "Wait for maintenance patrol repair at",
+            _ => "Restore maintenance patrol at",
+        };
         return Some(format!(
-            "Restore maintenance patrol at {} to {} replacement-ready drones",
+            "{action} {} to {} replacement-ready drones",
             intent.hub_belt, intent.target_healthy,
         ));
     }
@@ -11901,7 +11891,7 @@ mod tests {
     }
 
     #[test]
-    fn mining_ops_active_rotation_distinguishes_delivery_from_hub_repair() {
+    fn mining_ops_active_rotation_describes_each_waiting_condition() {
         let repository = WorkflowRepository::open_in_memory().expect("repository");
         let mut workflow = repository
             .create(new_mining_maintenance_rotation_workflow(
@@ -11915,16 +11905,93 @@ mod tests {
                 },
             ))
             .expect("rotation workflow");
-        workflow.current_step = Some("delivering_replacement".to_owned());
-        let delivery = mining_workflow_next_action(&workflow).expect("delivery action");
-        assert!(delivery.contains("Deliver replacement"));
-        assert!(delivery.contains("REMOTE-BELT-1"));
-        workflow.current_step = Some("repair_pending".to_owned());
-        let repair = mining_workflow_next_action(&workflow).expect("repair action");
-        assert!(repair.contains("MD-OLD"));
-        assert!(repair.contains("HUB-BELT-1"));
-        assert!(repair.contains(">=95%"));
-        assert!(!repair.contains("Deliver replacement"));
+        for (step, expected) in [
+            (
+                "delivering_replacement",
+                "Deliver replacement maintenance to REMOTE-BELT-1",
+            ),
+            (
+                "waiting_for_replacement_readiness",
+                "replacement maintenance at HUB-BELT-1 to reach >=95%",
+            ),
+            (
+                "waiting_for_healthy_hub_reserve",
+                "at least 2 replacement-ready patrol drones at HUB-BELT-1",
+            ),
+            (
+                "waiting_for_worn_capacity_evidence",
+                "operational capacity for worn drone MD-OLD at REMOTE-BELT-1",
+            ),
+            (
+                "repair_pending",
+                "drone MD-OLD at HUB-BELT-1 to reach >=95%",
+            ),
+        ] {
+            workflow.current_step = Some(step.to_owned());
+            let action = mining_workflow_next_action(&workflow).expect("rotation action");
+            assert!(action.contains(expected), "{step}: {action}");
+        }
+    }
+
+    #[test]
+    fn mining_ops_active_capacity_and_pool_workflows_describe_reconciliation_steps() {
+        let repository = WorkflowRepository::open_in_memory().expect("repository");
+        let mut capacity = repository
+            .create(new_mining_transport_capacity_workflow(
+                MiningTransportCapacityIntent {
+                    region: "alpha".into(),
+                    system: "REMOTE".into(),
+                    collect: "REMOTE-BELT-1".into(),
+                    deliver: "HUB-BELT-1".into(),
+                    controller: "TC".into(),
+                    target_freighters: 3,
+                    reuse_candidates: Vec::new(),
+                },
+            ))
+            .expect("capacity workflow");
+        for (step, expected) in [
+            (
+                "verifying_released_capacity_return",
+                "Return excess Cargo Freighters to regional stock",
+            ),
+            (
+                "waiting_for_staged_capacity_arrival",
+                "Confirm reusable Cargo Freighters arrived",
+            ),
+            (
+                "verifying_capacity_adoption",
+                "Verify Cargo Freighter adoption",
+            ),
+        ] {
+            capacity.current_step = Some(step.into());
+            let action = mining_workflow_next_action(&capacity).expect("capacity action");
+            assert!(action.contains(expected), "{step}: {action}");
+        }
+
+        let mut pool = repository
+            .create(new_mining_maintenance_pool_workflow(
+                MiningMaintenancePoolIntent {
+                    region: "alpha".into(),
+                    hub_belt: "HUB-BELT-1".into(),
+                    target_healthy: 3,
+                    reuse_candidates: Vec::new(),
+                },
+            ))
+            .expect("pool workflow");
+        for (step, expected) in [
+            (
+                "waiting_for_hub_pool_evidence",
+                "Refresh authoritative maintenance-patrol evidence",
+            ),
+            (
+                "waiting_for_hub_pool_health",
+                "Wait for maintenance patrol repair",
+            ),
+        ] {
+            pool.current_step = Some(step.into());
+            let action = mining_workflow_next_action(&pool).expect("pool action");
+            assert!(action.contains(expected), "{step}: {action}");
+        }
     }
 
     #[test]
@@ -12327,10 +12394,10 @@ mod tests {
         let repository = WorkflowRepository::open_in_memory().expect("repository");
         let mut disconnected = devices.clone();
         disconnected.retain(|device| {
-            !device
+            device
                 .device_type
                 .as_ref()
-                .is_some_and(|kind| kind.as_str() == "ftl_relay")
+                .is_none_or(|kind| kind.as_str() != "ftl_relay")
         });
         for device in &mut disconnected {
             if device.key.id.as_str().starts_with("MD-") {
@@ -16445,10 +16512,12 @@ mod tests {
         assert_eq!(second.instance.id, first.instance.id);
         assert_eq!(repository.list().expect("workflows").len(), 1);
 
-        let mut trend = crate::mining::TransportCapacityTrend::default();
-        trend.last_observed_backlog_units = Some(54_979);
-        trend.last_observation_at_ms = Some(1_000);
-        trend.last_capacity_change_at_ms = Some(1_000);
+        let trend = crate::mining::TransportCapacityTrend {
+            last_observed_backlog_units: Some(54_979),
+            last_observation_at_ms: Some(1_000),
+            last_capacity_change_at_ms: Some(1_000),
+            ..Default::default()
+        };
         save_mining_transport_capacity_trend(
             &repository,
             "alpha",

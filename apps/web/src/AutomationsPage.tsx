@@ -1411,6 +1411,8 @@ const workflowStepNames: Record<string, string> = {
   releasing_excess_capacity:
     "Releasing excess Cargo Freighters to regional stock",
   returning_released_capacity: "Returning released Cargo Freighters to the hub",
+  verifying_released_capacity_return:
+    "Verifying released Cargo Freighters returned to regional stock",
   waiting_for_released_capacity: "Confirming released Cargo Freighters",
   waiting_for_released_capacity_location:
     "Waiting for released Cargo Freighter location",
@@ -1419,6 +1421,9 @@ const workflowStepNames: Record<string, string> = {
     "Waiting for authoritative mining backlog",
   provisioning_capacity: "Provisioning the Cargo Freighter shortfall",
   staging_reusable_capacity: "Delivering reusable Cargo Freighters",
+  waiting_for_staged_capacity_arrival:
+    "Waiting for reusable Cargo Freighters to arrive",
+  verifying_capacity_adoption: "Verifying Cargo Freighter adoption",
   waiting_for_capacity_adoption_evidence: "Confirming Cargo Freighter adoption",
   waiting_for_capacity_inventory:
     "Waiting for Cargo Freighters at the controller",
@@ -1426,6 +1431,12 @@ const workflowStepNames: Record<string, string> = {
   provisioning_replacement: "Provisioning a replacement maintenance drone",
   delivering_replacement: "Delivering the replacement maintenance drone",
   verifying_replacement_delivery: "Confirming replacement maintenance delivery",
+  waiting_for_replacement_readiness:
+    "Waiting for replacement maintenance to reach >=95% capacity",
+  waiting_for_healthy_hub_reserve:
+    "Waiting for the minimum healthy hub maintenance reserve",
+  waiting_for_worn_capacity_evidence:
+    "Waiting for authoritative worn-drone capacity",
   waiting_for_replacement_patrol: "Confirming replacement maintenance patrol",
   waiting_for_replacement_patrol_repair:
     "Repairing replacement maintenance patrol before worn-drone return",
@@ -1436,6 +1447,10 @@ const workflowStepNames: Record<string, string> = {
   repair_pending: "Waiting for returned drone to reach >=95% capacity",
   configuring_hub_patrol: "Configuring the hub maintenance patrol",
   provisioning_hub_pool: "Provisioning the hub maintenance reserve",
+  waiting_for_hub_pool_evidence:
+    "Waiting for authoritative hub maintenance evidence",
+  waiting_for_hub_pool_health:
+    "Waiting for the hub maintenance reserve to become healthy",
   awaiting_available_resources: "Waiting for available resources",
   awaiting_blueprint_control_replicant:
     "Waiting for blueprint control Replicant",
@@ -1936,7 +1951,7 @@ function MiningOpsHealth({ health }: { health: DirectorMiningOpsSummary }) {
         {health.healthy_routes} / {health.total_routes} healthy
       </dd>
       <dt>Cargo freighters</dt>
-      <dd>{health.active_cargo_freighters} active</dd>
+      <dd>{health.active_cargo_freighters} usable</dd>
       <dt>Cargo backlog</dt>
       <dd>
         {health.worst_backlog

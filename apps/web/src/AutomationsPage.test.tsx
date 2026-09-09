@@ -829,7 +829,7 @@ describe("Director goal controls", () => {
               (term) => term.textContent === label,
             )?.nextElementSibling?.textContent;
           expect(metric("Transport")).toBe("5 / 6 healthy");
-          expect(metric("Cargo freighters")).toBe("9 active");
+          expect(metric("Cargo freighters")).toBe("9 usable");
           expect(metric("Protection")).toBe("4 / 4 priority systems");
           expect(metric("Expansion")).toBe("3 candidates");
           if (scenario === "critical backlog") {
@@ -971,92 +971,125 @@ describe("Director goal controls", () => {
     container.remove();
   });
 
-  it("describes the registered mining campaign rather than nonexistent site workflows", async () => {
-    vi.useFakeTimers();
-    const workflow = {
-      id: "WF-MINING",
+  it.each([
+    {
       kind: "mining.campaign",
-      status: "waiting" as const,
-      current_step: "executing",
-      revision: 1,
-      updated_at_ms: 10,
-    };
-    const detail = {
-      summary: workflow,
-      schema_version: 3,
-      parameters: { systems: ["REMOTE"] },
-      wait_reason: null,
-      parent_id: null,
-      claims: [],
-      created_at_ms: 10,
-      finished_at_ms: null,
-      error: null,
-    };
-    vi.stubGlobal(
-      "fetch",
-      vi.fn((input: RequestInfo | URL) => {
-        const url =
-          typeof input === "string"
-            ? input
-            : input instanceof URL
-              ? input.href
-              : input.url;
-        const payload =
-          url === "/api/descriptors"
-            ? { reports: [], actions: [], workflows: [] }
-            : url === "/api/workflows/WF-MINING"
-              ? detail
-              : url === "/api/director"
-                ? {
-                    metadata: { revision: 1, generated_at_ms: 10 },
-                    mode: "advisory",
-                    regions: [],
-                    goals: [],
-                    replicants: [],
-                    workforce: {
-                      total: 0,
-                      busy: 0,
-                      idle: 0,
-                      idle_ratio: 1,
-                      pending_worker_demand: 0,
-                      scale_up_recommended: false,
-                      scale_reason: null,
-                    },
-                  }
-                : { activity: [] };
-        return Promise.resolve({
-          ok: true,
-          json: () => Promise.resolve({ protocol_version: 1, payload }),
-        });
-      }),
-    );
-    const container = document.createElement("div");
-    document.body.appendChild(container);
-    const root = createRoot(container);
-    try {
-      await act(async () => {
-        root.render(
-          <AutomationsPage
-            workflows={[workflow]}
-            entities={{}}
-            selectedWorkflowId={workflow.id}
-          />,
-        );
-        await vi.runAllTimersAsync();
-      });
-      expect(container.querySelector(".workflow-step")?.textContent).toContain(
-        "Executing mining site and AMI transport work",
-      );
-      expect(container.textContent).toContain(
+      step: "executing",
+      label: "Executing mining site and AMI transport work",
+      reason:
         "Waiting for mining site or AMI transport work to complete; see the Director next action.",
+    },
+    {
+      kind: "mining.transport_capacity",
+      step: "waiting_for_staged_capacity_arrival",
+      label: "Waiting for reusable Cargo Freighters to arrive",
+      reason: "Waiting for reusable Cargo Freighters to arrive",
+    },
+    {
+      kind: "mining.maintenance_rotation",
+      step: "waiting_for_worn_capacity_evidence",
+      label: "Waiting for authoritative worn-drone capacity",
+      reason: "Waiting for authoritative worn-drone capacity",
+    },
+    {
+      kind: "mining.maintenance_pool",
+      step: "waiting_for_hub_pool_evidence",
+      label: "Waiting for authoritative hub maintenance evidence",
+      reason: "Waiting for authoritative hub maintenance evidence",
+    },
+  ])(
+    "describes the $kind $step state without a generic wait reason",
+    async ({ kind, step, label, reason }) => {
+      vi.useFakeTimers();
+      const workflow = {
+        id: "WF-MINING",
+        kind,
+        status: "waiting" as const,
+        current_step: step,
+        revision: 1,
+        updated_at_ms: 10,
+      };
+      const detail = {
+        summary: workflow,
+        schema_version: 3,
+        parameters: {},
+        wait_reason: null,
+        parent_id: null,
+        claims: [],
+        created_at_ms: 10,
+        finished_at_ms: null,
+        error: null,
+      };
+      vi.stubGlobal(
+        "fetch",
+        vi.fn((input: RequestInfo | URL) => {
+          const url =
+            typeof input === "string"
+              ? input
+              : input instanceof URL
+                ? input.href
+                : input.url;
+          const payload =
+            url === "/api/descriptors"
+              ? { reports: [], actions: [], workflows: [] }
+              : url === "/api/workflows/WF-MINING"
+                ? detail
+                : url === "/api/director"
+                  ? {
+                      metadata: { revision: 1, generated_at_ms: 10 },
+                      mode: "advisory",
+                      regions: [],
+                      goals: [],
+                      replicants: [],
+                      workforce: {
+                        total: 0,
+                        busy: 0,
+                        idle: 0,
+                        idle_ratio: 1,
+                        pending_worker_demand: 0,
+                        scale_up_recommended: false,
+                        scale_reason: null,
+                      },
+                    }
+                  : { activity: [] };
+          return Promise.resolve({
+            ok: true,
+            json: () => Promise.resolve({ protocol_version: 1, payload }),
+          });
+        }),
       );
-    } finally {
-      act(() => {
-        root.unmount();
-      });
-      container.remove();
-    }
-  });
+      const container = document.createElement("div");
+      document.body.appendChild(container);
+      const root = createRoot(container);
+      try {
+        await act(async () => {
+          root.render(
+            <AutomationsPage
+              workflows={[workflow]}
+              entities={{}}
+              selectedWorkflowId={workflow.id}
+            />,
+          );
+          await vi.runAllTimersAsync();
+        });
+        expect(
+          container.querySelector(".workflow-step")?.textContent,
+        ).toContain(label);
+        const waitReason = container.querySelector(
+          ".workflow-wait > span",
+        )?.textContent;
+        expect(waitReason).toBe(reason);
+        expect(waitReason).not.toBe(
+          "Waiting for a workflow dependency or resource to become ready.",
+        );
+      } finally {
+        act(() => {
+          root.unmount();
+        });
+        container.remove();
+      }
+    },
+  );
 
   it("opens the active recovery workflow ID from a selected workflow", async () => {
     vi.useFakeTimers();

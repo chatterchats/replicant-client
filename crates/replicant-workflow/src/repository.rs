@@ -2419,17 +2419,16 @@ impl WorkflowRepository {
                         continue;
                     }
                 }
-                if is_exclusive_namespace(&namespace) {
-                    if physical_claim_conflict_in(
+                if is_exclusive_namespace(&namespace)
+                    && physical_claim_conflict_in(
                         &transaction,
                         &candidate.resource,
                         item.spec.workflow_id,
                     )?
                     .is_some()
-                    {
-                        diagnostics.claim_rejected = diagnostics.claim_rejected.saturating_add(1);
-                        continue;
-                    }
+                {
+                    diagnostics.claim_rejected = diagnostics.claim_rejected.saturating_add(1);
+                    continue;
                 }
                 let allocation = ResourceAllocation {
                     id: AllocationId::new(),
@@ -2617,16 +2616,15 @@ impl WorkflowRepository {
                     continue;
                 }
             }
-            if is_exclusive_namespace(&namespace) {
-                if physical_claim_conflict_in(
+            if is_exclusive_namespace(&namespace)
+                && physical_claim_conflict_in(
                     &transaction,
                     &candidate.resource,
                     item.spec.workflow_id,
                 )?
                 .is_some()
-                {
-                    continue;
-                }
+            {
+                continue;
             }
             let revision = i64::try_from(candidate.observed_revision)
                 .map_err(|_| RepositoryError::RevisionOutOfRange(candidate.observed_revision))?;
@@ -3475,16 +3473,15 @@ fn candidate_supports_affined_dependents(
                 continue;
             }
             let (namespace, _) = dependent_candidate.resource.persisted_parts()?;
-            if is_exclusive_namespace(&namespace) {
-                if physical_claim_conflict_in(
+            if is_exclusive_namespace(&namespace)
+                && physical_claim_conflict_in(
                     transaction,
                     &dependent_candidate.resource,
                     workflow_id,
                 )?
                 .is_some()
-                {
-                    continue;
-                }
+            {
+                continue;
             }
             eligible = eligible.saturating_add(1);
         }
