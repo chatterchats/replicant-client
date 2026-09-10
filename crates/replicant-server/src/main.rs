@@ -169,11 +169,12 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let director = tokio::spawn(run_director(state.clone(), shutdown_rx.clone()));
     let runtime_lag = tokio::spawn(run_runtime_lag_probe(shutdown_rx.clone()));
     let signal = tokio::spawn(shutdown_signal(shutdown_tx.clone()));
-    let server_result = axum::serve(listener, router(state))
+    let server_result = axum::serve(listener, router(state.clone()))
         .with_graceful_shutdown(wait_for_shutdown(shutdown_rx))
         .await;
     let _ = shutdown_tx.send(true);
     supervisor.await?;
+    state.shutdown_workflows().await;
     messages.await?;
     triggers.await?;
     director.await?;

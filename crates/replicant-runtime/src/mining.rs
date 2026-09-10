@@ -58,6 +58,24 @@ const fn default_transport_freighter_count() -> usize {
 pub type AnyError = Box<dyn StdError + Send + Sync + 'static>;
 /// Result type returned by the reusable mining workflow.
 pub type AnyResult<T> = Result<T, AnyError>;
+/// Mining planning cannot mutate safely until managed evidence becomes authoritative.
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+pub(crate) struct MiningAuthorityPending {
+    message: String,
+}
+
+impl MiningAuthorityPending {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+pub(crate) fn authority_pending(message: impl Into<String>) -> AnyError {
+    Box::new(MiningAuthorityPending::new(message))
+}
 
 fn app_error(kind: io::ErrorKind, message: impl Into<String>) -> AnyError {
     io::Error::new(kind, message.into()).into()
@@ -1426,7 +1444,7 @@ async fn create_plan(client: &Client, config: &Config) -> AnyResult<MiningMissio
         .iter()
         .map(|route| (route.system.as_str(), route))
         .collect::<BTreeMap<_, _>>();
-    let devices = device_snapshots(client).await?;
+    let devices = planning_device_snapshots(client).await?;
     let catalogue = client.galaxy().catalogue();
     sort_systems_by_hub_distance(&mut systems, &config.hub, &catalogue);
     let blueprints = fetch_blueprints(client).await?;
@@ -1440,13 +1458,10 @@ async fn create_plan(client: &Client, config: &Config) -> AnyResult<MiningMissio
         };
         let audit = audit_site(&devices, &system, &belt.designation);
         if !audit.mutation_safe {
-            return Err(app_error(
-                io::ErrorKind::WouldBlock,
-                format!(
-                    "mining site {} requires authoritative evidence before provisioning: {:?}",
-                    belt.designation, audit.issues
-                ),
-            ));
+            return Err(authority_pending(format!(
+                "mining site {} requires authoritative evidence before provisioning: {:?}",
+                belt.designation, audit.issues
+            )));
         }
         let missing = site_shortages(&audit);
         sites.push(SiteMission {
@@ -1482,15 +1497,18 @@ async fn create_plan(client: &Client, config: &Config) -> AnyResult<MiningMissio
         let desired_freighters = explicit_routes
             .get(site.system.as_str())
             .map_or(MIN_TRANSPORT_FREIGHTERS, |route| route.desired_freighters);
-        let audit = transport_service_present(&devices, &site.system, &site.belt, &config.hub);
+        let audit = transport_service_present_with_authority(
+            &devices,
+            &site.system,
+            &site.belt,
+            &config.hub,
+            true,
+        );
         if audit.state == EvidenceState::Unknown {
-            return Err(app_error(
-                io::ErrorKind::WouldBlock,
-                format!(
-                    "mining route {} to {} requires authoritative evidence before provisioning",
-                    site.belt, config.hub
-                ),
-            ));
+            return Err(authority_pending(format!(
+                "mining route {} to {} requires authoritative evidence before provisioning",
+                site.belt, config.hub
+            )));
         }
         let usable_freighters = audit.usable_freighters.clone();
         let freighter = usable_freighters.first().cloned();
@@ -1827,6 +1845,16 @@ pub(crate) async fn device_snapshots(client: &Client) -> AnyResult<Vec<Device>> 
     }
     devices.sort_by(|left, right| left.key.cmp(&right.key));
     Ok(devices)
+}
+
+async fn planning_device_snapshots(client: &Client) -> AnyResult<Vec<Device>> {
+    client
+        .devices()
+        .refresh_many()
+        .of_type(DeviceType::CargoFreighter)
+        .collect()
+        .await?;
+    device_snapshots(client).await
 }
 
 async fn select_replicant(client: &Client, requested: Option<&str>) -> AnyResult<String> {
@@ -2895,8 +2923,20 @@ pub(crate) fn transport_service_present_with_authority(
     usable_freighters.sort();
     unknown_freighters.sort();
     unusable_freighters.sort();
-    // Both directions must agree before a count can authorize capacity changes.
-    // An empty relationship is known zero only after an authoritative census.
+    let conflicting_inverse_relationship = devices.iter().any(|other_controller| {
+        other_controller.key.id.as_str() != selected_controller_code
+            && other_controller
+                .relationships
+                .controlled_devices
+                .iter()
+                .any(|child| {
+                    adopted_freighters
+                        .binary_search_by(|code| code.as_str().cmp(child.id.as_str()))
+                        .is_ok()
+                })
+    });
+    // Positive inverse evidence must not contradict the child-side census.
+    // Only non-authoritative snapshots require inverse membership confirmation.
     let relationships_incomplete = (!membership_authoritative
         && controller.relationships.controlled_devices.is_empty())
         || controller
@@ -2913,13 +2953,15 @@ pub(crate) fn transport_service_present_with_authority(
             controller_code(device) == Some(selected_controller_code.as_str())
                 && device.device_type.is_none()
         })
-        || adopted_freighters.iter().any(|code| {
-            !controller
-                .relationships
-                .controlled_devices
-                .iter()
-                .any(|child| child.id.as_str() == code)
-        });
+        || conflicting_inverse_relationship
+        || (!membership_authoritative
+            && adopted_freighters.iter().any(|code| {
+                !controller
+                    .relationships
+                    .controlled_devices
+                    .iter()
+                    .any(|child| child.id.as_str() == code)
+            }));
 
     let state = if controller_operational == EvidenceState::Unknown
         || controller_directive == EvidenceState::Unknown
@@ -3369,6 +3411,15 @@ mod tests {
             )
             .mount(&server)
             .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/devices"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"devices": [], "next_cursor": null})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
         let client = Client::builder()
             .base_url(Url::parse(&server.uri()).expect("mock URL"))
             .authentication_token(SecretString::from("test-token"))
@@ -3398,10 +3449,210 @@ mod tests {
 
         assert!(plan_expansion(&client, &request, false).await.is_err());
         let requests = server.received_requests().await.expect("received requests");
-        assert_eq!(requests.len(), 3);
+        assert_eq!(requests.len(), 4);
         assert_eq!(requests[0].url.path(), "/v1/replicants/WORKER");
-        assert_eq!(requests[1].url.path(), "/v1/blueprints");
-        assert_eq!(requests[2].url.path(), "/v1/locations/SOL");
+        assert_eq!(requests[1].url.path(), "/v1/devices");
+        assert_eq!(requests[2].url.path(), "/v1/blueprints");
+        assert_eq!(requests[3].url.path(), "/v1/locations/SOL");
+        client.close().await.expect("close");
+    }
+
+    async fn seed_owned_device(server: &MockServer, client: &Client, value: serde_json::Value) {
+        let code = value["device_code"]
+            .as_str()
+            .expect("device code")
+            .to_owned();
+        Mock::given(method("GET"))
+            .and(path(format!("/v1/devices/{code}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(value))
+            .mount(server)
+            .await;
+        client
+            .devices()
+            .refresh(&code)
+            .await
+            .expect("seed owned device");
+    }
+
+    #[tokio::test]
+    async fn planning_recognizes_authoritative_child_route_membership() {
+        let server = MockServer::start().await;
+        let system = "XHAWI";
+        let belt = "XHAWI-BELT-1";
+        let hub = "SCEPTURUM-BELT-1";
+        Mock::given(method("GET"))
+            .and(path("/v1/replicants/WORKER"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "replicant_code": "WORKER",
+                "status": "active"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/locations/XHAWI"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "location": system,
+                "asteroid_belt": {
+                    "present": true,
+                    "belts": [{"designation": belt, "density": "dense"}]
+                }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/blueprints"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"blueprints": []})),
+            )
+            .mount(&server)
+            .await;
+        let freighter = serde_json::json!({
+            "device_code": "CF",
+            "device_type": CARGO_FREIGHTER,
+            "location": belt,
+            "status": "surging",
+            "controller_device_code": "TC"
+        });
+        Mock::given(method("GET"))
+            .and(path("/v1/devices"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "devices": [freighter.clone()],
+                "next_cursor": null
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = Client::builder()
+            .base_url(Url::parse(&server.uri()).expect("mock URL"))
+            .authentication_token(SecretString::from("test-token"))
+            .in_memory()
+            .startup_policy(replicant_client::StartupPolicy::RestoreOnly)
+            .start()
+            .await
+            .expect("restore-only startup");
+        client
+            .replicants()
+            .get_owned("WORKER")
+            .await
+            .expect("seed committed worker projection");
+
+        seed_owned_device(
+            &server,
+            &client,
+            serde_json::json!({
+                "device_code": "MC",
+                "device_type": MINING_CONTROLLER,
+                "location": belt,
+                "status": "coordinating",
+                "ami_directive": {"directive": "deplete_smallest"},
+                "ami_directive_status": "active"
+            }),
+        )
+        .await;
+        for index in 0..4 {
+            seed_owned_device(
+                &server,
+                &client,
+                serde_json::json!({
+                    "device_code": format!("M{index}"),
+                    "device_type": MINING_DRONE,
+                    "location": belt,
+                    "status": "idle",
+                    "controller_device_code": "MC"
+                }),
+            )
+            .await;
+        }
+        seed_owned_device(
+            &server,
+            &client,
+            serde_json::json!({
+                "device_code": "SC",
+                "device_type": SURVEY_CONTROLLER,
+                "location": belt,
+                "status": "coordinating",
+                "ami_directive": {"directive": "belt_search"},
+                "ami_directive_status": "active"
+            }),
+        )
+        .await;
+        for index in 0..2 {
+            seed_owned_device(
+                &server,
+                &client,
+                serde_json::json!({
+                    "device_code": format!("S{index}"),
+                    "device_type": SURVEY_DRONE,
+                    "location": belt,
+                    "status": "idle",
+                    "controller_device_code": "SC"
+                }),
+            )
+            .await;
+        }
+        seed_owned_device(
+            &server,
+            &client,
+            serde_json::json!({
+                "device_code": "MD",
+                "device_type": MAINTENANCE_DRONE,
+                "location": belt,
+                "status": "idle",
+                "operational_capacity": 100.0,
+                "ami_directive": {"directive": "patrol"},
+                "ami_directive_status": "active"
+            }),
+        )
+        .await;
+        seed_owned_device(
+            &server,
+            &client,
+            serde_json::json!({
+                "device_code": "TC",
+                "device_type": TRANSPORT_CONTROLLER,
+                "location": belt,
+                "status": "coordinating",
+                "tags": [site_tag(system), role_tag("transport-controller")],
+                "ami_directive": {
+                    "directive": "ferry",
+                    "config": {"collect": belt, "deliver": hub}
+                },
+                "ami_directive_status": "active",
+                "controlled_devices": []
+            }),
+        )
+        .await;
+        seed_owned_device(&server, &client, freighter).await;
+
+        let mission_file = std::env::temp_dir().join(format!(
+            "replicant-mining-authoritative-route-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        let request = MiningExpansionRequest {
+            systems: vec![system.into()],
+            replicant: "WORKER".into(),
+            hub: hub.into(),
+            transport_routes: vec![AmiTransportRouteIntent {
+                system: system.into(),
+                collect: belt.into(),
+                deliver: hub.into(),
+                desired_freighters: 1,
+            }],
+            mission_file: mission_file.clone(),
+            wait_timeout: Duration::from_secs(1),
+            max_concurrency: 1,
+        };
+
+        let mission = plan_expansion(&client, &request, false)
+            .await
+            .expect("authoritative child relation should complete the route");
+        assert_eq!(mission.routes.len(), 1);
+        assert_eq!(mission.routes[0].phase, RoutePhase::Active);
+        assert_eq!(mission.routes[0].controller.as_deref(), Some("TC"));
+        assert_eq!(mission.routes[0].freighters(), ["CF"]);
+        assert!(mission.route_print_requirements.is_empty());
+
+        fs::remove_file(mission_file).expect("remove mission");
         client.close().await.expect("close");
     }
 
@@ -4134,6 +4385,80 @@ mod tests {
     }
 
     #[test]
+    fn authoritative_child_membership_ignores_empty_controller_inverse() {
+        let system = "XHAWI";
+        let belt = "XHAWI-BELT-1";
+        let hub = "SCEPTURUM-BELT-1";
+        let controller = healthy_transport_controller("TC", system, belt, hub, &[]);
+        let freighter = transport_freighter("CF", "TC", belt, "surging");
+
+        let audit = transport_service_present_with_authority(
+            &[controller, freighter],
+            system,
+            belt,
+            hub,
+            true,
+        );
+
+        assert_eq!(audit.state, EvidenceState::Present);
+        assert_eq!(audit.controller.as_deref(), Some("TC"));
+        assert_eq!(audit.adopted_freighters, ["CF"]);
+        assert_eq!(audit.usable_freighters, ["CF"]);
+    }
+
+    #[test]
+    fn authoritative_membership_does_not_override_controller_evidence() {
+        let system = "XHAWI";
+        let belt = "XHAWI-BELT-1";
+        let hub = "SCEPTURUM-BELT-1";
+        let controller = healthy_transport_controller("TC", system, belt, hub, &[]);
+        let freighter = transport_freighter("CF", "TC", belt, "surging");
+        let mut missing_status = controller.clone();
+        missing_status.status = None;
+        let mut missing_directive = controller.clone();
+        missing_directive
+            .active_directive
+            .as_mut()
+            .expect("directive")
+            .directive = None;
+        let mut missing_configuration = controller;
+        missing_configuration
+            .active_directive
+            .as_mut()
+            .expect("directive")
+            .details
+            .insert("config".into(), serde_json::json!({"collect": belt}));
+
+        for (field, controller) in [
+            ("status", missing_status),
+            ("directive", missing_directive),
+            ("configuration", missing_configuration),
+        ] {
+            let audit = transport_service_present_with_authority(
+                &[controller, freighter.clone()],
+                system,
+                belt,
+                hub,
+                true,
+            );
+            assert_eq!(audit.state, EvidenceState::Unknown, "{field}");
+        }
+    }
+
+    #[test]
+    fn conservative_child_membership_with_empty_inverse_is_unknown() {
+        let system = "XHAWI";
+        let belt = "XHAWI-BELT-1";
+        let hub = "SCEPTURUM-BELT-1";
+        let controller = healthy_transport_controller("TC", system, belt, hub, &[]);
+        let freighter = transport_freighter("CF", "TC", belt, "surging");
+
+        let audit = transport_service_present(&[controller, freighter], system, belt, hub);
+
+        assert_eq!(audit.state, EvidenceState::Unknown);
+    }
+
+    #[test]
     fn authoritative_empty_transport_membership_is_known_zero_capacity() {
         let system = "ILPHARD";
         let belt = "ILPHARD-BELT-1";
@@ -4149,6 +4474,49 @@ mod tests {
         assert_eq!(authoritative.state, EvidenceState::Absent);
         assert_eq!(authoritative.usable_freighter_count(), 0);
         assert!(authoritative.adopted_freighters.is_empty());
+    }
+
+    #[test]
+    fn authoritative_membership_rejects_conflicting_child_controller() {
+        let system = "XHAWI";
+        let belt = "XHAWI-BELT-1";
+        let hub = "SCEPTURUM-BELT-1";
+        let controller = healthy_transport_controller("TC", system, belt, hub, &["CF"]);
+        let freighter = transport_freighter("CF", "OTHER", belt, "surging");
+
+        let audit = transport_service_present_with_authority(
+            &[controller, freighter],
+            system,
+            belt,
+            hub,
+            true,
+        );
+
+        assert_eq!(audit.state, EvidenceState::Unknown);
+        assert!(audit.adopted_freighters.is_empty());
+    }
+
+    #[test]
+    fn authoritative_membership_rejects_competing_controller_inverse() {
+        let system = "XHAWI";
+        let belt = "XHAWI-BELT-1";
+        let hub = "SCEPTURUM-BELT-1";
+        let controller = healthy_transport_controller("TC", system, belt, hub, &[]);
+        let freighter = transport_freighter("CF", "TC", belt, "surging");
+        let mut competing_controller = device("OTHER", TRANSPORT_CONTROLLER, belt);
+        competing_controller.relationships.controlled_devices =
+            vec![DeviceKey::live(DeviceId::from("CF"))];
+
+        let audit = transport_service_present_with_authority(
+            &[controller, freighter, competing_controller],
+            system,
+            belt,
+            hub,
+            true,
+        );
+
+        assert_eq!(audit.state, EvidenceState::Unknown);
+        assert_eq!(audit.adopted_freighters, ["CF"]);
     }
 
     #[test]

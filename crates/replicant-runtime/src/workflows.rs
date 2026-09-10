@@ -31,9 +31,9 @@ use crate::{
         event_mission_preflight, plan_event_mission,
     },
     mining::{
-        AmiTransportRouteIntent, MiningExpansionRequest, MiningMission, execute_mining_item,
-        merge_mining_item_state, mining_item_completed, mining_work_item_specs,
-        plan_expansion_from_managed_state,
+        AmiTransportRouteIntent, MiningAuthorityPending, MiningExpansionRequest, MiningMission,
+        execute_mining_item, merge_mining_item_state, mining_item_completed,
+        mining_work_item_specs, plan_expansion_from_managed_state,
     },
     relay::{
         RelayExecutionState, RelayExpansionRequest, elastic_relay_assignment, execute_relay_trip,
@@ -332,6 +332,9 @@ pub struct MiningWorkflowCheckpoint {
     pub migration_worker: Option<String>,
     /// Whether execution has entered the pooled executor.
     pub started: bool,
+    /// Last incomplete-authority condition emitted for this campaign.
+    #[serde(default)]
+    pub authority_wait: Option<String>,
 }
 
 /// Identity-free persisted event-fulfillment inputs.
@@ -713,6 +716,30 @@ fn mining_checkpoint_has_legacy_ward_gate(mission: &MiningMission) -> bool {
         .any(|batch| batch.device_type == "system_ward")
 }
 
+async fn wait_for_authoritative_mining_evidence(
+    context: &mut WorkflowContext,
+    checkpoint: &mut MiningWorkflowCheckpoint,
+    message: String,
+) -> Result<bool, String> {
+    let changed = checkpoint.authority_wait.as_deref() != Some(message.as_str());
+    checkpoint.authority_wait = Some(message.clone());
+    context
+        .advance_to("waiting_for_authoritative_mining_evidence", checkpoint)
+        .map_err(string_error)?;
+    if changed {
+        context.emit_activity(message).map_err(string_error)?;
+    }
+    context.mark_waiting().map_err(string_error)?;
+    crate::automation::wait_for_campaign_work(
+        context,
+        "waiting for authoritative mining site and route evidence",
+        &[],
+        None,
+        Duration::from_secs(30),
+    )
+    .await
+}
+
 pub(crate) async fn execute_mining_pool_config(
     context: &mut WorkflowContext,
     item_executor: Arc<dyn MiningItemExecutor>,
@@ -743,7 +770,7 @@ pub(crate) async fn execute_mining_pool_config(
             )
             .map_err(string_error);
     }
-    if checkpoint.mission.is_none() {
+    while checkpoint.mission.is_none() {
         let candidates = regional_relay_candidates(
             repository.as_ref(),
             &client,
@@ -752,27 +779,45 @@ pub(crate) async fn execute_mining_pool_config(
         )?;
         let worker = candidate_identity(&candidates, "replicant", None)
             .ok_or_else(|| "mining planning has no regional Replicant".to_owned())?;
-        checkpoint.mission = Some(
-            plan_expansion_from_managed_state(
-                &client,
-                &MiningExpansionRequest {
-                    systems: config.systems.clone(),
-                    replicant: worker,
-                    hub: config.hub.clone(),
-                    transport_routes: config.transport_routes.clone(),
-                    mission_file: config.mission_file.clone(),
-                    wait_timeout: Duration::from_secs(config.wait_timeout_seconds),
-                    max_concurrency: config.max_concurrency.max(1),
-                },
-                false,
-            )
-            .await
-            .map_err(string_error)?,
-        );
-        context
-            .persist_checkpoint(&checkpoint)
-            .map_err(string_error)?;
+        let planning = plan_expansion_from_managed_state(
+            &client,
+            &MiningExpansionRequest {
+                systems: config.systems.clone(),
+                replicant: worker,
+                hub: config.hub.clone(),
+                transport_routes: config.transport_routes.clone(),
+                mission_file: config.mission_file.clone(),
+                wait_timeout: Duration::from_secs(config.wait_timeout_seconds),
+                max_concurrency: config.max_concurrency.max(1),
+            },
+            false,
+        )
+        .await;
+        checkpoint.mission = match planning {
+            Ok(mission) => {
+                checkpoint.authority_wait = None;
+                Some(mission)
+            }
+            Err(error) => {
+                let Some(pending) = error.downcast_ref::<MiningAuthorityPending>() else {
+                    return Err(string_error(error));
+                };
+                if !wait_for_authoritative_mining_evidence(
+                    context,
+                    &mut checkpoint,
+                    pending.to_string(),
+                )
+                .await?
+                {
+                    return Ok(());
+                }
+                None
+            }
+        };
     }
+    context
+        .persist_checkpoint(&checkpoint)
+        .map_err(string_error)?;
     let mut mission = checkpoint
         .mission
         .clone()
@@ -953,10 +998,25 @@ pub(crate) async fn execute_mining_pool_config(
         if running.is_empty() {
             break;
         }
+        let mut authority_wait = None;
         for result in futures::future::join_all(running).await {
-            let (item_type, index, lane) = result?;
+            let (item_type, index, lane, pending) = result?;
             merge_mining_item_state(&mut mission, &lane, &item_type, index);
             checkpoint.mission = Some(mission.clone());
+            context
+                .advance_to("executing", &checkpoint)
+                .map_err(string_error)?;
+            if authority_wait.is_none() {
+                authority_wait = pending;
+            }
+        }
+        if let Some(message) = authority_wait {
+            if !wait_for_authoritative_mining_evidence(context, &mut checkpoint, message).await? {
+                return Ok(());
+            }
+            continue;
+        }
+        if checkpoint.authority_wait.take().is_some() {
             context
                 .advance_to("executing", &checkpoint)
                 .map_err(string_error)?;
@@ -1180,7 +1240,7 @@ async fn run_mining_item(
     index: usize,
     mut allocations: AllocationSet,
     wait_timeout: Duration,
-) -> Result<(String, usize, MiningMission), String> {
+) -> Result<(String, usize, MiningMission, Option<String>), String> {
     let mut mission = item
         .state
         .checkpoint_json
@@ -1213,7 +1273,7 @@ async fn run_mining_item(
                 workflow_now_millis(),
             )
             .map_err(string_error)?;
-        return Ok((item_type, index, mission));
+        return Ok((item_type, index, mission, None));
     }
     loop {
         let outcome = item_executor
@@ -1253,7 +1313,7 @@ async fn run_mining_item(
                         workflow_now_millis(),
                     )
                     .map_err(string_error)?;
-                return Ok((item_type, index, lane));
+                return Ok((item_type, index, lane, None));
             }
             Ok(lane) => {
                 repository
@@ -1269,7 +1329,7 @@ async fn run_mining_item(
                         workflow_now_millis(),
                     )
                     .map_err(string_error)?;
-                return Ok((item_type, index, lane));
+                return Ok((item_type, index, lane, None));
             }
             Err(error)
                 if error
@@ -1356,10 +1416,10 @@ async fn run_mining_item(
                                                 workflow_now_millis(),
                                             )
                                             .map_err(string_error)?;
-                                        return Ok((item_type, index, mission));
+                                        return Ok((item_type, index, mission, None));
                                     }
                                     ReplacementOutcome::Unavailable => {
-                                        return Ok((item_type, index, mission));
+                                        return Ok((item_type, index, mission, None));
                                     }
                                 }
                             }
@@ -1382,10 +1442,10 @@ async fn run_mining_item(
                                     workflow_now_millis(),
                                 )
                                 .map_err(string_error)?;
-                            return Ok((item_type, index, mission));
+                            return Ok((item_type, index, mission, None));
                         }
                         ReplacementOutcome::Unavailable => {
-                            return Ok((item_type, index, mission));
+                            return Ok((item_type, index, mission, None));
                         }
                     }
                 }
@@ -1402,25 +1462,34 @@ async fn run_mining_item(
                         workflow_now_millis(),
                     )
                     .map_err(string_error)?;
-                return Ok((item_type, index, mission));
+                return Ok((item_type, index, mission, None));
             }
             Err(error) => {
-                let waiting = crate::failure::failure_class(error.as_ref()).is_some_and(|class| {
-                    matches!(
-                        class,
-                        crate::failure::FailureClass::EventControlUnavailable
-                            | crate::failure::FailureClass::ConnectivityDependency
-                            | crate::failure::FailureClass::ManufacturingCapacity
-                            | crate::failure::FailureClass::TransientUpstream
-                    )
-                });
+                let authority_wait = error
+                    .downcast_ref::<MiningAuthorityPending>()
+                    .map(ToString::to_string);
+                let waiting = authority_wait.is_some()
+                    || crate::failure::failure_class(error.as_ref()).is_some_and(|class| {
+                        matches!(
+                            class,
+                            crate::failure::FailureClass::EventControlUnavailable
+                                | crate::failure::FailureClass::ConnectivityDependency
+                                | crate::failure::FailureClass::ManufacturingCapacity
+                                | crate::failure::FailureClass::TransientUpstream
+                        )
+                    });
+                let now_ms = workflow_now_millis();
                 let transition = if waiting {
                     WorkItemTransition::Waiting {
                         checkpoint_json: Some(
                             serde_json::to_value(&mission).map_err(string_error)?,
                         ),
                         reason: error.to_string(),
-                        retry_at_ms: Some(workflow_now_millis().saturating_add(300_000)),
+                        retry_at_ms: Some(if authority_wait.is_some() {
+                            now_ms
+                        } else {
+                            now_ms.saturating_add(300_000)
+                        }),
                     }
                 } else {
                     WorkItemTransition::RetryableFailure {
@@ -1431,9 +1500,9 @@ async fn run_mining_item(
                     }
                 };
                 repository
-                    .transition_work_item(item.id, revision, transition, workflow_now_millis())
+                    .transition_work_item(item.id, revision, transition, now_ms)
                     .map_err(string_error)?;
-                return Ok((item_type, index, mission));
+                return Ok((item_type, index, mission, authority_wait));
             }
         }
     }
@@ -4552,7 +4621,7 @@ mod tests {
     use replicant_client::{SecretString, StartupPolicy, managed::SyncDomain, raw::Url};
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
-        matchers::{method, path},
+        matchers::{method, path, query_param},
     };
 
     #[test]
@@ -4859,6 +4928,71 @@ mod tests {
         }
     }
 
+    struct AuthorityPendingMiningItemExecutor;
+
+    impl MiningItemExecutor for AuthorityPendingMiningItemExecutor {
+        fn execute<'a>(
+            &'a self,
+            _client: &'a replicant_client::Client,
+            _mission: &'a MiningMission,
+            _item: (&'a str, usize),
+            _allocations: &'a AllocationSet,
+            _wait_timeout: Duration,
+            _claims: crate::mining::MiningWorkflowClaims,
+        ) -> MiningItemFuture<'a> {
+            Box::pin(async {
+                Err(crate::mining::authority_pending(
+                    "mining site evidence is incomplete",
+                ))
+            })
+        }
+    }
+
+    struct AuthorityThenCompleteMiningItemExecutor {
+        pending: AtomicBool,
+    }
+
+    impl AuthorityThenCompleteMiningItemExecutor {
+        fn new() -> Self {
+            Self {
+                pending: AtomicBool::new(true),
+            }
+        }
+    }
+
+    impl MiningItemExecutor for AuthorityThenCompleteMiningItemExecutor {
+        fn execute<'a>(
+            &'a self,
+            _client: &'a replicant_client::Client,
+            mission: &'a MiningMission,
+            (item_type, index): (&'a str, usize),
+            _allocations: &'a AllocationSet,
+            _wait_timeout: Duration,
+            _claims: crate::mining::MiningWorkflowClaims,
+        ) -> MiningItemFuture<'a> {
+            let mut lane = mission.clone();
+            Box::pin(async move {
+                if self.pending.swap(false, Ordering::SeqCst) {
+                    return Err(crate::mining::authority_pending(
+                        "mining site evidence is incomplete",
+                    ));
+                }
+                if item_type != "route" {
+                    return Err(std::io::Error::other("unexpected mining item").into());
+                }
+                let mut route = lane
+                    .routes
+                    .get(index)
+                    .cloned()
+                    .ok_or_else(|| std::io::Error::other("missing mining route"))?;
+                route.phase = crate::mining::RoutePhase::Active;
+                lane.routes = vec![route];
+                lane.sites.clear();
+                Ok(lane)
+            })
+        }
+    }
+
     fn mining_pool_mission() -> MiningMission {
         MiningMission {
             version: 1,
@@ -4984,7 +5118,7 @@ mod tests {
             client.clone(),
         );
 
-        let (_, _, returned) = run_mining_item(
+        let (_, _, returned, authority_wait) = run_mining_item(
             repository.clone(),
             client.clone(),
             broker,
@@ -4999,6 +5133,7 @@ mod tests {
         )
         .await
         .expect("run item");
+        assert!(authority_wait.is_none());
 
         assert_eq!(returned.warnings, ["durable phase reached"]);
         let stored = repository
@@ -5010,6 +5145,614 @@ mod tests {
                 .expect("mission checkpoint");
         assert_eq!(checkpoint.warnings, ["durable phase reached"]);
         client.close().await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn mining_item_authority_blocker_is_propagated_to_campaign_adapter() {
+        let server = MockServer::start().await;
+        let client = mining_pool_client(&server).await;
+        let repository =
+            Arc::new(replicant_workflow::WorkflowRepository::open_in_memory().expect("repository"));
+        let mission = mining_pool_mission();
+        let workflow = repository
+            .create(new_mining_workflow(MiningWorkflowConfig {
+                systems: vec!["PENDING".into()],
+                region: "Alpha".into(),
+                hub: "ROOT-1-L4".into(),
+                transport_routes: Vec::new(),
+                mission_file: std::env::temp_dir().join("mining-authority-unused.json"),
+                wait_timeout_seconds: 1,
+                max_concurrency: 1,
+            }))
+            .expect("workflow");
+        let specs = mining_work_item_specs(workflow.id, &mission, "Alpha").expect("specs");
+        repository
+            .reconcile_work_items(workflow.id, &specs, 1)
+            .expect("reconcile items");
+        let assigned = repository
+            .claim_next_work_item(workflow.id, 2)
+            .expect("claim item")
+            .expect("assigned item");
+        let running = repository
+            .start_work_item(
+                assigned.id,
+                assigned.state.revision,
+                "test",
+                "test-assignment",
+                3,
+            )
+            .expect("start item");
+        let broker = crate::assignment::ResourceBroker::with_managed_client(
+            repository.clone(),
+            client.clone(),
+        );
+
+        let (_, _, returned, authority_wait) = run_mining_item(
+            repository.clone(),
+            client.clone(),
+            broker,
+            Arc::new(AuthorityPendingMiningItemExecutor),
+            Vec::new(),
+            mission,
+            running.clone(),
+            "route".into(),
+            0,
+            AllocationSet::default(),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("run item");
+
+        assert_eq!(
+            authority_wait.as_deref(),
+            Some("mining site evidence is incomplete")
+        );
+        let stored = repository
+            .read_work_item(running.id)
+            .expect("read item")
+            .expect("stored item");
+        assert_eq!(stored.state.status, WorkItemStatus::Waiting);
+        assert!(
+            stored
+                .state
+                .next_attempt_at_ms
+                .is_some_and(|retry| retry <= workflow_now_millis())
+        );
+        let stored_checkpoint: MiningMission = serde_json::from_value(
+            stored
+                .state
+                .checkpoint_json
+                .expect("stored mission checkpoint"),
+        )
+        .expect("mission checkpoint");
+        assert_eq!(stored_checkpoint.mission_id, returned.mission_id);
+        assert_eq!(stored_checkpoint.warnings, returned.warnings);
+        client.close().await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn executor_authority_blocker_waits_and_resumes_the_same_campaign() {
+        let server = MockServer::start().await;
+        let client = mining_pool_client(&server).await;
+        seed_mining_pool_worker(&server, &client, "REP-A", &[]).await;
+        Mock::given(method("GET"))
+            .and(path("/v1/stars"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "stars": [{"designation": "ROOT-1", "region": "alpha"}],
+                "total": 1
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        client
+            .galaxy()
+            .refresh_catalogue()
+            .await
+            .expect("seed catalogue");
+
+        let repository =
+            Arc::new(replicant_workflow::WorkflowRepository::open_in_memory().expect("repository"));
+        repository
+            .put_document(
+                "director.replicant",
+                "REP-A",
+                &serde_json::json!({"region": "Alpha"}),
+            )
+            .expect("Director region");
+        let mut mission = mining_pool_mission();
+        for site in &mut mission.sites {
+            site.phase = crate::mining::SitePhase::Operational;
+            site.missing.clear();
+        }
+        mission.routes.truncate(1);
+        mission.routes[0].controller = Some("TC".into());
+        mission.routes[0].freighter = Some("CF".into());
+        mission.routes[0].desired_freighters = 1;
+        let mut new = crate::automation::new_mining_campaign_workflow(
+            crate::automation::MiningCampaignIntent {
+                systems: vec!["PENDING".into()],
+                region: "Alpha".into(),
+                hub: mission.hub_location.clone(),
+                transport_routes: Vec::new(),
+                max_concurrency: 1,
+            },
+        );
+        new.checkpoint.mission = Some(mission);
+        let workflow = repository.create(new).expect("campaign");
+        let mut registry = WorkflowRegistry::new();
+        registry
+            .register(Arc::new(
+                crate::automation::MiningCampaignWorkflowFactory::with_item_executor(Arc::new(
+                    AuthorityThenCompleteMiningItemExecutor::new(),
+                )),
+            ))
+            .expect("register campaign");
+        let supervisor = replicant_workflow::WorkflowSupervisor::with_managed_client(
+            repository.clone(),
+            Arc::new(registry),
+            client.clone(),
+        );
+
+        for _ in 0..64 {
+            supervisor.tick().await.expect("supervisor tick");
+            if repository
+                .read(workflow.id)
+                .expect("campaign row")
+                .is_some_and(|campaign| campaign.status == WorkflowStatus::Waiting)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let waiting = repository
+            .read(workflow.id)
+            .expect("waiting row")
+            .expect("waiting campaign");
+        assert_eq!(waiting.id, workflow.id);
+        assert_eq!(waiting.status, WorkflowStatus::Waiting);
+        assert_eq!(
+            waiting.current_step.as_deref(),
+            Some("waiting_for_authoritative_mining_evidence")
+        );
+        assert!(waiting.last_error.is_none());
+        assert!(
+            waiting
+                .checkpoint::<MiningWorkflowCheckpoint>()
+                .expect("waiting checkpoint")
+                .mission
+                .is_some()
+        );
+        let waiting_items = repository
+            .list_work_items(workflow.id)
+            .expect("waiting work items");
+        assert_eq!(waiting_items.len(), 1);
+        assert_eq!(waiting_items[0].state.status, WorkItemStatus::Waiting);
+        assert_eq!(
+            repository
+                .activity(workflow.id)
+                .expect("campaign activity")
+                .iter()
+                .filter(|event| event.message == "mining site evidence is incomplete")
+                .count(),
+            1
+        );
+
+        Mock::given(method("GET"))
+            .and(path("/v1/devices/WAKE"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "device_code": "WAKE",
+                "device_type": "sensor_buoy",
+                "location": "ROOT-1-L4",
+                "status": "idle"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        client
+            .devices()
+            .get("WAKE")
+            .await
+            .expect("publish managed-state revision");
+        for _ in 0..64 {
+            supervisor.tick().await.expect("resumed supervisor tick");
+            if repository
+                .read(workflow.id)
+                .expect("campaign row")
+                .is_some_and(|campaign| campaign.status.is_terminal())
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let resumed = repository
+            .read(workflow.id)
+            .expect("resumed row")
+            .expect("resumed campaign");
+        assert_eq!(resumed.id, workflow.id);
+        assert_eq!(resumed.status, WorkflowStatus::Succeeded);
+        let resumed_items = repository
+            .list_work_items(workflow.id)
+            .expect("resumed work items");
+        assert_eq!(resumed_items.len(), 1);
+        assert_eq!(resumed_items[0].id, waiting_items[0].id);
+        assert_eq!(resumed_items[0].state.status, WorkItemStatus::Succeeded);
+        assert_eq!(
+            repository
+                .activity(workflow.id)
+                .expect("campaign activity")
+                .iter()
+                .filter(|event| event.message == "mining site evidence is incomplete")
+                .count(),
+            1
+        );
+        client.close().await.expect("close client");
+    }
+
+    fn mining_authority_devices(authoritative_route: bool) -> Vec<Value> {
+        let system = "ROOT";
+        let belt = "ROOT-BELT-1";
+        let hub = "HUB-BELT-1";
+        let mut devices = vec![
+            serde_json::json!({
+                "device_code": "MC",
+                "device_type": "ami_mining_controller",
+                "location": belt,
+                "status": "coordinating",
+                "ami_directive": {"directive": "deplete_smallest"},
+                "ami_directive_status": "active"
+            }),
+            serde_json::json!({
+                "device_code": "SC",
+                "device_type": "ami_survey_controller",
+                "location": belt,
+                "status": "coordinating",
+                "ami_directive": {"directive": "belt_search"},
+                "ami_directive_status": "active"
+            }),
+            serde_json::json!({
+                "device_code": "MD",
+                "device_type": "maintenance_drone",
+                "location": belt,
+                "status": "idle",
+                "operational_capacity": 100.0,
+                "ami_directive": {"directive": "patrol"},
+                "ami_directive_status": "active"
+            }),
+            serde_json::json!({
+                "device_code": "TC",
+                "device_type": "ami_transport_controller",
+                "location": belt,
+                "status": "coordinating",
+                "tags": [
+                    replicant_mining_planner::site_tag(system),
+                    replicant_mining_planner::role_tag("transport-controller")
+                ],
+                "controlled_devices": [{"device_code": "CF"}]
+            }),
+            serde_json::json!({
+                "device_code": "CF",
+                "device_type": "cargo_freighter",
+                "location": belt,
+                "status": "idle",
+                "controller_device_code": "TC"
+            }),
+        ];
+        if authoritative_route {
+            devices[3]["ami_directive"] = serde_json::json!({"directive": "ferry", "config": {
+                "collect": belt,
+                "deliver": hub
+            }});
+            devices[3]["ami_directive_status"] = Value::String("active".into());
+        }
+        for index in 0..4 {
+            devices.push(serde_json::json!({
+                "device_code": format!("M{index}"),
+                "device_type": "mining_drone",
+                "location": belt,
+                "status": "idle",
+                "controller_device_code": "MC"
+            }));
+        }
+        for index in 0..2 {
+            devices.push(serde_json::json!({
+                "device_code": format!("S{index}"),
+                "device_type": "survey_drone",
+                "location": belt,
+                "status": "idle",
+                "controller_device_code": "SC"
+            }));
+        }
+        devices.push(serde_json::json!({
+            "device_code": "REP-A-VESSEL",
+            "device_type": "racing_vessel",
+            "hosting_replicant": "REP-A",
+            "location": "ROOT-1-L4",
+            "status": "idle"
+        }));
+        devices
+    }
+
+    #[tokio::test]
+    async fn mining_campaign_authority_wait_is_durable_and_narrow() {
+        let server = MockServer::start().await;
+        let client = mining_pool_client(&server).await;
+        seed_mining_pool_worker(&server, &client, "REP-A", &[]).await;
+        Mock::given(method("GET"))
+            .and(path("/v1/locations/ROOT"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "location": "ROOT",
+                "asteroid_belt": {
+                    "present": true,
+                    "belts": [{"designation": "ROOT-BELT-1", "density": "dense"}]
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/blueprints"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"blueprints": []})),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/devices"))
+            .and(query_param("device_type", "cargo_freighter"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "devices": [{
+                    "device_code": "CF",
+                    "device_type": "cargo_freighter",
+                    "location": "ROOT-BELT-1",
+                    "status": "idle",
+                    "controller_device_code": "TC"
+                }],
+                "next_cursor": null
+            })))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/devices"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "devices": mining_authority_devices(false),
+                "next_cursor": null
+            })))
+            .up_to_n_times(1)
+            .with_priority(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/devices"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "devices": mining_authority_devices(true),
+                "next_cursor": null
+            })))
+            .with_priority(3)
+            .mount(&server)
+            .await;
+        client
+            .sync()
+            .domain(SyncDomain::Devices)
+            .await
+            .expect("seed incomplete route state");
+
+        let repository =
+            Arc::new(replicant_workflow::WorkflowRepository::open_in_memory().expect("repository"));
+        repository
+            .put_document(
+                "director.replicant",
+                "REP-A",
+                &serde_json::json!({"region": "Alpha"}),
+            )
+            .expect("Director region");
+        Mock::given(method("GET"))
+            .and(path("/v1/stars"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "stars": [{"designation": "ROOT-1", "region": "alpha"}],
+                "total": 1
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        client
+            .galaxy()
+            .refresh_catalogue()
+            .await
+            .expect("seed catalogue");
+        let route = AmiTransportRouteIntent {
+            system: "ROOT".into(),
+            collect: "ROOT-BELT-1".into(),
+            deliver: "HUB-BELT-1".into(),
+            desired_freighters: 1,
+        };
+        let workflow = repository
+            .create(crate::automation::new_mining_campaign_workflow(
+                crate::automation::MiningCampaignIntent {
+                    systems: vec!["ROOT".into()],
+                    region: "Alpha".into(),
+                    hub: "HUB-BELT-1".into(),
+                    transport_routes: vec![route],
+                    max_concurrency: 1,
+                },
+            ))
+            .expect("campaign");
+        let mut registry = WorkflowRegistry::new();
+        registry
+            .register(Arc::new(
+                crate::automation::MiningCampaignWorkflowFactory::with_item_executor(Arc::new(
+                    ManagedMiningItemExecutor,
+                )),
+            ))
+            .expect("register campaign");
+        let registry = Arc::new(registry);
+        let supervisor = replicant_workflow::WorkflowSupervisor::with_managed_client(
+            repository.clone(),
+            registry.clone(),
+            client.clone(),
+        );
+        for _ in 0..64 {
+            supervisor.tick().await.expect("supervisor tick");
+            if repository
+                .read(workflow.id)
+                .expect("campaign row")
+                .is_some_and(|workflow| workflow.status == WorkflowStatus::Waiting)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let waiting = repository
+            .read(workflow.id)
+            .expect("waiting row")
+            .expect("waiting campaign");
+        assert_eq!(
+            waiting.status,
+            WorkflowStatus::Waiting,
+            "{:?}",
+            waiting.last_error
+        );
+        assert_eq!(
+            waiting.current_step.as_deref(),
+            Some("waiting_for_authoritative_mining_evidence")
+        );
+        assert!(waiting.last_error.is_none());
+        assert!(
+            waiting
+                .checkpoint::<MiningWorkflowCheckpoint>()
+                .expect("waiting checkpoint")
+                .mission
+                .is_none()
+        );
+        supervisor.tick().await.expect("second supervisor tick");
+        assert_eq!(
+            repository
+                .read(workflow.id)
+                .expect("campaign row")
+                .expect("campaign")
+                .id,
+            workflow.id
+        );
+        assert_eq!(
+            repository
+                .activity(workflow.id)
+                .expect("campaign activity")
+                .iter()
+                .filter(|event| event.message.contains("mining route ROOT-BELT-1"))
+                .count(),
+            1
+        );
+
+        supervisor.shutdown().await;
+        drop(supervisor);
+        assert_eq!(
+            repository
+                .read(workflow.id)
+                .expect("preserved campaign row")
+                .expect("preserved campaign")
+                .status,
+            WorkflowStatus::Waiting
+        );
+        let supervisor = replicant_workflow::WorkflowSupervisor::with_managed_client(
+            repository.clone(),
+            registry,
+            client.clone(),
+        );
+        client
+            .sync()
+            .domain(SyncDomain::Devices)
+            .await
+            .expect("supply authoritative route state");
+        let devices = client.state().owned_devices().expect("owned devices");
+        let audit = crate::mining::transport_service_present_with_authority(
+            &devices,
+            "ROOT",
+            "ROOT-BELT-1",
+            "HUB-BELT-1",
+            true,
+        );
+        assert_eq!(
+            audit.state,
+            crate::mining::EvidenceState::Present,
+            "{audit:?}"
+        );
+        for _ in 0..64 {
+            supervisor.tick().await.expect("resumed supervisor tick");
+            if repository
+                .read(workflow.id)
+                .expect("campaign row")
+                .is_some_and(|workflow| workflow.status.is_terminal())
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let resumed = repository
+            .read(workflow.id)
+            .expect("resumed row")
+            .expect("resumed campaign");
+        assert_eq!(resumed.id, workflow.id);
+        let resumed_checkpoint = resumed
+            .checkpoint::<MiningWorkflowCheckpoint>()
+            .expect("resumed checkpoint");
+        assert_eq!(
+            resumed.status,
+            WorkflowStatus::Succeeded,
+            "step={:?} error={:?} authority_wait={:?} mission={:?}",
+            resumed.current_step,
+            resumed.last_error,
+            resumed_checkpoint.authority_wait,
+            resumed_checkpoint.mission
+        );
+        assert!(resumed_checkpoint.mission.is_some());
+
+        let execution_error = repository
+            .create(crate::automation::new_mining_campaign_workflow(
+                crate::automation::MiningCampaignIntent {
+                    systems: vec!["ROOT".into()],
+                    region: "Beta".into(),
+                    hub: "HUB-BELT-1".into(),
+                    transport_routes: Vec::new(),
+                    max_concurrency: 1,
+                },
+            ))
+            .expect("non-authority campaign");
+        for _ in 0..64 {
+            supervisor.tick().await.expect("error supervisor tick");
+            if repository
+                .read(execution_error.id)
+                .expect("error campaign row")
+                .is_some_and(|workflow| workflow.status.is_terminal())
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let failed = repository
+            .read(execution_error.id)
+            .expect("failed row")
+            .expect("failed campaign");
+        assert_eq!(failed.status, WorkflowStatus::Failed);
+        assert_eq!(
+            failed.failure_disposition,
+            Some(replicant_workflow::WorkflowFailureDisposition::Retryable)
+        );
+        assert!(
+            failed
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("no regional Replicant"))
+        );
+
+        server.verify().await;
+        client.close().await.expect("close client");
+        for id in [workflow.id, execution_error.id] {
+            let scratch = std::env::temp_dir()
+                .join("replicant-client-automation")
+                .join(id.to_string());
+            std::fs::remove_dir_all(scratch).expect("remove campaign scratch directory");
+        }
     }
 
     #[test]
@@ -5623,6 +6366,7 @@ mod tests {
                     mission: Some(mining_pool_material_mission()),
                     migration_worker: None,
                     started: true,
+                    authority_wait: None,
                 },
                 current_step: Some("executing".into()),
                 parent_id: None,

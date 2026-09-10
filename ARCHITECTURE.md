@@ -297,8 +297,12 @@ The initial standing goals are intentionally batch-oriented rather than one-goal
   per-route backlog trend. Backlog above 30 Cargo Freighter loads suppresses expansion; eligible
   backlog above 10 loads scales before expansion, while 2–10 loads alone does not block it.
   Flat/rising backlog triggers a bounded Cargo Freighter census once per regional reconcile, then
-  exact controller/child reads. Both directions of adoption must agree before capacity changes;
-  incomplete type, status, directive/configuration, or relationship evidence remains unknown.
+  exact controller/child reads. Expansion planning performs the same bounded census once per
+  planning pass before route provisioning decisions. After a census, complete child-side Cargo
+  Freighter controller relationships define route membership; controller inverse entries remain
+  positive conflict evidence, but omission from that inverse list is not negative evidence.
+  Incomplete type, status, directive/configuration, or contradictory relationship evidence remains
+  unknown.
   Coordinating or patrolling devices with missing directive details are not rewritten. An explicitly
   idle device may be initialized: the upstream status contract defines idle as having no active task.
   A stuck route already at six usable freighters surfaces an actionable blocker. Load bands compare

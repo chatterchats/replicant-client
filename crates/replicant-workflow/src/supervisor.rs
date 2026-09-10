@@ -818,6 +818,23 @@ impl WorkflowSupervisor {
         Ok(cancelled)
     }
 
+    /// Stops every in-process executor without changing its durable workflow state.
+    ///
+    /// A replacement supervisor can reconcile and resume the preserved rows after restart.
+    pub async fn shutdown(&self) {
+        let tasks = {
+            let mut executors = self.executors();
+            for task in executors.tasks.values() {
+                task.abort();
+            }
+            std::mem::take(&mut executors.tasks)
+        };
+        for (_, task) in tasks {
+            let _ = task.await;
+        }
+        self.executors().controls.clear();
+    }
+
     /// Returns whether this supervisor currently owns the instance executor.
     #[must_use]
     pub fn has_executor(&self, id: WorkflowId) -> bool {

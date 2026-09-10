@@ -7966,6 +7966,12 @@ fn mining_campaign_next_action(workflow: &WorkflowInstance) -> Option<String> {
     use crate::mining::{MissionPhase, RoutePhase, SitePhase};
 
     let intent = workflow.config::<MiningCampaignIntent>().ok()?;
+    if workflow.current_step.as_deref() == Some("waiting_for_authoritative_mining_evidence") {
+        return Some(format!(
+            "Refresh authoritative mining site and route evidence for {}",
+            intent.systems.join(", ")
+        ));
+    }
     let mission = workflow
         .checkpoint::<crate::automation::MiningCampaignCheckpoint>()
         .ok()
@@ -11617,6 +11623,113 @@ mod tests {
         for (name, signals, expected) in cases {
             assert_eq!(mining_ops_priority(signals), expected, "{name}");
         }
+    }
+
+    #[tokio::test]
+    async fn mining_ops_reuses_waiting_campaign_across_reconciliation() {
+        let server = MockServer::start().await;
+        let client = test_client_at(&server).await;
+        let repository = WorkflowRepository::open_in_memory().expect("repository");
+        let campaign = repository
+            .create(new_mining_campaign_workflow(MiningCampaignIntent {
+                systems: vec!["REMOTE".to_owned()],
+                region: "alpha".to_owned(),
+                hub: "HUB-BELT-1".to_owned(),
+                max_concurrency: 1,
+                transport_routes: Vec::new(),
+            }))
+            .expect("campaign");
+        let running = repository
+            .update(
+                campaign.id,
+                campaign.revision,
+                replicant_workflow::WorkflowState {
+                    status: WorkflowStatus::Running,
+                    current_step: Some("waiting_for_authoritative_mining_evidence".to_owned()),
+                    checkpoint: campaign.checkpoint::<Value>().expect("checkpoint"),
+                    last_error: None,
+                    result: None::<Value>,
+                },
+            )
+            .expect("running campaign");
+        repository
+            .update(
+                running.id,
+                running.revision,
+                replicant_workflow::WorkflowState {
+                    status: WorkflowStatus::Waiting,
+                    current_step: running.current_step.clone(),
+                    checkpoint: running.checkpoint::<Value>().expect("checkpoint"),
+                    last_error: None,
+                    result: None::<Value>,
+                },
+            )
+            .expect("waiting campaign");
+
+        let reused = repository
+            .create_or_reuse_active(
+                new_mining_campaign_workflow(MiningCampaignIntent {
+                    systems: vec!["REMOTE".to_owned()],
+                    region: "alpha".to_owned(),
+                    hub: "HUB-BELT-1".to_owned(),
+                    max_concurrency: 4,
+                    transport_routes: Vec::new(),
+                }),
+                |workflow| {
+                    Ok(workflow
+                        .config::<MiningCampaignIntent>()
+                        .is_ok_and(|intent| {
+                            canonical_region(&intent.region) == "alpha"
+                                && intent.systems == ["REMOTE"]
+                        }))
+                },
+            )
+            .expect("reuse waiting campaign");
+        assert!(!reused.created);
+        assert_eq!(reused.instance.id, campaign.id);
+
+        let region = mining_ops_region();
+        let devices = Vec::<Device>::new();
+        let catalogue = Vec::<Star>::new();
+        let locations = Vec::<Location>::new();
+        let inventories = Vec::<Inventory>::new();
+        let location_systems = BTreeMap::<String, String>::new();
+        let system_regions = BTreeMap::<String, String>::new();
+        let mut reserved = BTreeSet::new();
+        for pass in 0..2 {
+            let workflows = repository.list().expect("workflows");
+            let mut requirements =
+                DirectorRequirementGraph::load(&repository, 1_000 + pass).expect("requirements");
+            let summary = reconcile_expand_mining(
+                &client,
+                &repository,
+                &region,
+                &[],
+                &workflows,
+                &devices,
+                &catalogue,
+                &locations,
+                &inventories,
+                &location_systems,
+                &system_regions,
+                &GoalControls::default(),
+                true,
+                true,
+                true,
+                &mut reserved,
+                &mut requirements,
+                1_000 + pass,
+            )
+            .await
+            .expect("reconcile Mining Ops");
+            assert_eq!(summary.status, DirectorGoalStatus::Active);
+            assert_eq!(
+                summary.active_workflows,
+                vec![ProtocolWorkflowId(campaign.id.to_string())]
+            );
+            assert_eq!(repository.list().expect("campaigns").len(), 1);
+        }
+        client.close().await.expect("close client");
     }
 
     #[test]

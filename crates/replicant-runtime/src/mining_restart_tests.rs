@@ -454,6 +454,15 @@ async fn mining_authority_remote_census_discovers_hidden_freighter_before_provis
         .expect(1)
         .mount(&server)
         .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/inventory"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"locations": [], "next_cursor": null})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
     let repository = Arc::new(WorkflowRepository::open_in_memory().expect("repository"));
     let mut intent = capacity_intent();
     intent.target_freighters = 3;

@@ -25,10 +25,10 @@ use tracing::{info, warn};
 use super::validation::{self, ValidationReason};
 use super::{
     AnyResult, Config, EvidenceState, ExecutionPrintBatch, MiningMission, MissionPhase,
-    PrintPurpose, RoutePhase, SiteAssets, SitePhase, app_error, audit_site, controller_code,
-    device_is_in_system, device_location, device_snapshots, device_type, fetch_blueprints,
-    find_device, has_reservation_tag, is_opaque_mining_mission_tag, site_shortages, stable_hash,
-    transport_service_present,
+    PrintPurpose, RoutePhase, SiteAssets, SitePhase, app_error, audit_site, authority_pending,
+    controller_code, device_is_in_system, device_location, device_snapshots, device_type,
+    fetch_blueprints, find_device, has_reservation_tag, is_opaque_mining_mission_tag,
+    site_shortages, stable_hash, transport_service_present,
 };
 
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
@@ -262,13 +262,10 @@ async fn reconcile(client: &Client, config: &Config, mission: &mut MiningMission
     for site in &mut mission.sites {
         let audit = audit_site(&devices, &site.system, &site.belt);
         if !audit.mutation_safe {
-            return Err(app_error(
-                io::ErrorKind::WouldBlock,
-                format!(
-                    "mining site {} requires authoritative evidence before provisioning: {:?}",
-                    site.belt, audit.issues
-                ),
-            ));
+            return Err(authority_pending(format!(
+                "mining site {} requires authoritative evidence before provisioning: {:?}",
+                site.belt, audit.issues
+            )));
         }
         if audit.operational {
             site.assets = audit.assets;

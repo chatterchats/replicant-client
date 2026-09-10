@@ -664,6 +664,9 @@ pub struct MiningCampaignCheckpoint {
     pub migration_worker: Option<String>,
     /// Whether pooled execution began.
     pub started: bool,
+    /// Last incomplete-authority condition emitted for this campaign.
+    #[serde(default)]
+    pub authority_wait: Option<String>,
 }
 
 /// Human-facing payload selector for one logistics delivery.
@@ -2772,6 +2775,7 @@ impl WorkflowFactory for MiningCampaignWorkflowFactory {
             mission,
             migration_worker: checkpoint.replicant.or(legacy.replicant),
             started: checkpoint.started,
+            authority_wait: None,
         };
         Ok(Some(WorkflowMigration::new(
             serde_json::to_value(config).map_err(string_error)?,
@@ -5765,6 +5769,7 @@ impl WorkflowExecutor for MiningCampaignWorkflow {
                     mission: checkpoint.mission,
                     migration_worker: checkpoint.migration_worker,
                     started: checkpoint.started,
+                    authority_wait: checkpoint.authority_wait,
                 },
             )
             .await

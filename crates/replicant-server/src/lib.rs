@@ -450,6 +450,11 @@ impl AppState {
         &self.client
     }
 
+    /// Stops in-process workflow executors while preserving their durable restart state.
+    pub async fn shutdown_workflows(&self) {
+        self.supervisor.shutdown().await;
+    }
+
     fn record_runtime_telemetry(
         &self,
         metric: &'static str,
@@ -11203,6 +11208,69 @@ mod tests {
                 .get("access-control-allow-private-network"),
             Some(&"true".parse().expect("header value"))
         );
+        client.close().await.expect("close client");
+    }
+
+    #[tokio::test]
+    async fn mining_authority_wait_emits_no_terminal_attention_notification() {
+        let (_app, client, state) = test_app().await;
+        let campaign = state
+            .repository
+            .create(NewWorkflow {
+                kind: WorkflowKind::new("mining.campaign").expect("kind"),
+                schema_version: 3,
+                config: serde_json::json!({"systems": ["ROOT"], "region": "alpha"}),
+                checkpoint: serde_json::json!({
+                    "mission": null,
+                    "started": false,
+                    "authority_wait": "mining route evidence is incomplete"
+                }),
+                current_step: Some("waiting_for_authoritative_mining_evidence".to_owned()),
+                parent_id: None,
+            })
+            .expect("campaign");
+        let running = state
+            .repository
+            .update(
+                campaign.id,
+                campaign.revision,
+                WorkflowState {
+                    status: WorkflowStatus::Running,
+                    current_step: campaign.current_step.clone(),
+                    checkpoint: campaign.checkpoint::<Value>().expect("checkpoint"),
+                    last_error: None,
+                    result: None::<Value>,
+                },
+            )
+            .expect("running campaign");
+        let waiting = state
+            .repository
+            .update(
+                running.id,
+                running.revision,
+                WorkflowState {
+                    status: WorkflowStatus::Waiting,
+                    current_step: running.current_step.clone(),
+                    checkpoint: running.checkpoint::<Value>().expect("checkpoint"),
+                    last_error: None,
+                    result: None::<Value>,
+                },
+            )
+            .expect("waiting campaign");
+
+        for _ in 0..2 {
+            let notifications = operational_notifications(
+                &client,
+                std::slice::from_ref(&waiting),
+                &[],
+                &client.status(),
+            );
+            assert!(
+                notifications
+                    .iter()
+                    .all(|notification| notification.title != "Workflow needs attention")
+            );
+        }
         client.close().await.expect("close client");
     }
 
